@@ -735,18 +735,44 @@ let drag = null;       // { pointerId, x, y } one-pointer pan in progress
 let textTap = null;    // { pointerId } a tap that will place text on release
 let spaceDown = false;
 
+// A fingertip wobbles and the screen reports it in whole pixels. When the
+// finger lifts, the line is re-sampled at even steps and each point is
+// averaged with its neighbours on both sides (a bell-shaped weighting about
+// 3.5 screen px wide). Averaging both ways adds no lag, keeps the two ends
+// where they were, and leaves curves as curves.
+function steady(pts, px) {
+  const n = pts.length / 3;
+  if (n < 3) return pts;
+  const step = 1.5 / px, R = [];
+  let x = pts[0], y = pts[1], left = step;
+  R.push(x, y);
+  for (let i = 1; i < n; i++) {
+    const tx = pts[i * 3], ty = pts[i * 3 + 1];
+    let d = Math.hypot(tx - x, ty - y);
+    while (d >= left) {
+      x += ((tx - x) * left) / d; y += ((ty - y) * left) / d; d -= left; left = step;
+      R.push(x, y);
+    }
+    left -= d; x = tx; y = ty;
+  }
+  R.push(x, y);
+  const m = R.length / 2;
+  if (m < 5 || m > 60000) return pts;
+  const K = [1, 0.912, 0.693, 0.438, 0.23, 0.101, 0.037, 0.011]; // exp(-(1.5k)^2 / (2 * 3.5^2))
+  const out = [];
+  for (let i = 0; i < m; i++) {
+    const r = Math.min(i, m - 1 - i, K.length - 1);
+    let sx = 0, sy = 0, sw = 0;
+    for (let k = -r; k <= r; k++) { const w = K[k < 0 ? -k : k]; sx += R[(i + k) * 2] * w; sy += R[(i + k) * 2 + 1] * w; sw += w; }
+    out.push(r5(sx / sw), r5(sy / sw), 0.5);
+  }
+  return out;
+}
+
 function addPoint(e, rect) {
   const s = liveStrokes.get(cur.id); if (!s) return;
-  let [bx, by] = boardPoint(e, rect);
-  if (e.pointerType === 'touch') {
-    // A fingertip wobbles. Follow it loosely when it moves slowly and
-    // closely when it moves fast, so letters come out steadier without lag.
-    if (cur.fx == null) { cur.fx = bx; cur.fy = by; }
-    const px = Math.hypot(bx - cur.fx, by - cur.fy) * bw * zoom;
-    const k = Math.min(1, 0.12 + px / 28);
-    cur.fx += (bx - cur.fx) * k; cur.fy += (by - cur.fy) * k;
-    cur.rx = bx; cur.ry = by; bx = cur.fx; by = cur.fy;
-  }
+  const [bx, by] = boardPoint(e, rect);
+  if (e.pointerType === 'touch') cur.touch = true;
   const x = r5(bx), y = r5(by);
   const p = e.pointerType === 'pen' && e.pressure > 0 ? Math.round(e.pressure * 1000) / 1000 : 0.5;
   const n = s.pts.length;
@@ -863,20 +889,15 @@ live.addEventListener('pointermove', (e) => {
 function endStroke(e) {
   if (!cur || e.pointerId !== cur.pointerId) return;
   const id = cur.id, sent = cur.sent, out = cur.out, s = liveStrokes.get(id);
-  // Tolerance: a third of a pixel at 100%, never looser when zoomed out. A
-  // finger gets about a screen pixel and a half, which irons out its wobble.
-  const eps = cur.rx != null ? Math.max(EPS, 1.5 / (bw * zoom)) : EPS / Math.max(1, zoom);
-  if (s && cur.rx != null && s.pts.length) { // the line ends where the finger did
-    const x = r5(cur.rx), y = r5(cur.ry), n = s.pts.length;
-    if (s.pts[n - 3] !== x || s.pts[n - 2] !== y) { s.pts.push(x, y, 0.5); if (sent) out.push(x, y, 0.5); }
-  }
+  // Tolerance: a third of a pixel at 100%, never looser when zoomed out.
+  const touch = cur.touch, eps = touch ? Math.max(EPS / Math.max(1, zoom), 0.5 / (bw * zoom)) : EPS / Math.max(1, zoom);
   cur = null; document.body.classList.remove('drawing');
   if (!s) return;
   if (sent && out.length) send({ t: 'p', id, pts: out });
   liveStrokes.delete(id);
   if (!s.pts.length) { redrawLive(); if (sent) send({ t: 'u', id }); return; }
   // Zoomed in, detail is finer: tighten the tolerance to match.
-  const f = { id, l: me, c: s.c, w: s.w, pts: simplify(s.pts, eps) };
+  const f = { id, l: me, c: s.c, w: s.w, pts: simplify(touch ? steady(s.pts, bw * zoom) : s.pts, eps) };
   insertStroke(f); redrawLive();
   pending.set(id, f); mine.push(id);
   // Confirmed by `ok`. If the socket is down or still loading the snapshot,
