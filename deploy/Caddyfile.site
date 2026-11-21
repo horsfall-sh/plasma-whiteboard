@@ -1,0 +1,7 @@
+whiteboard.example.com {
+    encode gzip zstd
+    header Strict-Transport-Security "max-age=31536000"
+    # Caddy replaces any X-Forwarded-For a client sends with the real address,
+    # which is what the relay's rate limits read (WB_TRUST_PROXY=1).
+    reverse_proxy 127.0.0.1:8787
+}

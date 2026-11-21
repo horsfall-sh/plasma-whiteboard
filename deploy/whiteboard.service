@@ -1,0 +1,37 @@
+[Unit]
+Description=Whiteboard relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wb-relay
+Environment=WB_ADDR=127.0.0.1:8787
+Environment=WB_DB=/var/lib/whiteboard/whiteboard.db
+Environment=WB_TRUST_PROXY=1
+Environment=WB_TTL_DAYS=90
+Restart=on-failure
+RestartSec=2
+
+# Runs as its own throwaway user; may write only its state directory.
+DynamicUser=yes
+StateDirectory=whiteboard
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+# The VM has 1 GB and another site on it.
+MemoryMax=350M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

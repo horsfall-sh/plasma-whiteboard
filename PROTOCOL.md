@@ -23,6 +23,13 @@ and sending a new one. The page draws it in a sans-serif font, line height 1.25,
 
 Zoom and pan are local to each browser and never go on the wire.
 
+## Crumple and the shelf
+
+A board has one sheet in use and a shelf of up to five crumpled sheets. Crumpling renumbers the sheet's
+strokes from sheet 0 to a new sheet number; nothing is copied or rewritten. A sixth crumple deletes the
+oldest shelved sheet for good. Undo and layer delete or restore act on the sheet in use only. The limit of
+10,000 strokes counts the sheet in use and the shelf together.
+
 ## Coordinates
 
 Points are flat arrays of `x, y, pressure` triples. `x` is 0 to 1, `y` is 0 to 0.5625, pressure is 0 to 1.
@@ -45,6 +52,9 @@ the connection. The key is sent in the first message, never in the URL.
 | `u` | `id` | Undo one of my own strokes. |
 | `ld` | `l` | Delete layer `l` for everyone (any editor). |
 | `lr` | `l` | Restore the deleted strokes of layer `l` (any editor). |
+| `cr` | | Crumple: move everything on the sheet in use to the shelf and start blank (any editor). Ignored on a blank sheet. |
+| `un` | `k` | Bring crumpled sheet `k` back (any editor). The sheet in use, if it has anything on it, is crumpled in its place. |
+| `sv` | `k` | Ask for the strokes of crumpled sheet `k`, to draw a preview. |
 
 Messages from a viewer other than `join` are ignored.
 
@@ -52,7 +62,7 @@ Messages from a viewer other than `join` are ignored.
 
 | `t` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `role`, `me`, `view`, `layers` | Sent after a good `join`. `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. **The client drops all board state when it receives this**; the snapshot follows. |
+| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
 | `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`. |
 | `ready` | | Snapshot complete. The client now resends unconfirmed strokes with `s`. |
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
@@ -64,6 +74,9 @@ Messages from a viewer other than `join` are ignored.
 | `l` | `l`, `c` | A new layer (a new contributor joined). Sent to everyone. |
 | `ld` | `l` | Layer `l` was deleted: drop its finished strokes and mark it restorable. Sent to everyone, including the sender. |
 | `lr` | `l`, `a` | Layer `l` was restored: `a` holds its strokes; insert them by `q`. Sent to everyone. |
+| `cr` | `k`, `by`, `drop`, `shelf` | The sheet was crumpled into shelf entry `k` by layer `by`: drop every stored item (keep your own unconfirmed ones; they land on the new sheet) and clear every layer's `del`. `drop` is the sheet number thrown away to keep the shelf at five, or null. Sent to everyone. |
+| `un` | `k`, `by`, `shelf`, `layers`, `a` | Sheet `k` was brought back: `a` holds its items, `layers` the layer list as in `hello`. Replace the board with them. Sent to everyone. |
+| `sv` | `k`, `a` | To the one who asked: the items of crumpled sheet `k`. |
 | `n` | `n` | Number of connections on the board now. |
 | `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections (retry later). `rate`: sending too fast. `bad`: malformed join. |
 
@@ -82,7 +95,8 @@ same sequence. A client that falls too far behind is disconnected and gets a fre
 | Message size | 1 MiB |
 | Points per stroke | 20,000 |
 | Text annotation | 500 characters, 20 lines |
-| Strokes kept per board (visible plus restorable) | 10,000 |
+| Strokes kept per board (sheet in use plus shelf, visible plus restorable) | 10,000 |
+| Crumpled sheets on the shelf | 5 |
 | Live strokes per board / per connection | 64 / 4 |
 | Contributors per board | 200 (later browsers join as viewers) |
 | Connections per board / per address | 100 / 40 |

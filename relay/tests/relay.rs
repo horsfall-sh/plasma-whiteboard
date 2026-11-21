@@ -531,3 +531,81 @@ async fn text_annotations() {
     assert!(strokes.is_empty());
     s.stop().await;
 }
+
+#[tokio::test]
+async fn crumple_shelves_the_sheet_and_brings_it_back() {
+    let s = start(&temp_db("crumple")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, hello, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    assert_eq!(hello["shelf"], json!([]));
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+
+    // Crumpling a blank sheet does nothing; a viewer can't crumple.
+    a.send(json!({"t": "cr"})).await;
+    a.quiet().await;
+    a.draw("one-a").await;
+    a.draw("one-b").await;
+    v.expect("e").await;
+    v.expect("e").await;
+    v.send(json!({"t": "cr"})).await;
+    a.quiet().await;
+
+    a.send(json!({"t": "cr"})).await;
+    let cr = a.expect("cr").await;
+    assert_eq!(cr["shelf"], json!([{"k": 1, "n": 2}]));
+    assert!(cr["drop"].is_null());
+    assert_eq!(v.expect("cr").await["k"], 1);
+    let (_j, hello, strokes) = Client::join(&s.addr, &view, None).await;
+    assert!(strokes.is_empty(), "the new sheet is blank");
+    assert_eq!(hello["shelf"], json!([{"k": 1, "n": 2}]));
+
+    // A preview of the crumpled sheet, for the one who asks.
+    a.send(json!({"t": "sv", "k": 1})).await;
+    let sv = a.expect("sv").await;
+    assert_eq!(sv["a"].as_array().unwrap().len(), 2);
+    v.quiet().await;
+
+    // Draw a second sheet, then go back to the first: they swap.
+    a.draw("two-a").await;
+    v.expect("e").await;
+    a.send(json!({"t": "un", "k": 1})).await;
+    let un = a.expect("un").await;
+    let ids: Vec<&str> = un["a"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["one-a", "one-b"]);
+    assert_eq!(un["shelf"], json!([{"k": 2, "n": 1}]));
+    v.expect("un").await;
+
+    // It all survives a restart.
+    drop(a);
+    drop(v);
+    let db = s.stop().await;
+    let s = start(&db).await;
+    let (mut a, hello, strokes) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    assert_eq!(strokes.len(), 2);
+    assert_eq!(hello["shelf"], json!([{"k": 2, "n": 1}]));
+
+    // Bringing a sheet back onto a blank sheet shelves nothing.
+    a.send(json!({"t": "cr"})).await;
+    assert_eq!(a.expect("cr").await["shelf"], json!([{"k": 2, "n": 1}, {"k": 3, "n": 2}]));
+    a.send(json!({"t": "un", "k": 2})).await;
+    assert_eq!(a.expect("un").await["shelf"], json!([{"k": 3, "n": 2}]));
+
+    // The shelf holds five; a sixth crumple throws the oldest away.
+    for i in 0..5 {
+        a.draw(&format!("fill-{i}")).await;
+        a.send(json!({"t": "cr"})).await;
+        let cr = a.expect("cr").await;
+        let shelf = cr["shelf"].as_array().unwrap();
+        assert!(shelf.len() <= 5);
+        if i == 4 {
+            assert_eq!(cr["drop"], 3, "sheet 3 was the oldest");
+            assert_eq!(shelf.len(), 5);
+            assert!(shelf.iter().all(|s| s["k"] != 3));
+        }
+    }
+    // A thrown-away sheet can't be brought back; its stroke ids are free again.
+    a.send(json!({"t": "un", "k": 3})).await;
+    a.quiet().await;
+    a.draw("one-a").await;
+    s.stop().await;
+}

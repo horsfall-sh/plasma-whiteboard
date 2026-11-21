@@ -9,3 +9,4 @@ node_modules/
 .DS_Store
 relay/target-linux/
 .playwright-mcp/
+web/crumple.wasm

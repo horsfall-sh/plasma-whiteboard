@@ -11,9 +11,13 @@ board in a browser window on a laptop, and share that window in a video call.
 - Boards are stored in SQLite and survive a restart.
 - **Text annotations:** pick Text, tap the board, type. Enter finishes, Shift+Enter starts a new line, Escape
   cancels. Tap your own text with the Text tool to edit it. Size follows S, M, L.
+- **Crumple:** wipes the board for everyone and puts it on a shelf of up to five crumpled boards. **Shelf**
+  shows them with a small preview; **Bring back** swaps one in and crumples the board in use in its place.
+  A sixth crumple throws the oldest away. The toast after a crumple has an Undo.
 - **Zoom** up to 8x, local to your browser. Two-finger pinch, trackpad pinch, Ctrl or Cmd + wheel, the
   toolbar buttons, or the `+`, `-` and `0` keys. Scrolling pans; so does a middle-button drag or Space + drag.
-  On a view link one finger or the mouse pans.
+  The **Move** tool makes any drag (pen, finger or mouse) pan. While zoomed in, a small map at the bottom
+  left shows where you are; tap or drag on it to go there. On a view link one finger or the mouse pans.
 
 ## Tablet and pen
 
@@ -30,6 +34,7 @@ board in a browser window on a laptop, and share that window in a video call.
 | --- | --- |
 | `relay/` | The relay: one Rust binary (axum, tokio, SQLite in WAL mode). Serves the page, makes boards, relays strokes. The page is embedded in the binary. |
 | `web/` | The page: plain HTML, CSS and JS. No framework and no build step. |
+| `crumple/` | The crumple animation in Rust, built to WebAssembly: each frame it computes a paper mesh (wrinkle, wad, toss), which the page draws with WebGL using a picture of the board as the paper. Without it, or with reduced motion set, crumpling still works, without the animation. |
 | `smooth/` | Stroke simplification in Rust (Ramer-Douglas-Peucker over x, y, pressure), built to WebAssembly. The page falls back to the same algorithm in JS if the module does not load. |
 | `PROTOCOL.md` | The wire contract between page and relay, and the limits. |
 | `BRIEF.md` | The build brief. |

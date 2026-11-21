@@ -27,6 +27,8 @@ pub struct StrokeRow {
     /// Set for a text annotation; None for a pen stroke.
     pub txt: Option<String>,
     pub state: u8,
+    /// 0: the sheet being drawn on. Above 0: a crumpled sheet on the shelf.
+    pub sheet: u32,
 }
 
 #[derive(Default)]
@@ -76,6 +78,15 @@ enum Cmd {
         from: u8,
         to: u8,
     },
+    SheetMove {
+        board: i64,
+        from: u32,
+        to: u32,
+    },
+    SheetDrop {
+        board: i64,
+        sheet: u32,
+    },
     Sweep {
         cutoff: i64,
         skip: Vec<i64>,
@@ -121,6 +132,7 @@ CREATE TABLE IF NOT EXISTS strokes(
   pts TEXT NOT NULL,
   state INTEGER NOT NULL DEFAULT 0,
   txt TEXT,
+  sheet INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(board, seq)) WITHOUT ROWID;
 CREATE UNIQUE INDEX IF NOT EXISTS strokes_id ON strokes(board, id);
 ";
@@ -138,6 +150,12 @@ impl Db {
             .exists([])?;
         if !has_txt {
             conn.execute_batch("ALTER TABLE strokes ADD COLUMN txt TEXT")?;
+        }
+        let has_sheet: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('strokes') WHERE name = 'sheet'")?
+            .exists([])?;
+        if !has_sheet {
+            conn.execute_batch("ALTER TABLE strokes ADD COLUMN sheet INTEGER NOT NULL DEFAULT 0")?;
         }
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -197,6 +215,16 @@ impl Db {
 
     pub fn layer_state(&self, board: i64, layer: u32, from: u8, to: u8) {
         self.send(Cmd::LayerState { board, layer, from, to });
+    }
+
+    /// Move every stroke of one sheet to another sheet number (0 is the one in use).
+    pub fn sheet_move(&self, board: i64, from: u32, to: u32) {
+        self.send(Cmd::SheetMove { board, from, to });
+    }
+
+    /// Throw a crumpled sheet away for good.
+    pub fn sheet_drop(&self, board: i64, sheet: u32) {
+        self.send(Cmd::SheetDrop { board, sheet });
     }
 
     /// Delete boards not opened since `cutoff`, except those in `skip`.
@@ -285,7 +313,7 @@ fn apply(
                     out.layers.push(row?);
                 }
                 let mut q = conn.prepare_cached(
-                    "SELECT seq, id, layer, color, width, pts, state, txt FROM strokes WHERE board = ? ORDER BY seq",
+                    "SELECT seq, id, layer, color, width, pts, state, txt, sheet FROM strokes WHERE board = ? ORDER BY seq",
                 )?;
                 let rows = q.query_map(params![board], |r| {
                     Ok(StrokeRow {
@@ -297,6 +325,7 @@ fn apply(
                         pts: r.get(5)?,
                         state: r.get(6)?,
                         txt: r.get(7)?,
+                        sheet: r.get(8)?,
                     })
                 })?;
                 for row in rows {
@@ -321,9 +350,17 @@ fn apply(
         }
         Cmd::LayerState { board, layer, from, to } => {
             conn.prepare_cached(
-                "UPDATE strokes SET state = ? WHERE board = ? AND layer = ? AND state = ?",
+                "UPDATE strokes SET state = ? WHERE board = ? AND layer = ? AND state = ? AND sheet = 0",
             )?
             .execute(params![to, board, layer, from])?;
+        }
+        Cmd::SheetMove { board, from, to } => {
+            conn.prepare_cached("UPDATE strokes SET sheet = ? WHERE board = ? AND sheet = ?")?
+                .execute(params![to, board, from])?;
+        }
+        Cmd::SheetDrop { board, sheet } => {
+            conn.prepare_cached("DELETE FROM strokes WHERE board = ? AND sheet = ?")?
+                .execute(params![board, sheet])?;
         }
         Cmd::Sweep { cutoff, skip, reply } => {
             let mut ids: Vec<i64> = Vec::new();

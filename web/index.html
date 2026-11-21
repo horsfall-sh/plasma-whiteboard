@@ -12,6 +12,7 @@
 <div id="board">
   <canvas id="base"></canvas>
   <canvas id="live"></canvas>
+  <canvas id="fx" hidden></canvas>
   <textarea id="textEdit" rows="1" maxlength="500" spellcheck="false" autocapitalize="sentences" aria-label="Text annotation" hidden></textarea>
 </div>
 
@@ -25,7 +26,10 @@
   <button type="button" class="tools" data-w="0.009" aria-label="Large pen" aria-pressed="false">L</button>
   <span class="sep tools"></span>
   <button type="button" id="undo" class="tools wide" aria-label="Undo my last stroke">Undo</button>
+  <button type="button" id="crumpleBtn" class="tools wide" aria-label="Crumple this board: wipe it and put it on the shelf">Crumple</button>
+  <button type="button" id="shelfBtn" class="tools wide" aria-label="Shelf of crumpled boards" aria-expanded="false" aria-controls="shelfPanel">Shelf</button>
   <span class="sep tools"></span>
+  <button type="button" id="moveBtn" class="tools wide" aria-label="Move around the board: drag to pan" aria-pressed="false">Move</button>
   <button type="button" id="zoomOut" aria-label="Zoom out">&minus;</button>
   <button type="button" id="zoomReset" class="wide" aria-label="Reset zoom to the whole board">100%</button>
   <button type="button" id="zoomIn" aria-label="Zoom in">+</button>
@@ -41,6 +45,15 @@
   </header>
   <p class="hint">Hide changes only your view. Delete removes a layer for everyone and can be restored.</p>
   <ul id="layerList"></ul>
+</section>
+
+<section id="shelfPanel" class="panel" aria-label="Shelf" hidden>
+  <header>
+    <h2>Shelf</h2>
+    <button type="button" class="close" data-close aria-label="Close shelf">Close</button>
+  </header>
+  <p class="hint" id="shelfHint"></p>
+  <ul id="shelfList"></ul>
 </section>
 
 <section id="sharePanel" class="panel" aria-label="Share" hidden>
@@ -65,6 +78,7 @@
   <p><a id="newBoard" href="/" target="_blank" rel="noopener">New board</a></p>
 </section>
 
+<div id="nav" aria-label="Where you are on the board. Tap or drag to move." hidden><div id="navBox"></div></div>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 <div id="msg" role="alert" hidden></div>
 <div id="status"><b></b><span>connecting</span></div>

@@ -67,11 +67,12 @@ const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; sty
 connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 fn assets() -> Vec<Asset> {
-    let raw: [(&str, &str, &str, &[u8]); 5] = [
+    let raw: [(&str, &str, &str, &[u8]); 6] = [
         ("/", "index.html", "text/html; charset=utf-8", include_bytes!("../../web/index.html")),
         ("/app.js", "app.js", "text/javascript; charset=utf-8", include_bytes!("../../web/app.js")),
         ("/app.css", "app.css", "text/css; charset=utf-8", include_bytes!("../../web/app.css")),
         ("/smooth.wasm", "smooth.wasm", "application/wasm", include_bytes!("../../web/smooth.wasm")),
+        ("/crumple.wasm", "crumple.wasm", "application/wasm", include_bytes!("../../web/crumple.wasm")),
         ("/favicon.svg", "favicon.svg", "image/svg+xml", include_bytes!("../../web/favicon.svg")),
     ];
     raw.into_iter()
@@ -386,6 +387,7 @@ pub async fn serve(
         .route("/app.js", get(file))
         .route("/app.css", get(file))
         .route("/smooth.wasm", get(file))
+        .route("/crumple.wasm", get(file))
         .route("/favicon.svg", get(file))
         .route("/favicon.ico", get(|| async { plain(StatusCode::NO_CONTENT, "") }))
         .route("/api/boards", post(create_board))

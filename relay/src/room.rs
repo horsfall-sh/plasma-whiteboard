@@ -21,6 +21,8 @@ pub const MAX_ROOM_CONNS: usize = 100;
 pub const MAX_WIDTH: f32 = 0.2;
 pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_TEXT_LINES: usize = 20;
+/// Crumpled sheets kept per board. Crumpling one more throws the oldest away.
+pub const MAX_SHELF: usize = 5;
 const SNAPSHOT_CHUNK: usize = 200;
 
 /// A message on its way to the board's connections.
@@ -65,6 +67,15 @@ pub enum In {
     LayerDelete { l: u32 },
     #[serde(rename = "lr")]
     LayerRestore { l: u32 },
+    /// Crumple the sheet in use: shelve everything on it and start blank.
+    #[serde(rename = "cr")]
+    Crumple {},
+    /// Bring crumpled sheet `k` back; the sheet in use is crumpled in its place.
+    #[serde(rename = "un")]
+    Uncrumple { k: u32 },
+    /// Ask for the strokes of crumpled sheet `k`, to draw a preview.
+    #[serde(rename = "sv")]
+    SheetView { k: u32 },
 }
 
 struct Stroke {
@@ -74,6 +85,12 @@ struct Stroke {
     id: String,
     /// The stroke as it goes on the wire: {"id":..,"l":..,"q":..,"c":..,"w":..,"pts":[..]}
     json: String,
+}
+
+/// A crumpled sheet on the shelf.
+struct Sheet {
+    k: u32,
+    strokes: Vec<Stroke>,
 }
 
 struct Layer {
@@ -92,8 +109,11 @@ struct Live {
 
 struct State {
     next_seq: u64,
-    /// Drawn and restorable strokes, in sequence order.
+    /// Drawn and restorable strokes of the sheet in use, in sequence order.
     strokes: Vec<Stroke>,
+    /// Crumpled sheets, oldest first.
+    shelf: Vec<Sheet>,
+    next_sheet: u32,
     /// Every stroke id the board has ever stored, undone ones included.
     ids: HashSet<String>,
     layers: Vec<Layer>,
@@ -252,12 +272,27 @@ impl Room {
     pub fn new(board: i64, loaded: Loaded) -> Room {
         let mut ids = HashSet::new();
         let mut strokes = Vec::new();
+        let mut shelf: Vec<Sheet> = Vec::new();
         let mut next_seq = 1;
+        let mut next_sheet = 1;
         for r in loaded.strokes {
             next_seq = next_seq.max(r.seq + 1);
+            next_sheet = next_sheet.max(r.sheet + 1);
             if r.state != UNDONE {
                 let w = width_json(r.width as f32);
-                strokes.push(Stroke {
+                let into = if r.sheet == 0 {
+                    &mut strokes
+                } else {
+                    let i = match shelf.iter().position(|s| s.k == r.sheet) {
+                        Some(i) => i,
+                        None => {
+                            shelf.push(Sheet { k: r.sheet, strokes: Vec::new() });
+                            shelf.len() - 1
+                        }
+                    };
+                    &mut shelf[i].strokes
+                };
+                into.push(Stroke {
                     seq: r.seq,
                     layer: r.layer,
                     state: r.state,
@@ -267,6 +302,7 @@ impl Room {
             }
             ids.insert(r.id);
         }
+        shelf.sort_by_key(|s| s.k);
         let layers = loaded
             .layers
             .into_iter()
@@ -279,6 +315,8 @@ impl Room {
             st: Mutex::new(State {
                 next_seq,
                 strokes,
+                shelf,
+                next_sheet,
                 ids,
                 layers,
                 live: HashMap::new(),
@@ -348,14 +386,10 @@ impl Room {
             (Role::Edit, Some(v)) => hello.push_str(&format!(r#","view":"{v}","layers":["#)),
             _ => hello.push_str(r#","view":null,"layers":["#),
         }
-        for (i, l) in st.layers.iter().enumerate() {
-            let del = st.strokes.iter().any(|s| s.layer == l.n && s.state == DELETED);
-            if i > 0 {
-                hello.push(',');
-            }
-            hello.push_str(&format!(r#"{{"l":{},"c":"{}","del":{del}}}"#, l.n, l.color));
-        }
-        hello.push_str("]}");
+        hello.push_str(&layers_json(&st));
+        hello.push_str(r#"],"shelf":"#);
+        hello.push_str(&shelf_json(&st));
+        hello.push('}');
         snapshot.push(hello.into());
 
         let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
@@ -517,6 +551,57 @@ impl Room {
                     self.all(format!(r#"{{"t":"ld","l":{l}}}"#));
                 }
             }
+            In::Crumple {} => {
+                if st.strokes.is_empty() {
+                    return;
+                }
+                let k = st.next_sheet;
+                st.next_sheet += 1;
+                let sheet = std::mem::take(&mut st.strokes);
+                db.sheet_move(self.board, 0, k);
+                st.shelf.push(Sheet { k, strokes: sheet });
+                let mut dropped = String::from("null");
+                if st.shelf.len() > MAX_SHELF {
+                    let old = st.shelf.remove(0);
+                    for s in &old.strokes {
+                        st.ids.remove(&s.id);
+                    }
+                    db.sheet_drop(self.board, old.k);
+                    dropped = old.k.to_string();
+                }
+                self.all(format!(
+                    r#"{{"t":"cr","k":{k},"by":{},"drop":{dropped},"shelf":{}}}"#,
+                    peer.layer,
+                    shelf_json(&st)
+                ));
+            }
+            In::Uncrumple { k } => {
+                let Some(i) = st.shelf.iter().position(|s| s.k == k) else { return };
+                let back = st.shelf.remove(i);
+                let cur = std::mem::replace(&mut st.strokes, back.strokes);
+                // Storage: first move the sheet in use out of the way, then bring k in.
+                let nk = st.next_sheet;
+                st.next_sheet += 1;
+                db.sheet_move(self.board, 0, nk);
+                db.sheet_move(self.board, k, 0);
+                if !cur.is_empty() {
+                    st.shelf.push(Sheet { k: nk, strokes: cur });
+                }
+                let head = format!(
+                    r#"{{"t":"un","k":{k},"by":{},"shelf":{},"layers":[{}],"a":["#,
+                    peer.layer,
+                    shelf_json(&st),
+                    layers_json(&st)
+                );
+                let drawn = st.strokes.iter().filter(|s| s.state == LIVE).map(|s| s.json.as_str());
+                self.all(strokes_msg(&head, drawn));
+            }
+            In::SheetView { k } => {
+                let Some(sheet) = st.shelf.iter().find(|s| s.k == k) else { return };
+                let head = format!(r#"{{"t":"sv","k":{k},"a":["#);
+                let drawn = sheet.strokes.iter().filter(|s| s.state == LIVE).map(|s| s.json.as_str());
+                self.only(conn, strokes_msg(&head, drawn));
+            }
             In::LayerRestore { l } => {
                 let mut back: Vec<&str> = Vec::new();
                 for s in st.strokes.iter_mut().filter(|s| s.layer == l && s.state == DELETED) {
@@ -568,7 +653,7 @@ impl Room {
             }
             return;
         }
-        if st.strokes.len() >= MAX_STROKES {
+        if st.strokes.len() + st.shelf.iter().map(|s| s.strokes.len()).sum::<usize>() >= MAX_STROKES {
             drop_live(self);
             self.only(conn, refusal(&id, "this board is full"));
             return;
@@ -583,6 +668,33 @@ impl Room {
         st.ids.insert(id.clone());
         st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
     }
+}
+
+/// The layers as they go in hello and un: `{l, c, del}` objects, comma separated.
+fn layers_json(st: &State) -> String {
+    let mut out = String::new();
+    for (i, l) in st.layers.iter().enumerate() {
+        let del = st.strokes.iter().any(|s| s.layer == l.n && s.state == DELETED);
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(r#"{{"l":{},"c":"{}","del":{del}}}"#, l.n, l.color));
+    }
+    out
+}
+
+/// The shelf, oldest first: `[{k, n}]` with n the number of drawn items.
+fn shelf_json(st: &State) -> String {
+    let mut out = String::from("[");
+    for (i, s) in st.shelf.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let n = s.strokes.iter().filter(|x| x.state == LIVE).count();
+        out.push_str(&format!(r#"{{"k":{},"n":{n}}}"#, s.k));
+    }
+    out.push(']');
+    out
 }
 
 fn refusal(id: &str, why: &str) -> String {

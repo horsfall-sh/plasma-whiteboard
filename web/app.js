@@ -31,6 +31,7 @@ const sctx = spare.getContext('2d');
 const statusEl = $('#status'), statusText = $('#status span');
 const toastEl = $('#toast'), msgEl = $('#msg');
 const layersPanel = $('#layersPanel'), sharePanel = $('#sharePanel'), layerList = $('#layerList');
+const shelfPanel = $('#shelfPanel'), shelfList = $('#shelfList');
 
 // ---- state -----------------------------------------------------------------
 
@@ -58,7 +59,7 @@ let hidden = new Set();        // layers hidden in this browser only
 let zoom = 1, panX = 0, panY = 0;
 let dpr = 1;
 let rv = { z: 1, x: 0, y: 0 };  // the view the base canvas was last drawn at
-let tool = 'pen';              // 'pen' | 'erase' | 'text'
+let tool = 'pen';              // 'pen' | 'erase' | 'text' | 'move'
 
 let color = null;              // selected pen colour (null until hello gives mine)
 let myColor = null;
@@ -286,7 +287,25 @@ function zoomAt(f, sx, sy, settle) {
   setView(z, bx - sx / (bw * z), by - sy / (bw * z), settle);
 }
 function zoomStep(f) { zoomAt(f, bw / 2, (bw * ASPECT) / 2, true); }
-function showZoom() { const b = $('#zoomReset'); if (b) b.textContent = `${Math.round(zoom * 100)}%`; }
+// The zoom label, and the small map (bottom left) that shows which part of the
+// board is on screen while zoomed in.
+const navEl = $('#nav'), navBox = $('#navBox');
+function showZoom() {
+  $('#zoomReset').textContent = `${Math.round(zoom * 100)}%`;
+  navEl.hidden = zoom === 1;
+  if (zoom === 1) return;
+  navBox.style.left = `${panX * 100}%`; navBox.style.top = `${(panY / ASPECT) * 100}%`;
+  navBox.style.width = navBox.style.height = `${100 / zoom}%`;
+}
+// Tap or drag on the map to put that spot at the centre of the screen.
+function navTo(e) {
+  const r = navEl.getBoundingClientRect();
+  const bx = (e.clientX - r.left) / r.width, by = ((e.clientY - r.top) / r.height) * ASPECT;
+  setView(zoom, bx - 0.5 / zoom, by - (0.5 * ASPECT) / zoom);
+}
+navEl.addEventListener('pointerdown', (e) => { e.preventDefault(); try { navEl.setPointerCapture(e.pointerId); } catch { /* gone */ } navTo(e); });
+navEl.addEventListener('pointermove', (e) => { if (e.buttons || e.pointerType !== 'mouse') navTo(e); });
+navEl.addEventListener('pointerup', settleView);
 // Board point under a pointer event.
 function boardPoint(e, rect) {
   return [
@@ -504,6 +523,9 @@ function onMessage(m) {
       break;
     case 'ld': onLayerDeleted(m.l); break;
     case 'lr': onLayerRestored(m.l, m.a); break;
+    case 'cr': onCrumpled(m); break;
+    case 'un': onUncrumpled(m); break;
+    case 'sv': onSheetView(m); break;
     case 'n': people = m.n | 0; showStatus(); break;
     case 'err': onError(m); break;
   }
@@ -538,7 +560,8 @@ function onHello(m) {
 
   redrawBase(true); redrawLive();
   statusEl.classList.add('ok'); showStatus('connected');
-  fillShare(); layersChanged();
+  shelf = Array.isArray(m.shelf) ? m.shelf : [];
+  fillShare(); layersChanged(); shelfChanged();
 }
 
 function onReady() {
@@ -677,8 +700,9 @@ live.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   if (editor) { closeEditor(true); return; } // a tap outside the text box finishes it
   const viewer = role !== 'edit' || me == null;
+  const primary = t !== 'mouse' || e.button === 0;
   if ((t === 'mouse' && (e.button === 1 || (e.button === 0 && spaceDown))) ||
-      (viewer && (t !== 'mouse' || e.button === 0))) {
+      (primary && (viewer || tool === 'move'))) {
     capture(e); drag = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
     return;
   }
@@ -893,12 +917,14 @@ function buildSwatches() {
 }
 function markTools() {
   for (const b of document.querySelectorAll('#bar [data-c]')) {
-    const on = tool !== 'erase' && b.dataset.c === color;
+    const on = (tool === 'pen' || tool === 'text') && b.dataset.c === color;
     b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));
   }
   eraserBtn.classList.toggle('on', tool === 'erase'); eraserBtn.setAttribute('aria-pressed', String(tool === 'erase'));
   textBtn.classList.toggle('on', tool === 'text'); textBtn.setAttribute('aria-pressed', String(tool === 'text'));
   document.body.classList.toggle('text', tool === 'text');
+  const mv = $('#moveBtn'); mv.classList.toggle('on', tool === 'move'); mv.setAttribute('aria-pressed', String(tool === 'move'));
+  document.body.classList.toggle('move', tool === 'move');
   for (const b of document.querySelectorAll('#bar [data-w]')) {
     const on = Number(b.dataset.w) === width;
     b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));
@@ -907,10 +933,13 @@ function markTools() {
 
 $('#bar').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
-  if (b.dataset.c) { color = b.dataset.c; if (tool === 'erase') tool = 'pen'; markTools(); }
+  if (b.dataset.c) { color = b.dataset.c; if (tool !== 'text') tool = 'pen'; markTools(); }
   else if (b.dataset.w) { width = Number(b.dataset.w); markTools(); }
   else if (b.id === 'eraser') { tool = tool === 'erase' ? 'pen' : 'erase'; markTools(); }
   else if (b.id === 'textBtn') { tool = tool === 'text' ? 'pen' : 'text'; markTools(); }
+  else if (b.id === 'crumpleBtn') crumple();
+  else if (b.id === 'shelfBtn') openPanel(shelfPanel.hidden ? shelfPanel : null);
+  else if (b.id === 'moveBtn') { tool = tool === 'move' ? 'pen' : 'move'; markTools(); }
   else if (b.id === 'zoomIn') zoomStep(1.5);
   else if (b.id === 'zoomOut') zoomStep(1 / 1.5);
   else if (b.id === 'zoomReset') setView(1, 0, 0, true);
@@ -924,6 +953,9 @@ $('#bar').addEventListener('click', (e) => {
 function openPanel(p) {
   layersPanel.hidden = p !== layersPanel;
   sharePanel.hidden = p !== sharePanel;
+  shelfPanel.hidden = p !== shelfPanel;
+  $('#shelfBtn').setAttribute('aria-expanded', String(p === shelfPanel));
+  if (p === shelfPanel) renderShelf();
   $('#layersBtn').setAttribute('aria-expanded', String(p === layersPanel));
   $('#shareBtn').setAttribute('aria-expanded', String(p === sharePanel));
   if (p === layersPanel) renderLayers();
@@ -1005,6 +1037,236 @@ sharePanel.addEventListener('click', (e) => {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(input.value).then(done, fallback);
   } else fallback();
+});
+
+// ---- crumple -----------------------------------------------------------------
+// Crumpling wipes the board for everyone and puts what was on it on a shelf of
+// up to five sheets; any of them can be brought back, which shelves the sheet
+// in use in its place. The animation's geometry comes from Rust (crumple.wasm):
+// each frame it returns a mesh, drawn here with WebGL using a picture of the
+// board as the paper.
+
+let shelf = [];                // [{ k, n }] crumpled sheets, oldest first
+const previews = new Map();    // k -> small canvas
+const asked = new Set();       // previews requested and not yet received
+const fx = $('#fx');
+const GRID_COLS = 48, GRID_ROWS = 27;
+const calm = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+let paper = null;              // crumple.wasm exports
+let glState;                   // undefined: not tried; null: no WebGL; else { gl, pos, n, count }
+let fxChain = Promise.resolve();
+
+(async () => {
+  try {
+    const res = await fetch('/crumple.wasm');
+    if (!res.ok) return;
+    const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+    const x = instance.exports;
+    if (x.cr_setup && x.cr_frame && x.cr_target && x.memory) paper = x;
+  } catch { /* no animation; crumpling still works */ }
+})();
+
+function glInit() {
+  if (glState !== undefined) return glState;
+  glState = null;
+  const gl = fx.getContext('webgl', { alpha: true, antialias: true, depth: true });
+  if (!gl) return null;
+  const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER,
+    'attribute vec4 a; attribute vec2 uv; uniform float asp; varying vec2 v; varying float s;' +
+    'void main(){ v = uv; s = a.w; gl_Position = vec4(a.x * 2.0 - 1.0, 1.0 - a.y / asp * 2.0, -a.z * 0.9, 1.0); }'));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER,
+    'precision mediump float; uniform sampler2D tex; varying vec2 v; varying float s;' +
+    'void main(){ gl_FragColor = vec4(texture2D(tex, v).rgb * s, 1.0); }'));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+  gl.useProgram(prog);
+  gl.uniform1f(gl.getUniformLocation(prog, 'asp'), ASPECT);
+  const C = GRID_COLS, R = GRID_ROWS, n = (C + 1) * (R + 1);
+  const uv = new Float32Array(n * 2), idx = new Uint16Array(C * R * 6);
+  for (let j = 0; j <= R; j++) for (let i = 0; i <= C; i++) { uv[(j * (C + 1) + i) * 2] = i / C; uv[(j * (C + 1) + i) * 2 + 1] = j / R; }
+  let q = 0;
+  for (let j = 0; j < R; j++) for (let i = 0; i < C; i++) {
+    const a = j * (C + 1) + i, b = a + 1, c = a + C + 1, d = c + 1;
+    idx[q++] = a; idx[q++] = b; idx[q++] = c; idx[q++] = b; idx[q++] = d; idx[q++] = c;
+  }
+  const attr = (name, size, data, usage) => {
+    const buf = gl.createBuffer(), loc = gl.getAttribLocation(prog, name);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, data, usage);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    return buf;
+  };
+  attr('uv', 2, uv, gl.STATIC_DRAW);
+  const pos = attr('a', 4, new Float32Array(n * 4), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0, 0, 0, 0);
+  return (glState = { gl, pos, n, count: idx.length });
+}
+
+// A picture of a sheet of paper, to wrap round the mesh.
+function paperCanvas() {
+  const c = document.createElement('canvas');
+  c.width = Math.min(1024, base.width); c.height = Math.round(c.width * ASPECT);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  return [c, ctx];
+}
+function edge(c, ctx) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#c9ced6'; ctx.lineWidth = 3; ctx.strokeRect(0, 0, c.width, c.height); return c; }
+// What the board shows right now.
+function paperOfScreen() {
+  const [c, ctx] = paperCanvas();
+  ctx.drawImage(base, 0, 0, c.width, c.height);
+  ctx.drawImage(live, 0, 0, c.width, c.height);
+  return edge(c, ctx);
+}
+// The current strokes at the current view, drawn in one go.
+function paperOfStrokes() {
+  const [c, ctx] = paperCanvas();
+  const k = (c.width / bw) * zoom;
+  ctx.setTransform(k, 0, 0, k, -panX * bw * k, -panY * bw * k);
+  const v = curView();
+  for (const s of strokes) if (!hidden.has(s.l)) drawFull(ctx, s, v);
+  return edge(c, ctx);
+}
+
+// Play the paper crumpling (or, reversed, uncrumpling). Resolves when done;
+// at once if the animation can't run here.
+function playPaper(tex, reverse, ms) {
+  return new Promise((done) => {
+    const g = !calm && paper && tex.width > 0 && glInit();
+    if (!g) return done();
+    const { gl } = g;
+    fx.width = base.width; fx.height = base.height;
+    gl.viewport(0, 0, fx.width, fx.height);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tex);
+    paper.cr_setup(GRID_COLS, GRID_ROWS, (Math.random() * 0x7fffffff) | 0, ASPECT);
+    // The wad flies to the Shelf button.
+    const br = boardEl.getBoundingClientRect(), sr = $('#shelfBtn').getBoundingClientRect();
+    const tx = sr.width ? (sr.left + sr.width / 2 - br.left) / bw : 0.06;
+    const ty = sr.width ? (sr.top + sr.height / 2 - br.top) / bw : 0.05;
+    paper.cr_target(Math.min(1.05, Math.max(-0.05, tx)), Math.min(ASPECT + 0.05, Math.max(-0.05, ty)));
+    fx.hidden = false;
+    const t0 = performance.now();
+    const tick = (now) => {
+      const p = Math.min(1, Math.max(0, (now - t0) / ms));
+      const ptr = paper.cr_frame(reverse ? 1 - p : p);
+      gl.bindBuffer(gl.ARRAY_BUFFER, g.pos);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(paper.memory.buffer, ptr, g.n * 4));
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.drawElements(gl.TRIANGLES, g.count, gl.UNSIGNED_SHORT, 0);
+      if (p < 1) requestAnimationFrame(tick);
+      else { fx.hidden = true; done(); }
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+// Empty the sheet in use, keeping my strokes the relay has not stored yet
+// (they will land on the new sheet).
+function clearSheet() {
+  const keep = strokes.filter((s) => pending.has(s.id));
+  strokes.length = 0; byId.clear(); counts.clear();
+  for (const s of keep) { strokes.push(s); byId.set(s.id, s); bump(s.l, 1); }
+}
+
+function crumple() {
+  if (role !== 'edit') return;
+  if (!(online && ready)) return toast('Not connected. Try again in a moment.');
+  if (!strokes.length) return toast('Nothing to crumple: the board is blank.');
+  if (editor) closeEditor(true);
+  send({ t: 'cr' });
+}
+
+function onCrumpled(m) {
+  const tex = paperOfScreen();
+  clearSheet();
+  for (const L of layers.values()) L.del = false;
+  shelf = Array.isArray(m.shelf) ? m.shelf : [];
+  redrawBase(true); layersChanged(); shelfChanged();
+  fxChain = fxChain.then(() => playPaper(tex, false, 950));
+  const text = m.drop != null ? 'Board crumpled. The oldest crumpled board was thrown away.' : 'Board crumpled and put on the shelf.';
+  if (role === 'edit') toast(text, 'Undo', () => send({ t: 'un', k: m.k }), 8000);
+  else toast(text, null, null, 4000);
+}
+
+function onUncrumpled(m) {
+  const old = strokes.some((s) => !pending.has(s.id)) ? paperOfScreen() : null;
+  clearSheet();
+  const mineLeft = strokes.splice(0);
+  for (const raw of Array.isArray(m.a) ? m.a : []) {
+    if (byId.has(raw.id)) continue;
+    const s = strokeFrom(raw); strokes.push(s); byId.set(s.id, s); bump(s.l, 1);
+  }
+  strokes.sort(byQ);
+  for (const s of mineLeft) strokes.push(s);
+  if (Array.isArray(m.layers)) for (const L of m.layers) layers.set(L.l, { l: L.l, c: L.c, del: !!L.del });
+  shelf = Array.isArray(m.shelf) ? m.shelf : [];
+  // Keep the board out of sight until the paper has unfolded over it.
+  base.style.visibility = 'hidden';
+  redrawBase(true); layersChanged(); shelfChanged();
+  const tex = paperOfStrokes();
+  fxChain = fxChain
+    .then(() => (old ? playPaper(old, false, 450) : null))
+    .then(() => playPaper(tex, true, 800))
+    .then(() => { base.style.visibility = ''; });
+}
+
+function shelfChanged() {
+  $('#shelfBtn').textContent = shelf.length ? `Shelf ${shelf.length}` : 'Shelf';
+  for (const k of [...previews.keys()]) if (!shelf.some((s) => s.k === k)) previews.delete(k);
+  renderShelf();
+}
+
+function renderShelf() {
+  if (shelfPanel.hidden) return;
+  $('#shelfHint').textContent = shelf.length
+    ? `${shelf.length} of 5 crumpled boards kept. Bringing one back crumples the board in use in its place.` +
+      (shelf.length >= 5 ? ' Crumpling another throws the oldest away.' : '')
+    : 'No crumpled boards yet. Crumple wipes the board for everyone and keeps it here.';
+  const rows = [];
+  for (let i = shelf.length - 1; i >= 0; i--) { // newest first
+    const { k, n } = shelf[i];
+    const li = el('li');
+    let pv = previews.get(k);
+    if (!pv) {
+      pv = document.createElement('canvas'); pv.width = 256; pv.height = 144;
+      if (!asked.has(k) && online && ready) { asked.add(k); send({ t: 'sv', k }); }
+    }
+    const who = el('span', 'who', i === shelf.length - 1 ? 'Latest' : `${shelf.length - 1 - i} before`);
+    who.append(el('small', null, `${n} item${n === 1 ? '' : 's'}`));
+    const b = el('button', null, 'Bring back'); b.type = 'button'; b.dataset.k = String(k);
+    b.setAttribute('aria-label', `Bring back crumpled board with ${n} items`);
+    li.append(pv, who, b);
+    rows.push(li);
+  }
+  shelfList.replaceChildren(...rows);
+}
+
+function onSheetView(m) {
+  asked.delete(m.k);
+  if (!shelf.some((s) => s.k === m.k) || !Array.isArray(m.a)) return;
+  const c = document.createElement('canvas'); c.width = 256; c.height = 144;
+  const ctx = c.getContext('2d'), k = c.width / bw;
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  for (const raw of m.a) drawFull(ctx, strokeFrom(raw));
+  previews.set(m.k, c);
+  renderShelf();
+}
+
+shelfList.addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-k]'); if (!b) return;
+  if (!(online && ready)) return toast('Not connected. Try again in a moment.');
+  if (editor) closeEditor(true);
+  send({ t: 'un', k: Number(b.dataset.k) });
+  openPanel(null);
 });
 
 // ---- toast and message card ------------------------------------------------
