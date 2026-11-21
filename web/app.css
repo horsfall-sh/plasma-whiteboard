@@ -184,3 +184,32 @@ body.edit.move #live, body:not(.edit) #live { cursor: grab; }
   background: #f2c66d; color: #23262b; font: 700 10px/13px system-ui, sans-serif; text-align: center;
 }
 #shelfN:empty { display: none; }
+
+/* ---- people, labels and pings ---- */
+#bar .act-ping { color: #d6a4ff; }                 /* pointing something out */
+#who {
+  position: fixed; right: 8px; bottom: 30px; z-index: 2; display: flex; align-items: center; gap: 6px;
+  min-width: 0; min-height: 30px; max-width: 60vw; padding: 4px 10px; border-radius: 15px; font-size: 13px;
+  background: #2b2f36; color: #e8eaed; border: 1px solid #444; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+#who .dot, #whoList .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(255,255,255,.5); }
+#who.ping { animation: whoIn 2.5s ease-out; border-color: currentColor; font-weight: 600; }
+@keyframes whoIn { from { opacity: 0; } to { opacity: 1; } }
+body.drawing #who { opacity: .12; pointer-events: none; }
+#meRow label { display: block; color: #9aa3ad; font-size: 12px; margin: 10px 0 4px; }
+#meRow .row { display: flex; gap: 6px; }
+#meRow input[type=text] { flex: 1 1 auto; min-width: 0; padding: 6px 8px; border-radius: 6px; border: 1px solid #555; background: #1e2126; color: #fff; font-size: 14px; }
+#meRow button { font-size: 13px; }
+#hueIn {
+  width: 100%; height: 22px; border-radius: 11px; appearance: none; -webkit-appearance: none; margin: 0;
+  background: linear-gradient(to right, hsl(0,70%,42%), hsl(60,70%,42%), hsl(120,70%,42%), hsl(180,70%,42%), hsl(240,70%,42%), hsl(300,70%,42%), hsl(359,70%,42%));
+}
+#hueIn::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: #fff; border: 2px solid #222; }
+#hueIn::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #fff; border: 2px solid #222; }
+body:not(.edit) #meRow { display: none; }
+#whoList { list-style: none; margin: 12px 0 0; padding: 0; }
+#whoList li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid #3a3f47; }
+#whoList li.away .who, #whoList li.away .dot { opacity: .45; }
+#whoList .who { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#whoList .who small { color: #9aa3ad; margin-left: 6px; }
+#whoList button { font-size: 13px; }

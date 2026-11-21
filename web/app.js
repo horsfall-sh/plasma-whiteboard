@@ -38,6 +38,7 @@ const statusEl = $('#status'), statusText = $('#status span');
 const toastEl = $('#toast'), msgEl = $('#msg');
 const layersPanel = $('#layersPanel'), sharePanel = $('#sharePanel'), layerList = $('#layerList');
 const shelfPanel = $('#shelfPanel'), shelfList = $('#shelfList');
+const whoPanel = $('#whoPanel'), whoBtn = $('#who');
 
 // ---- state -----------------------------------------------------------------
 
@@ -406,6 +407,7 @@ function redrawLive() {
   setCtxView(lctx, curView());
   wipe(lctx);
   for (const s of liveStrokes.values()) { s.drawn = 0; drawNew(s); }
+  drawPings();
 }
 
 // Time-sliced redraw of finished strokes. Invariant: strokes[0..cursor) are on
@@ -611,14 +613,16 @@ function onMessage(m) {
       removeStroke(m.id);
       break;
     case 'l':
-      if (!layers.has(m.l)) { layers.set(m.l, { l: m.l, c: m.c, del: false }); layersChanged(); }
+      if (!layers.has(m.l)) { layers.set(m.l, { l: m.l, c: m.c, del: false, n: null }); layersChanged(); renderWho(); }
       break;
     case 'ld': onLayerDeleted(m.l); break;
     case 'lr': onLayerRestored(m.l, m.a); break;
     case 'cr': onCrumpled(m); break;
     case 'un': onUncrumpled(m); break;
     case 'sv': onSheetView(m); break;
-    case 'n': people = m.n | 0; showStatus(); break;
+    case 'n': people = m.n | 0; onlineLayers = new Set(Array.isArray(m.on) ? m.on : []); showStatus(); renderWho(); break;
+    case 'nm': onName(m); break;
+    case 'pg': onPing(m); break;
     case 'err': onError(m); break;
   }
 }
@@ -646,7 +650,7 @@ function onHello(m) {
   dropBoard();
   if (keep) { keep.l = me; liveStrokes.set(keep.id, keep); cur.sent = false; cur.out = []; }
   else { cur = null; document.body.classList.remove('drawing'); }
-  for (const L of Array.isArray(m.layers) ? m.layers : []) layers.set(L.l, { l: L.l, c: L.c, del: !!L.del });
+  for (const L of Array.isArray(m.layers) ? m.layers : []) layers.set(L.l, { l: L.l, c: L.c, del: !!L.del, n: L.n || null });
 
   const mineNow = me != null && layers.get(me) ? layers.get(me).c : null;
   if (mineNow && (color == null || color === myColor)) color = mineNow;
@@ -657,6 +661,7 @@ function onHello(m) {
   statusEl.classList.add('ok'); showStatus('connected');
   shelf = Array.isArray(m.shelf) ? m.shelf : [];
   fillShare(); layersChanged(); shelfChanged();
+  sendLabel(); renderWho();
 }
 
 function onReady() {
@@ -735,14 +740,54 @@ let drag = null;       // { pointerId, x, y } one-pointer pan in progress
 let textTap = null;    // { pointerId } a tap that will place text on release
 let spaceDown = false;
 
+// Fast writing outruns the screen: a quick cursive loop arrives as a handful
+// of samples many pixels apart, and joining them with straight lines makes it
+// angular. Where samples are far apart, fill in along a curve through them (a
+// centripetal Catmull-Rom spline, which does not overshoot or make loops of
+// its own). Samples that are already close are left alone.
+function curveThrough(pts, px) {
+  const Q = [];
+  for (let i = 0; i < pts.length; i += 3) {
+    const n = Q.length;
+    if (!n || Q[n - 2] !== pts[i] || Q[n - 1] !== pts[i + 1]) Q.push(pts[i], pts[i + 1]);
+  }
+  const m = Q.length / 2;
+  if (m < 3) return pts;
+  const X = (i) => (i < 0 ? 2 * Q[0] - Q[2] : i >= m ? 2 * Q[2 * m - 2] - Q[2 * m - 4] : Q[2 * i]);
+  const Y = (i) => (i < 0 ? 2 * Q[1] - Q[3] : i >= m ? 2 * Q[2 * m - 1] - Q[2 * m - 3] : Q[2 * i + 1]);
+  const out = [Q[0], Q[1], 0.5];
+  for (let i = 0; i < m - 1; i++) {
+    const x1 = X(i), y1 = Y(i), x2 = X(i + 1), y2 = Y(i + 1);
+    const steps = Math.min(64, Math.ceil((Math.hypot(x2 - x1, y2 - y1) * px) / 2));
+    if (steps > 2) {
+      const x0 = X(i - 1), y0 = Y(i - 1), x3 = X(i + 2), y3 = Y(i + 2);
+      const t1 = Math.sqrt(Math.hypot(x1 - x0, y1 - y0)) || 1e-6;
+      const t2 = t1 + Math.sqrt(Math.hypot(x2 - x1, y2 - y1));
+      const t3 = t2 + (Math.sqrt(Math.hypot(x3 - x2, y3 - y2)) || 1e-6);
+      for (let k = 1; k < steps; k++) {
+        const t = t1 + ((t2 - t1) * k) / steps;
+        const a1x = ((t1 - t) * x0 + t * x1) / t1, a1y = ((t1 - t) * y0 + t * y1) / t1;
+        const a2x = ((t2 - t) * x1 + (t - t1) * x2) / (t2 - t1), a2y = ((t2 - t) * y1 + (t - t1) * y2) / (t2 - t1);
+        const a3x = ((t3 - t) * x2 + (t - t2) * x3) / (t3 - t2), a3y = ((t3 - t) * y2 + (t - t2) * y3) / (t3 - t2);
+        const b1x = ((t2 - t) * a1x + t * a2x) / t2, b1y = ((t2 - t) * a1y + t * a2y) / t2;
+        const b2x = ((t3 - t) * a2x + (t - t1) * a3x) / (t3 - t1), b2y = ((t3 - t) * a2y + (t - t1) * a3y) / (t3 - t1);
+        out.push(((t2 - t) * b1x + (t - t1) * b2x) / (t2 - t1), ((t2 - t) * b1y + (t - t1) * b2y) / (t2 - t1), 0.5);
+      }
+    }
+    out.push(x2, y2, 0.5);
+  }
+  return out;
+}
+
 // A fingertip wobbles and the screen reports it in whole pixels. When the
 // finger lifts, the line is re-sampled at even steps and each point is
 // averaged with its neighbours on both sides (a bell-shaped weighting about
 // 3.5 screen px wide). Averaging both ways adds no lag, keeps the two ends
 // where they were, and leaves curves as curves.
 function steady(pts, px) {
+  if (pts.length < 9) return pts;
+  pts = curveThrough(pts, px);
   const n = pts.length / 3;
-  if (n < 3) return pts;
   const step = 1.5 / px, R = [];
   let x = pts[0], y = pts[1], left = step;
   R.push(x, y);
@@ -768,6 +813,12 @@ function steady(pts, px) {
   }
   return out;
 }
+
+// The pen is the same thickness on the screen wherever you are: S, M and L
+// are about 2, 4 and 9 screen px. An upright tablet or a zoomed-in view shows
+// the board larger, and a line fixed in board units came out too fat for
+// handwriting there.
+function penW(w) { return Math.min(0.05, Math.max(0.0004, r5((w * 1000) / (bw * zoom)))); }
 
 function addPoint(e, rect) {
   const s = liveStrokes.get(cur.id); if (!s) return;
@@ -849,10 +900,12 @@ live.addEventListener('pointerdown', (e) => {
   if (tool === 'text') { textTap = { pointerId: e.pointerId }; return; }
   // Button 5 / buttons bit 32 is the eraser end of a pen.
   const penEraser = t === 'pen' && (e.button === 5 || (e.buttons & 32) !== 0);
-  const erase = tool === 'erase' || penEraser;
+  const ping = tool === 'ping' && !penEraser;
+  const erase = !ping && (tool === 'erase' || penEraser);
   const id = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
-  const s = begin(id, me, erase ? ERASER_COLOR : color, erase ? width * ERASER_SCALE : width);
-  cur = { id, pointerId: e.pointerId, out: [], sent: online && ready, pen: t === 'pen' };
+  const s = begin(id, me, ping ? myColor : erase ? ERASER_COLOR : color, penW(ping ? 0.004 : erase ? width * ERASER_SCALE : width));
+  // A ping is drawn here only; it goes out as one message when it ends.
+  cur = { id, pointerId: e.pointerId, out: [], sent: !ping && online && ready, pen: t === 'pen', ping };
   document.body.classList.add('drawing');
   if (cur.sent) send({ t: 'b', id, c: s.c, w: s.w });
   addPoint(e, boardEl.getBoundingClientRect());
@@ -890,9 +943,10 @@ function endStroke(e) {
   if (!cur || e.pointerId !== cur.pointerId) return;
   const id = cur.id, sent = cur.sent, out = cur.out, s = liveStrokes.get(id);
   // Tolerance: a third of a pixel at 100%, never looser when zoomed out.
-  const touch = cur.touch, eps = touch ? Math.max(EPS / Math.max(1, zoom), 0.5 / (bw * zoom)) : EPS / Math.max(1, zoom);
+  const touch = cur.touch, wasPing = cur.ping, eps = touch ? 0.3 / (bw * zoom) : EPS / Math.max(1, zoom);
   cur = null; document.body.classList.remove('drawing');
   if (!s) return;
+  if (wasPing) { liveStrokes.delete(id); redrawLive(); sendPing(s.pts, touch); tool = 'pen'; markTools(); return; }
   if (sent && out.length) send({ t: 'p', id, pts: out });
   liveStrokes.delete(id);
   if (!s.pts.length) { redrawLive(); if (sent) send({ t: 'u', id }); return; }
@@ -1078,6 +1132,7 @@ function markTools() {
   const pb = $('#penBtn'); pb.classList.toggle('on', tool === 'pen'); pb.setAttribute('aria-pressed', String(tool === 'pen'));
   eraserBtn.classList.toggle('on', tool === 'erase'); eraserBtn.setAttribute('aria-pressed', String(tool === 'erase'));
   textBtn.classList.toggle('on', tool === 'text'); textBtn.setAttribute('aria-pressed', String(tool === 'text'));
+  const pg = $('#pingBtn'); pg.classList.toggle('on', tool === 'ping'); pg.setAttribute('aria-pressed', String(tool === 'ping'));
   document.body.classList.toggle('text', tool === 'text');
   const mv = $('#moveBtn'); mv.classList.toggle('on', tool === 'move'); mv.setAttribute('aria-pressed', String(tool === 'move'));
   document.body.classList.toggle('move', tool === 'move');
@@ -1094,6 +1149,7 @@ $('#bar').addEventListener('click', (e) => {
   else if (b.id === 'penBtn') { tool = 'pen'; markTools(); }
   else if (b.id === 'eraser') { tool = tool === 'erase' ? 'pen' : 'erase'; markTools(); }
   else if (b.id === 'textBtn') { tool = tool === 'text' ? 'pen' : 'text'; markTools(); }
+  else if (b.id === 'pingBtn') { tool = tool === 'ping' ? 'pen' : 'ping'; markTools(); }
   else if (b.id === 'crumpleBtn') crumple();
   else if (b.id === 'shelfBtn') openPanel(shelfPanel.hidden ? shelfPanel : null);
   else if (b.id === 'moveBtn') { tool = tool === 'move' ? 'pen' : 'move'; markTools(); }
@@ -1105,12 +1161,187 @@ $('#bar').addEventListener('click', (e) => {
   else if (b.id === 'shareBtn') openPanel(sharePanel.hidden ? sharePanel : null);
 });
 
+// ---- people: labels, the roster and attention pings -------------------------
+
+const NAME_A = ['Amber', 'Brisk', 'Calm', 'Clever', 'Copper', 'Dapper', 'Eager', 'Fuzzy', 'Gentle', 'Golden', 'Happy', 'Indigo', 'Jolly', 'Keen', 'Lively', 'Lucky', 'Mellow', 'Nimble', 'Olive', 'Plucky', 'Quiet', 'Rapid', 'Rusty', 'Silver', 'Sunny', 'Tidy', 'Velvet', 'Witty', 'Zesty', 'Bold', 'Cosy', 'Merry'];
+const NAME_B = ['Otter', 'Heron', 'Badger', 'Falcon', 'Lynx', 'Marten', 'Newt', 'Osprey', 'Panda', 'Quail', 'Raven', 'Seal', 'Tapir', 'Vole', 'Walrus', 'Yak', 'Zebra', 'Beaver', 'Crane', 'Dingo', 'Egret', 'Finch', 'Gecko', 'Hare', 'Ibis', 'Jackal', 'Koala', 'Lemur', 'Moose', 'Robin', 'Stoat', 'Wren'];
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+const rollName = () => `${pick(NAME_A)} ${pick(NAME_B)}`;
+const cleanName = (t) => String(t).replace(/[\u0000-\u001f\u007f]/g, '').trim().split(/\s+/).join(' ').slice(0, 24);
+// Remembered in this browser, for every board. Private windows may refuse storage.
+const recall = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const remember = (k, v) => { try { localStorage.setItem(k, v); } catch { /* not kept */ } };
+
+let myName = cleanName(recall('wb.name') || '') || rollName();
+let myHue = recall('wb.hue') == null ? null : Math.max(0, Math.min(359, Number(recall('wb.hue')) || 0));
+let onlineLayers = new Set();
+
+function hueHex(h) { // hsl(h, 70%, 42%) as #rrggbb
+  const s = 0.7, l = 0.42, c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
+  const [r, g, b] = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][Math.floor(h / 60) % 6];
+  return '#' + [r, g, b].map((v) => Math.round((v + m) * 255).toString(16).padStart(2, '0')).join('');
+}
+
+// Tell the board my name and colour. The relay keeps them only while the board is open.
+function sendLabel() {
+  if (role !== 'edit' || me == null) return;
+  const c = myHue != null ? hueHex(myHue) : (layers.get(me) || {}).c;
+  if (c) send({ t: 'nm', n: myName, c });
+}
+
+function onName(m) {
+  const L = layers.get(m.l); if (!L) return;
+  L.n = typeof m.n === 'string' ? m.n : null;
+  if (typeof m.c === 'string' && /^#[0-9a-f]{6}$/i.test(m.c)) L.c = m.c;
+  if (m.l === me) {
+    if (color == null || color === myColor) color = L.c;
+    myColor = L.c; buildSwatches();
+  }
+  layersChanged(); renderWho();
+  if (pings.length) redrawLive();
+}
+
+// A ping is a shape that glows for a few seconds for everyone and is never kept.
+const PING_MS = 6000, NUDGE_MS = 20000;
+const pings = [];             // { l, k, pts, t0, bb } being shown
+const lastPing = new Map();   // l -> that layer's latest ping
+let nudge = null, nudgeTimer = 0, pingLoop = false;
+
+function sendPing(pts, touch) {
+  if (pts.length < 6) { toast('Circle something to ping it.', null, null, 2500); return; }
+  let eps = 2 / (bw * zoom), p = simplify(touch ? steady(pts, bw * zoom) : pts, eps);
+  while (p.length > 600) { eps *= 2; p = simplify(p, eps); }
+  if (online && ready) send({ t: 'pg', pts: p }); else toast('Not connected: the ping was not sent.', null, null, 2500);
+}
+
+function onPing(m) {
+  if (!Array.isArray(m.pts) || m.pts.length < 6) return;
+  const bb = [Infinity, Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < m.pts.length; i += 3) {
+    bb[0] = Math.min(bb[0], m.pts[i]); bb[1] = Math.min(bb[1], m.pts[i + 1]);
+    bb[2] = Math.max(bb[2], m.pts[i]); bb[3] = Math.max(bb[3], m.pts[i + 1]);
+  }
+  const p = { l: m.l, k: String(m.k || '?').slice(0, 1), pts: m.pts, t0: performance.now(), bb };
+  pings.push(p); if (pings.length > 8) pings.shift();
+  lastPing.set(m.l, p);
+  if (m.l !== me) { // a nudge, never a forced move
+    nudge = p; clearTimeout(nudgeTimer);
+    nudgeTimer = setTimeout(() => { nudge = null; renderWho(); }, NUDGE_MS);
+  }
+  renderWho(); showPings();
+}
+
+function showPings() {
+  if (pingLoop) return;
+  pingLoop = true;
+  const tick = () => {
+    const now = performance.now();
+    for (let i = pings.length - 1; i >= 0; i--) if (now - pings[i].t0 > PING_MS) pings.splice(i, 1);
+    redrawLive();
+    if (pings.length) requestAnimationFrame(tick); else pingLoop = false;
+  };
+  requestAnimationFrame(tick);
+}
+
+function drawPings() {
+  if (!pings.length) return;
+  const now = performance.now(), ctx = lctx, u = 1 / zoom; // u: one screen px
+  for (const p of pings) {
+    const age = now - p.t0; if (age > PING_MS || hidden.has(p.l)) continue;
+    const c = (layers.get(p.l) || {}).c || '#e67e22';
+    const a = Math.min(1, age / 200) * Math.min(1, (PING_MS - age) / 1500);
+    const pulse = 0.65 + 0.35 * Math.sin(age / 170);
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over'; ctx.lineCap = ctx.lineJoin = 'round';
+    ctx.strokeStyle = c; ctx.shadowColor = c; ctx.shadowBlur = 22 * dpr * pulse;
+    ctx.beginPath(); ctx.moveTo(p.pts[0] * bw, p.pts[1] * bw);
+    for (let i = 3; i < p.pts.length; i += 3) ctx.lineTo(p.pts[i] * bw, p.pts[i + 1] * bw);
+    ctx.globalAlpha = a * 0.35 * pulse; ctx.lineWidth = 14 * u; ctx.stroke();
+    ctx.globalAlpha = a; ctx.lineWidth = 4 * u; ctx.stroke();
+    // The letter, on a disc at the shape's top left.
+    const x = p.bb[0] * bw, y = p.bb[1] * bw, r = 13 * u;
+    ctx.shadowBlur = 8 * dpr; ctx.fillStyle = c;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = '#fff'; ctx.font = `700 ${15 * u}px ${FONT}`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(p.k, x, y + u);
+    ctx.restore();
+  }
+}
+
+// Bring a ping into view and show it again.
+function jumpToPing(p) {
+  const cx = (p.bb[0] + p.bb[2]) / 2, cy = (p.bb[1] + p.bb[3]) / 2;
+  setView(zoom, cx - visW(zoom) / 2, cy - visH(zoom) / 2, true);
+  p.t0 = performance.now();
+  if (!pings.includes(p)) pings.push(p);
+  showPings();
+}
+
+function renderWho() {
+  const dot = whoBtn.querySelector('.dot'), text = $('#whoText');
+  whoBtn.classList.toggle('ping', !!nudge);
+  if (nudge) {
+    const c = (layers.get(nudge.l) || {}).c || '#e67e22';
+    dot.style.background = c; whoBtn.style.color = '';
+    text.textContent = `${nudge.k} · ${nameOf(nudge.l)} is pointing`;
+  } else {
+    dot.style.background = myColor || '#888';
+    text.textContent = `${role === 'edit' && me != null ? myName : 'Watching'} · ${Math.max(1, people)} here`;
+  }
+  if (whoPanel.hidden) return;
+  const nameIn = $('#nameIn');
+  if (document.activeElement !== nameIn) nameIn.value = myName;
+  if (myHue != null && document.activeElement !== $('#hueIn')) $('#hueIn').value = String(myHue);
+  // Most recent pingers first, then me, then the others who are here.
+  const rows = [...layers.values()].filter((L) => onlineLayers.has(L.l) || lastPing.has(L.l) || L.l === me);
+  const when = (L) => (lastPing.has(L.l) ? lastPing.get(L.l).t0 : 0);
+  rows.sort((a, b) => when(b) - when(a) || (a.l === me ? -1 : b.l === me ? 1 : a.l - b.l));
+  const out = rows.map((L) => {
+    const li = el('li', onlineLayers.has(L.l) ? null : 'away');
+    const d = el('span', 'dot'); d.style.background = L.c;
+    const who = el('span', 'who', L.l === me ? `${nameOf(L.l)} (you)` : nameOf(L.l));
+    if (!onlineLayers.has(L.l)) who.append(el('small', null, 'left'));
+    li.append(d, who);
+    const p = lastPing.get(L.l);
+    if (p) {
+      const b = el('button', null, `Go to ${p.k}`);
+      b.type = 'button'; b.setAttribute('aria-label', `Go to ping ${p.k} from ${nameOf(L.l)}`);
+      b.addEventListener('click', () => { openPanel(null); jumpToPing(p); });
+      li.append(b);
+    }
+    return li;
+  });
+  const watching = people - [...onlineLayers].length;
+  if (watching > 0) out.push(el('li', 'away', `${watching} more watching or in another tab`));
+  $('#whoList').replaceChildren(...out);
+}
+
+whoBtn.addEventListener('click', () => {
+  if (nudge) { const p = nudge; nudge = null; clearTimeout(nudgeTimer); renderWho(); jumpToPing(p); return; }
+  openPanel(whoPanel.hidden ? whoPanel : null);
+});
+$('#nameIn').addEventListener('change', (e) => {
+  myName = cleanName(e.target.value) || rollName(); e.target.value = myName;
+  remember('wb.name', myName); sendLabel(); renderWho();
+});
+$('#reroll').addEventListener('click', () => {
+  myName = rollName(); $('#nameIn').value = myName;
+  remember('wb.name', myName); sendLabel(); renderWho();
+});
+$('#hueIn').addEventListener('change', (e) => {
+  myHue = Math.max(0, Math.min(359, Number(e.target.value) || 0));
+  remember('wb.hue', String(myHue)); sendLabel();
+});
+
 // ---- panels ----------------------------------------------------------------
 
 function openPanel(p) {
   layersPanel.hidden = p !== layersPanel;
   sharePanel.hidden = p !== sharePanel;
   shelfPanel.hidden = p !== shelfPanel;
+  whoPanel.hidden = p !== whoPanel;
+  whoBtn.setAttribute('aria-expanded', String(p === whoPanel));
+  if (p === whoPanel) renderWho();
   $('#shelfBtn').setAttribute('aria-expanded', String(p === shelfPanel));
   if (p === shelfPanel) renderShelf();
   $('#layersBtn').setAttribute('aria-expanded', String(p === layersPanel));
@@ -1120,7 +1351,8 @@ function openPanel(p) {
 }
 for (const b of document.querySelectorAll('[data-close]')) b.addEventListener('click', () => openPanel(null));
 
-const layerName = (l) => (l === me ? 'Your' : `Guest ${l}`);
+const nameOf = (l) => (layers.get(l) && layers.get(l).n) || `Guest ${l}`;
+const layerName = (l) => (l === me ? 'Your' : `${nameOf(l)}'s`);
 
 let layersQueued = false;
 function layersChanged() {
@@ -1139,7 +1371,7 @@ function renderLayers() {
     if (n === 0 && !L.del && L.l !== me) li.classList.add('dim');
     if (off) li.classList.add('off');
     const d = el('span', 'dot'); d.style.background = L.c;
-    const who = el('span', 'who', L.l === me ? 'You' : `Guest ${L.l}`);
+    const who = el('span', 'who', L.l === me ? `${nameOf(L.l)} (you)` : nameOf(L.l));
     who.append(el('small', null, `${n} item${n === 1 ? '' : 's'}${L.del ? ' · deleted' : ''}`));
     li.append(d, who);
     li.append(layerButton(off ? 'Show' : 'Hide', 'eye', L.l,
@@ -1380,7 +1612,7 @@ function onUncrumpled(m) {
   }
   strokes.sort(byQ);
   for (const s of mineLeft) strokes.push(s);
-  if (Array.isArray(m.layers)) for (const L of m.layers) layers.set(L.l, { l: L.l, c: L.c, del: !!L.del });
+  if (Array.isArray(m.layers)) for (const L of m.layers) layers.set(L.l, { l: L.l, c: L.c, del: !!L.del, n: L.n || null });
   shelf = Array.isArray(m.shelf) ? m.shelf : [];
   // Keep the board out of sight until the paper has unfolded over it.
   base.style.visibility = 'hidden';

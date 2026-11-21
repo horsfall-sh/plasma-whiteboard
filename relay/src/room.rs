@@ -9,6 +9,7 @@ use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 pub const ASPECT: f32 = 0.5625;
@@ -29,6 +30,9 @@ pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_TEXT_LINES: usize = 20;
 /// Crumpled sheets kept per board. Crumpling one more throws the oldest away.
 pub const MAX_SHELF: usize = 5;
+/// An attention ping is a rough circle, not a drawing.
+const MAX_PING_POINTS: usize = 300;
+const PING_EVERY: Duration = Duration::from_secs(2);
 const SNAPSHOT_CHUNK: usize = 200;
 
 /// A message on its way to the board's connections.
@@ -82,6 +86,14 @@ pub enum In {
     /// Ask for the strokes of crumpled sheet `k`, to draw a preview.
     #[serde(rename = "sv")]
     SheetView { k: u32 },
+    /// My label: a display name and my colour. Kept in memory only; the
+    /// browser sends it again on every join.
+    #[serde(rename = "nm")]
+    Name { n: String, c: String },
+    /// An attention ping: a shape shown to everyone for a few seconds and
+    /// never stored.
+    #[serde(rename = "pg")]
+    Ping { pts: Vec<f32> },
 }
 
 struct Stroke {
@@ -106,6 +118,10 @@ struct Layer {
     n: u32,
     who: [u8; 32],
     color: String,
+    name: Option<String>,
+    /// Connections open on this layer now.
+    on: u32,
+    pinged: Option<Instant>,
 }
 
 struct Live {
@@ -132,6 +148,8 @@ struct State {
     layers: Vec<Layer>,
     live: HashMap<String, Live>,
     conns: usize,
+    /// The next ping's letter, 0 for A, wrapping after Z.
+    next_ping: u8,
 }
 
 pub struct Room {
@@ -330,7 +348,7 @@ impl Room {
         let layers = loaded
             .layers
             .into_iter()
-            .map(|(n, who, color)| Layer { n, who, color })
+            .map(|(n, who, color)| Layer { n, who, color, name: None, on: 0, pinged: None })
             .collect();
         let (tx, _) = broadcast::channel(256);
         Room {
@@ -347,6 +365,7 @@ impl Room {
                 layers,
                 live: HashMap::new(),
                 conns: 0,
+                next_ping: 0,
             }),
         }
     }
@@ -383,14 +402,15 @@ impl Room {
         let mut layer = 0;
         if role == Role::Edit {
             let who = who.ok_or(())?;
-            if let Some(l) = st.layers.iter().find(|l| l.who == who) {
+            if let Some(l) = st.layers.iter_mut().find(|l| l.who == who) {
                 layer = l.n;
+                l.on += 1;
             } else if st.layers.len() < MAX_LAYERS {
                 layer = st.layers.len() as u32 + 1;
                 let color = layer_color(layer);
                 db.add_layer(self.board, layer, who, color.clone());
                 self.all(format!(r#"{{"t":"l","l":{layer},"c":"{color}"}}"#));
-                st.layers.push(Layer { n: layer, who, color });
+                st.layers.push(Layer { n: layer, who, color, name: None, on: 1, pinged: None });
             } else {
                 role = Role::View;
             }
@@ -399,7 +419,7 @@ impl Room {
         // Subscribe after the layer notice (the newcomer reads its layer from
         // hello) and before anything else can be broadcast.
         let rx = self.tx.subscribe();
-        self.all(format!(r#"{{"t":"n","n":{}}}"#, st.conns));
+        self.all(count_msg(&st));
 
         let mut snapshot = Vec::new();
         let mut hello = String::from(r#"{"t":"hello","role":"#);
@@ -439,16 +459,22 @@ impl Room {
     }
 
     /// Remove a connection and abandon the strokes it left unfinished.
-    pub fn leave(&self, conn: u64) {
+    pub fn leave(&self, peer: Peer) {
+        let conn = peer.conn;
         let mut st = self.st.lock().unwrap();
         st.conns = st.conns.saturating_sub(1);
+        if peer.role == Role::Edit {
+            if let Some(l) = st.layers.iter_mut().find(|l| l.n == peer.layer) {
+                l.on = l.on.saturating_sub(1);
+            }
+        }
         let gone: Vec<String> =
             st.live.iter().filter(|(_, s)| s.conn == conn).map(|(id, _)| id.clone()).collect();
         for id in gone {
             st.live.remove(&id);
             self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
         }
-        self.all(format!(r#"{{"t":"n","n":{}}}"#, st.conns));
+        self.all(count_msg(&st));
     }
 
     /// Apply one message from a connection that has joined.
@@ -465,6 +491,44 @@ impl Room {
         let conn = peer.conn;
         match msg {
             In::Join { .. } => {}
+            In::Name { n, c } => {
+                let Some(name) = clean_name(&n) else {
+                    return;
+                };
+                if !valid_color(&c) || !heavy.take() {
+                    return;
+                }
+                let color = c.to_ascii_lowercase();
+                let Some(l) = st.layers.iter_mut().find(|l| l.n == peer.layer) else {
+                    return;
+                };
+                l.name = Some(name.clone());
+                l.color = color.clone();
+                let name = serde_json::to_string(&name).unwrap_or_else(|_| "null".into());
+                self.all(format!(r#"{{"t":"nm","l":{},"n":{name},"c":"{color}"}}"#, peer.layer));
+            }
+            In::Ping { pts } => {
+                if pts.len() > MAX_PING_POINTS * 3 {
+                    return;
+                }
+                let Some(pts) = clean_pts(pts) else {
+                    return;
+                };
+                if pts.len() < 6 {
+                    return;
+                }
+                let now = Instant::now();
+                let Some(l) = st.layers.iter_mut().find(|l| l.n == peer.layer) else {
+                    return;
+                };
+                if l.pinged.is_some_and(|t| now.duration_since(t) < PING_EVERY) {
+                    return; // one ping every two seconds per contributor
+                }
+                l.pinged = Some(now);
+                let k = (b'A' + st.next_ping) as char;
+                st.next_ping = (st.next_ping + 1) % 26;
+                self.all(format!(r#"{{"t":"pg","l":{},"k":"{k}","pts":{}}}"#, peer.layer, pts_json(&pts)));
+            }
             In::Begin { id, c, w } => {
                 if !valid_id(&id) || !valid_color(&c) || !valid_width(w) {
                     return;
@@ -736,7 +800,23 @@ impl Room {
     }
 }
 
-/// The layers as they go in hello and un: `{l, c, del}` objects, comma separated.
+/// The head count, with the layers that have a connection open: `{t:"n", n, on:[l..]}`.
+fn count_msg(st: &State) -> String {
+    let on: Vec<String> = st.layers.iter().filter(|l| l.on > 0).map(|l| l.n.to_string()).collect();
+    format!(r#"{{"t":"n","n":{},"on":[{}]}}"#, st.conns, on.join(","))
+}
+
+/// A display name: 1 to 24 characters, single spaces, nothing unprintable.
+fn clean_name(n: &str) -> Option<String> {
+    let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
+    let len = n.chars().count();
+    if len == 0 || len > 24 || n.chars().any(char::is_control) {
+        return None;
+    }
+    Some(n)
+}
+
+/// The layers as they go in hello and un: `{l, c, del, n}` objects, comma separated.
 fn layers_json(st: &State) -> String {
     let mut out = String::new();
     for (i, l) in st.layers.iter().enumerate() {
@@ -744,7 +824,8 @@ fn layers_json(st: &State) -> String {
         if i > 0 {
             out.push(',');
         }
-        out.push_str(&format!(r#"{{"l":{},"c":"{}","del":{del}}}"#, l.n, l.color));
+        let name = l.name.as_ref().and_then(|n| serde_json::to_string(n).ok()).unwrap_or_else(|| "null".into());
+        out.push_str(&format!(r#"{{"l":{},"c":"{}","del":{del},"n":{name}}}"#, l.n, l.color));
     }
     out
 }

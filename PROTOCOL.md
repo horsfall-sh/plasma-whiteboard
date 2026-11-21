@@ -55,6 +55,8 @@ the connection. The key is sent in the first message, never in the URL.
 | `cr` | | Crumple: move everything on the sheet in use to the shelf and start blank (any editor). Ignored on a blank sheet. |
 | `un` | `k` | Bring crumpled sheet `k` back (any editor). The sheet in use, if it has anything on it, is crumpled in its place. |
 | `sv` | `k` | Ask for the strokes of crumpled sheet `k`, to draw a preview. |
+| `nm` | `n`, `c` | My label: a display name (1 to 24 characters) and my colour `#rrggbb`. Kept in memory only while the board is open; the browser sends it after every `hello`. |
+| `pg` | `pts` | An attention ping: a shape (2 to 300 points) shown to everyone for a few seconds. Never stored. One every two seconds per contributor; extra ones are dropped. |
 
 Messages from a viewer other than `join` are ignored.
 
@@ -62,7 +64,7 @@ Messages from a viewer other than `join` are ignored.
 
 | `t` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
+| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. Each layer is `{l, c, del, n}` (`n`: name or null). `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
 | `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`. |
 | `ready` | | Snapshot complete. The client now resends unconfirmed strokes with `s`. |
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
@@ -77,7 +79,9 @@ Messages from a viewer other than `join` are ignored.
 | `cr` | `k`, `by`, `drop`, `shelf` | The sheet was crumpled into shelf entry `k` by layer `by`: drop every stored item (keep your own unconfirmed ones; they land on the new sheet) and clear every layer's `del`. `drop` is the sheet number thrown away to keep the shelf at five, or null. Sent to everyone. |
 | `un` | `k`, `by`, `shelf`, `layers`, `a` | Sheet `k` was brought back: `a` holds its items, `layers` the layer list as in `hello`. Replace the board with them. Sent to everyone. |
 | `sv` | `k`, `a` | To the one who asked: the items of crumpled sheet `k`. |
-| `n` | `n` | Number of connections on the board now. |
+| `n` | `n`, `on` | Number of connections on the board now, and the layers that have one open. |
+| `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. |
+| `pg` | `l`, `k`, `pts` | A ping from layer `l` with letter `k` (A to Z, then round again). Sent to everyone, including the sender. |
 | `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections (retry later). `rate`: sending too fast. `bad`: malformed join. |
 
 `q` is a per-board sequence number. Strokes are drawn in `q` order. A stroke is never changed after it is

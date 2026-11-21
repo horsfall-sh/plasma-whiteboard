@@ -279,7 +279,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, _guard: IpGuard) {
 
     {
         let mut rooms = app.rooms.lock().await;
-        room.leave(conn);
+        room.leave(joined.peer);
         if room.conns() == 0 {
             rooms.remove(&board);
         }

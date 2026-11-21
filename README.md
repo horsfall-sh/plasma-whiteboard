@@ -26,7 +26,21 @@ board in a browser window on a laptop, and share that window in a video call.
   The **Move** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom
   left shows where you are; tap or drag on it to go there. On a view link one finger or the mouse pans.
 
+## People, names and pings
+
+- Everyone who can draw gets a two-word name and a colour. The chip at the bottom right opens the list of
+  people; there you can type your own name, roll a new one, or pick your colour with the slider. Both are
+  remembered in the browser. The relay keeps them only while the board is open.
+- **Ping:** press the ping button and circle something. The shape glows in your colour for everyone for a
+  few seconds with a letter (A, B, C ...) and is never stored. Others see a chip fade in ("B · Amber Otter
+  is pointing"); tapping it takes them there. Nobody's view is moved for them. There are no shared cursors.
+
 ## Tablet and pen
+
+- **Fast writing.** A finger moving fast is reported only about 60 times a second, so a quick cursive loop
+  arrives as a few far-apart points. When the finger lifts, the gaps are filled along a curve through the
+  points (centripetal Catmull-Rom) before smoothing.
+- **Pen thickness** is constant on the screen (S, M, L are about 2, 4 and 9 px) whatever the device or zoom.
 
 - **Finger on a phone.** The board starts at 100%, so an upright phone shows about a third of a page and a
   finger has room to write. Finger strokes are smoothed when the finger lifts: re-sampled at even steps and averaged with

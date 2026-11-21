@@ -26,6 +26,7 @@
   <button type="button" id="penBtn" class="tools on" title="Pen" aria-label="Pen" aria-pressed="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19l-4 1z"/><path d="M14.5 6.5l3 3"/></svg></button>
   <button type="button" id="eraser" class="tools" title="Eraser" aria-label="Eraser" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 19.5l-4.6-4.6a1.6 1.6 0 0 1 0-2.3l8.7-8.7a1.6 1.6 0 0 1 2.3 0l5.2 5.2a1.6 1.6 0 0 1 0 2.3L12 19.5H8.5z"/><path d="M8.3 8.2l7.5 7.5"/><path d="M12 19.5h8.5"/></svg></button>
   <button type="button" id="textBtn" class="tools" title="Text" aria-label="Text annotation" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6V4h14v2"/><path d="M12 4v16"/><path d="M9 20h6"/></svg></button>
+  <button type="button" id="pingBtn" class="tools act-ping" title="Ping: circle something to point it out. It glows for everyone and is not kept." aria-label="Ping: circle an area to point it out" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2.5"/><path d="M6.3 6.3a8 8 0 0 0 0 11.4"/><path d="M17.7 6.3a8 8 0 0 1 0 11.4"/></svg></button>
   <span class="sep tools"></span>
   <button type="button" class="tools" data-w="0.002" aria-label="Small pen" aria-pressed="false">S</button>
   <button type="button" class="tools on" data-w="0.004" aria-label="Medium pen" aria-pressed="true">M</button>
@@ -84,6 +85,20 @@
   <p><a id="newBoard" href="/" target="_blank" rel="noopener">New board</a></p>
 </section>
 
+<button type="button" id="who" aria-expanded="false" aria-controls="whoPanel" title="People on this board"><span class="dot"></span><span id="whoText"></span></button>
+<section id="whoPanel" class="panel" aria-label="People" hidden>
+  <header>
+    <h2>People</h2>
+    <button type="button" class="close" data-close aria-label="Close people">Close</button>
+  </header>
+  <div id="meRow">
+    <label for="nameIn">Your name</label>
+    <div class="row"><input id="nameIn" type="text" maxlength="24" spellcheck="false" autocomplete="off"><button type="button" id="reroll" title="Pick another name">New name</button></div>
+    <label for="hueIn">Your colour</label>
+    <input id="hueIn" type="range" min="0" max="359" step="1" value="210">
+  </div>
+  <ul id="whoList"></ul>
+</section>
 <div id="nav" aria-label="Where you are on the board. Tap or drag to move." hidden><div id="navBox"></div></div>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 <div id="msg" role="alert" hidden></div>

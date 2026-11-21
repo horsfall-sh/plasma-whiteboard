@@ -684,3 +684,76 @@ async fn other_sites_cannot_use_the_relay() {
     assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 201"));
     s.stop().await;
 }
+
+#[tokio::test]
+async fn names_and_pings_reach_everyone_and_are_not_stored() {
+    let s = start(&temp_db("names")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (mut b, _, _) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
+    a.expect("l").await;
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+
+    // A label: spaces are tidied, the colour is lower-cased, everyone hears it.
+    a.send(json!({"t": "nm", "n": "  Amber   \"Otter\" ", "c": "#AA5500"})).await;
+    for c in [&mut a, &mut b, &mut v] {
+        let m = c.expect("nm").await;
+        assert_eq!((m["l"].as_u64(), m["n"].as_str(), m["c"].as_str()), (Some(1), Some("Amber \"Otter\""), Some("#aa5500")));
+    }
+    // Bad labels are ignored.
+    a.send(json!({"t": "nm", "n": "", "c": "#aa5500"})).await;
+    a.send(json!({"t": "nm", "n": "x".repeat(25), "c": "#aa5500"})).await;
+    a.send(json!({"t": "nm", "n": "ok", "c": "red"})).await;
+    a.quiet().await;
+
+    // A ping gets a letter, goes to everyone including the sender, and is clamped.
+    a.send(json!({"t": "pg", "pts": [0.1, 0.1, 0.5, 5.0, 0.2, 0.5]})).await;
+    for c in [&mut a, &mut b, &mut v] {
+        let m = c.expect("pg").await;
+        assert_eq!((m["l"].as_u64(), m["k"].as_str()), (Some(1), Some("A")));
+        assert_eq!(m["pts"], json!([0.1, 0.1, 0.5, 2, 0.2, 0.5]));
+    }
+    // A second ping straight away from the same person is dropped; another person's gets B.
+    a.send(json!({"t": "pg", "pts": [0.1, 0.1, 0.5, 0.2, 0.2, 0.5]})).await;
+    b.send(json!({"t": "pg", "pts": [0.1, 0.1, 0.5, 0.2, 0.2, 0.5]})).await;
+    let m = a.expect("pg").await;
+    assert_eq!((m["l"].as_u64(), m["k"].as_str()), (Some(2), Some("B")));
+    // A viewer cannot ping, and one point is not a shape.
+    v.send(json!({"t": "pg", "pts": [0.1, 0.1, 0.5, 0.2, 0.2, 0.5]})).await;
+    b.expect("pg").await;
+    b.quiet().await;
+
+    // A late joiner sees the name in hello, no ping, and nothing was stored.
+    let (_c, hello, strokes) = Client::join(&s.addr, &view, None).await;
+    assert_eq!(hello["layers"][0]["n"], "Amber \"Otter\"");
+    assert_eq!(hello["layers"][0]["c"], "#aa5500");
+    assert!(hello["layers"][1]["n"].is_null());
+    assert!(strokes.is_empty());
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn presence_lists_the_layers_that_are_connected() {
+    let s = start(&temp_db("online")).await;
+    let (edit, _) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (b, _, _) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
+    let mut last = Value::Null;
+    while let Ok(Some(Ok(f))) = tokio::time::timeout(Duration::from_millis(300), a.ws.next()).await {
+        let Message::Text(t) = f else { continue };
+        let m: Value = serde_json::from_str(&t).unwrap();
+        if m["t"] == "n" {
+            last = m;
+        }
+    }
+    assert_eq!(last["on"], json!([1, 2]));
+    drop(b);
+    loop {
+        let m = a.raw().await.unwrap();
+        if m["t"] == "n" {
+            assert_eq!(m["on"], json!([1]));
+            break;
+        }
+    }
+    s.stop().await;
+}
