@@ -28,6 +28,11 @@ board in a browser window on a laptop, and share that window in a video call.
 
 ## Tablet and pen
 
+- **Finger on a phone.** The board starts at 100%, so an upright phone shows about a third of a page and a
+  finger has room to write. Finger strokes are steadied (the line follows a slow finger loosely and a fast
+  one closely) and simplified a little harder than pen strokes. The arrows move most of a screenful when a
+  whole page does not fit across the screen; the zoom button cycles 100%, the whole page, all nine pages.
+
 - The pen draws, with pressure. The eraser end of a pen erases.
 - Two fingers pinch to zoom and pan. They never draw.
 - One finger draws until a pen has touched the board in that browser. After that single fingers are ignored,

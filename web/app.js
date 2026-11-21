@@ -334,7 +334,11 @@ function zoomAt(f, sx, sy, settle) {
 function zoomStep(f) { zoomAt(f, vw / 2, vh / 2, true); }
 // The zoom button and the 0 key: fill the window; again, show the whole board.
 function zoomHome() {
-  if (zoom === 1) setView(minZoom(), WX, WY, true); else goPage(...pageAt());
+  // 100% -> the whole page (where the window is too narrow to show one at 100%) -> all nine -> 100%.
+  const pf = Math.min(vw, vh / ASPECT) / bw, [i, j] = pageAt();
+  if (zoom === 1 && pf < 0.9) setView(pf, i + 0.5 - visW(pf) / 2, (j + 0.5) * ASPECT - visH(pf) / 2, true);
+  else if (zoom === 1 || (zoom < 1 && zoom > minZoom() * 1.02)) setView(minZoom(), WX, WY, true);
+  else goPage(i, j);
 }
 // The page under the middle of the window: [column, row], each -1, 0 or 1.
 function pageAt() {
@@ -344,7 +348,14 @@ function goPage(i, j) {
   i = clamp(i, -1, 1); j = clamp(j, -1, 1);
   setView(1, i + 0.5 - visW(1) / 2, (j + 0.5) * ASPECT - visH(1) / 2, true);
 }
-function pageStep(di, dj) { const [i, j] = pageAt(); goPage(i + di, j + dj); }
+// The arrows move a page at a time. On a screen too narrow (or short) to show
+// a whole page at this zoom, they move most of a screenful instead.
+function pageStep(di, dj) {
+  const W = visW(zoom), H = visH(zoom);
+  if (di && W < 0.9) return setView(zoom, panX + di * W * 0.85, panY, true);
+  if (dj && H < ASPECT * 0.9) return setView(zoom, panX, panY + dj * H * 0.85, true);
+  const [i, j] = pageAt(); goPage(i + di, j + dj);
+}
 const pgBtn = { pgL: [-1, 0], pgR: [1, 0], pgU: [0, -1], pgD: [0, 1] };
 for (const id of Object.keys(pgBtn)) $('#' + id).addEventListener('click', () => pageStep(...pgBtn[id]));
 // The zoom label, and the small map (bottom left) that shows which part of the
@@ -354,9 +365,9 @@ function showZoom() {
   $('#zoomReset').textContent = `${Math.round(zoom * 100)}%`;
   const W = visW(zoom), H = visH(zoom);
   const all = W >= WW - 1e-6 && H >= WH - 1e-6; // every page is on screen
-  const [pi, pj] = pageAt();
-  $('#pgL').hidden = all || pi <= -1; $('#pgR').hidden = all || pi >= 1;
-  $('#pgU').hidden = all || pj <= -1; $('#pgD').hidden = all || pj >= 1;
+  const e = 1e-4; // an arrow shows while there is more of the board that way
+  $('#pgL').hidden = all || panX <= WX + e; $('#pgR').hidden = all || panX + W >= WX + WW - e;
+  $('#pgU').hidden = all || panY <= WY + e; $('#pgD').hidden = all || panY + H >= WY + WH - e;
   navEl.hidden = all;
   if (all) return;
   navBox.style.left = `${((Math.max(WX, panX) - WX) / WW) * 100}%`; navBox.style.top = `${((Math.max(WY, panY) - WY) / WH) * 100}%`;
@@ -442,13 +453,15 @@ function redrawBase(direct) {
 
 function layout() {
   // Keep the same board point at the middle of the window.
-  const cx = laidOut ? panX + visW(zoom) / 2 : 0.5, cy = laidOut ? panY + visH(zoom) / 2 : ASPECT / 2;
+  let cx = laidOut ? panX + visW(zoom) / 2 : 0.5, cy = laidOut ? panY + visH(zoom) / 2 : ASPECT / 2;
   vw = Math.max(1, innerWidth); vh = Math.max(1, innerHeight);
   bw = Math.max(vw, vh / ASPECT) / OVERLAP;
   // Start filling the window, unless that would cut off more than about a
   // third of the board (a phone held upright): then start with all of it.
-  const pageFit = Math.min(vw, vh / ASPECT) / bw;
-  if (!laidOut) zoom = pageFit < 0.7 ? pageFit : 1;
+  // Start at 100%. On a phone held upright that shows about a third of the
+  // page's width, which is what a finger needs to write at a sensible size;
+  // start at the page's left edge, where writing starts.
+  if (!laidOut) { zoom = 1; if (visW(1) < 0.7) cx = visW(1) / 2 - 0.02; }
   laidOut = true;
   zoom = Math.min(MAX_ZOOM, Math.max(minZoom(), zoom));
   panX = clampPan(cx - visW(zoom) / 2, visW(zoom), WX, WW);
@@ -724,7 +737,16 @@ let spaceDown = false;
 
 function addPoint(e, rect) {
   const s = liveStrokes.get(cur.id); if (!s) return;
-  const [bx, by] = boardPoint(e, rect);
+  let [bx, by] = boardPoint(e, rect);
+  if (e.pointerType === 'touch') {
+    // A fingertip wobbles. Follow it loosely when it moves slowly and
+    // closely when it moves fast, so letters come out steadier without lag.
+    if (cur.fx == null) { cur.fx = bx; cur.fy = by; }
+    const px = Math.hypot(bx - cur.fx, by - cur.fy) * bw * zoom;
+    const k = Math.min(1, 0.12 + px / 28);
+    cur.fx += (bx - cur.fx) * k; cur.fy += (by - cur.fy) * k;
+    cur.rx = bx; cur.ry = by; bx = cur.fx; by = cur.fy;
+  }
   const x = r5(bx), y = r5(by);
   const p = e.pointerType === 'pen' && e.pressure > 0 ? Math.round(e.pressure * 1000) / 1000 : 0.5;
   const n = s.pts.length;
@@ -841,13 +863,20 @@ live.addEventListener('pointermove', (e) => {
 function endStroke(e) {
   if (!cur || e.pointerId !== cur.pointerId) return;
   const id = cur.id, sent = cur.sent, out = cur.out, s = liveStrokes.get(id);
+  // Tolerance: a third of a pixel at 100%, never looser when zoomed out. A
+  // finger gets about a screen pixel and a half, which irons out its wobble.
+  const eps = cur.rx != null ? Math.max(EPS, 1.5 / (bw * zoom)) : EPS / Math.max(1, zoom);
+  if (s && cur.rx != null && s.pts.length) { // the line ends where the finger did
+    const x = r5(cur.rx), y = r5(cur.ry), n = s.pts.length;
+    if (s.pts[n - 3] !== x || s.pts[n - 2] !== y) { s.pts.push(x, y, 0.5); if (sent) out.push(x, y, 0.5); }
+  }
   cur = null; document.body.classList.remove('drawing');
   if (!s) return;
   if (sent && out.length) send({ t: 'p', id, pts: out });
   liveStrokes.delete(id);
   if (!s.pts.length) { redrawLive(); if (sent) send({ t: 'u', id }); return; }
   // Zoomed in, detail is finer: tighten the tolerance to match.
-  const f = { id, l: me, c: s.c, w: s.w, pts: simplify(s.pts, EPS / Math.max(1, zoom)) }; // never looser when zoomed out
+  const f = { id, l: me, c: s.c, w: s.w, pts: simplify(s.pts, eps) };
   insertStroke(f); redrawLive();
   pending.set(id, f); mine.push(id);
   // Confirmed by `ok`. If the socket is down or still loading the snapshot,
