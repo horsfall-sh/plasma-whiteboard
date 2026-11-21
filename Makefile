@@ -1,7 +1,7 @@
 # Build the stroke simplifier to WebAssembly, then the relay (which embeds the page).
 WASM := smooth/target/wasm32-unknown-unknown/release/wb_smooth.wasm
 
-.PHONY: all wasm relay test run linux clean
+.PHONY: ship all wasm relay test run linux clean
 
 all: relay
 
@@ -39,3 +39,10 @@ linux: wasm
 
 clean:
 	rm -rf smooth/target crumple/target relay/target relay/target-linux web/smooth.wasm web/crumple.wasm
+
+# Test, build for the server and deploy to the live board. Run after every
+# change so the public board always matches the latest commit.
+HOST ?= root@HOST_IP
+ship: test linux
+	sh deploy/deploy.sh $(HOST)
+	@curl -fsS -o /dev/null -w "live: %{http_code}\n" https://whiteboard.example.com/healthz

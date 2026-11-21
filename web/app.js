@@ -7,7 +7,7 @@
 const ASPECT = 9 / 16;
 const WX = -1, WY = -ASPECT, WW = 3, WH = 3 * ASPECT; // the whole surface
 const OVERLAP = 1.08; // at 100% a page shows with a little of its neighbours
-const EPS = 0.0004;          // simplification tolerance (under 1px on a 1600px board)
+const EPS = 0.00025;         // simplification tolerance: about a third of a pixel on a 1300px page
 const PRESSURE_SPAN = 0.15;  // must match smooth/src/lib.rs
 const ERASER_SCALE = 6;
 const ERASER_COLOR = '#ffffff';
@@ -188,10 +188,14 @@ function seg(ctx, s, i) {
   ctx.stroke();
 }
 
-// Finished strokes are simplified, so their points are sparse and already
-// within EPS of the pen path: draw them as straight pieces. Consecutive pieces
-// of the same width share one path, so a constant-pressure stroke (mouse,
-// finger) costs a single stroke() call.
+// Finished strokes are simplified, so their points are sparse. Joining them
+// with straight pieces looks angular, so draw a smooth curve THROUGH the
+// points: each piece is a cubic whose tangents follow the neighbouring points
+// (a Catmull-Rom spline), with the tangent length held to a third of the
+// shorter neighbouring piece so it cannot overshoot. A point where the line
+// turns sharply is a real corner and stays one. Consecutive pieces of the same
+// width share one path, so a constant-pressure stroke costs one stroke() call.
+const CORNER_COS = 0.35; // turns sharper than about 70 degrees are corners
 function drawFull(ctx, s, v) {
   const P = s.pts, n = P.length / 3;
   if (!n) return;
@@ -199,17 +203,35 @@ function drawFull(ctx, s, v) {
   if (s.txt != null) return drawText(ctx, s);
   prep(ctx, s);
   if (n === 1) return dot(ctx, s);
+  // Tangent at point i, in px, already scaled for the piece that leaves it
+  // (tx, ty) or arrives at it; zero at the ends and at corners.
   let lw = lineW(s, (P[2] + P[5]) / 2);
   ctx.lineWidth = lw;
-  ctx.beginPath(); ctx.moveTo(P[0] * bw, P[1] * bw);
-  for (let k = 3; k < P.length; k += 3) {
-    const w = lineW(s, (P[k - 1] + P[k + 2]) / 2);
-    if (w !== lw) {
-      ctx.stroke();
-      lw = w; ctx.lineWidth = lw;
-      ctx.beginPath(); ctx.moveTo(P[k - 3] * bw, P[k - 2] * bw);
+  let x1 = P[0] * bw, y1 = P[1] * bw; // start of the current piece
+  ctx.beginPath(); ctx.moveTo(x1, y1);
+  let ux = 0, uy = 0, lenIn = 0;      // unit tangent at the piece's start, and the length of the piece before
+  for (let i = 0; i < n - 1; i++) {
+    const k = i * 3;
+    const x2 = P[k + 3] * bw, y2 = P[k + 4] * bw;
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    // Unit tangent at the piece's end.
+    let vx = 0, vy = 0, lenOut = 0;
+    if (i < n - 2 && len > 0) {
+      const x3 = P[k + 6] * bw, y3 = P[k + 7] * bw;
+      lenOut = Math.hypot(x3 - x2, y3 - y2);
+      if (lenOut > 0) {
+        const cos = ((x2 - x1) * (x3 - x2) + (y2 - y1) * (y3 - y2)) / (len * lenOut);
+        if (cos > CORNER_COS) {
+          const d = Math.hypot(x3 - x1, y3 - y1) || 1;
+          vx = (x3 - x1) / d; vy = (y3 - y1) / d;
+        }
+      }
     }
-    ctx.lineTo(P[k] * bw, P[k + 1] * bw);
+    const w = lineW(s, (P[k + 2] + P[k + 5]) / 2);
+    if (w !== lw) { ctx.stroke(); lw = w; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(x1, y1); }
+    const a = Math.min(len, lenIn || len) / 3, b = Math.min(len, lenOut || len) / 3;
+    ctx.bezierCurveTo(x1 + ux * a, y1 + uy * a, x2 - vx * b, y2 - vy * b, x2, y2);
+    x1 = x2; y1 = y2; ux = vx; uy = vy; lenIn = len;
   }
   ctx.stroke();
 }
@@ -706,7 +728,7 @@ function addPoint(e, rect) {
   const x = r5(bx), y = r5(by);
   const p = e.pointerType === 'pen' && e.pressure > 0 ? Math.round(e.pressure * 1000) / 1000 : 0.5;
   const n = s.pts.length;
-  if (n && Math.abs(s.pts[n - 3] - x) + Math.abs(s.pts[n - 2] - y) < 0.0004 / zoom) return; // jitter
+  if (n && Math.abs(s.pts[n - 3] - x) + Math.abs(s.pts[n - 2] - y) < 0.0003 / Math.max(1, zoom)) return; // jitter
   if (n >= 60000) return; // 20,000 points per stroke
   s.pts.push(x, y, p);
   if (cur.sent) cur.out.push(x, y, p);
@@ -825,7 +847,7 @@ function endStroke(e) {
   liveStrokes.delete(id);
   if (!s.pts.length) { redrawLive(); if (sent) send({ t: 'u', id }); return; }
   // Zoomed in, detail is finer: tighten the tolerance to match.
-  const f = { id, l: me, c: s.c, w: s.w, pts: simplify(s.pts, EPS / zoom) };
+  const f = { id, l: me, c: s.c, w: s.w, pts: simplify(s.pts, EPS / Math.max(1, zoom)) }; // never looser when zoomed out
   insertStroke(f); redrawLive();
   pending.set(id, f); mine.push(id);
   // Confirmed by `ok`. If the socket is down or still loading the snapshot,
