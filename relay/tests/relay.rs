@@ -609,3 +609,77 @@ async fn crumple_shelves_the_sheet_and_brings_it_back() {
     a.draw("one-a").await;
     s.stop().await;
 }
+
+#[tokio::test]
+async fn a_reconnect_can_finish_the_stroke_its_old_socket_began() {
+    let s = start(&temp_db("reconnect")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut old, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+    old.send(json!({"t": "b", "id": "half", "c": "#112233", "w": 0.004})).await;
+    old.send(json!({"t": "p", "id": "half", "pts": [0.1, 0.1, 0.5]})).await;
+    v.expect("b").await;
+    v.expect("p").await;
+    // The same browser reconnects while the relay still holds the old socket,
+    // and sends the finished stroke whole.
+    let (mut new, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    new.send(json!({"t": "s", "id": "half", "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5, 0.3, 0.3, 0.5]})).await;
+    assert_eq!(new.expect("ok").await["id"], "half");
+    assert_eq!(v.expect("e").await["id"], "half");
+    // The old socket going away must not remove it.
+    drop(old);
+    new.quiet().await;
+    v.quiet().await;
+    let (_j, _, strokes) = Client::join(&s.addr, &view, None).await;
+    assert_eq!(strokes.len(), 1);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_board_has_a_size_budget_and_undo_frees_it() {
+    let s = start(&temp_db("budget")).await;
+    let (edit, _) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    // 20,000 points of awkward decimals: about 470 KB each once stored.
+    let pts: Vec<f64> = (0..60_000).map(|i| f64::from(12345 + i % 7) / 100000.0).collect();
+    let mut stored = 0;
+    let mut refused = false;
+    for i in 0..60 {
+        // Stay under the byte-rate limit: this test is about the board budget.
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        a.send(json!({"t": "s", "id": format!("big{i}"), "c": "#112233", "w": 0.004, "pts": pts})).await;
+        let m = a.next().await;
+        if m["t"] == "no" {
+            refused = true;
+            break;
+        }
+        assert_eq!(m["t"], "ok", "{m}");
+        stored += 1;
+    }
+    assert!(refused, "the board never filled");
+    assert!((30..=40).contains(&stored), "stored {stored} strokes of about 470 KB in 16 MB");
+    // Undo one: there is room again.
+    a.send(json!({"t": "u", "id": "big0"})).await;
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    a.send(json!({"t": "s", "id": "again", "c": "#112233", "w": 0.004, "pts": pts})).await;
+    assert_eq!(a.expect("ok").await["id"], "again");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn other_sites_cannot_use_the_relay() {
+    let s = start(&temp_db("origin")).await;
+    let mut sock = TcpStream::connect(&s.addr).await.unwrap();
+    let req = "POST /api/boards HTTP/1.1\r\nHost: test\r\nOrigin: https://evil.example\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    sock.read_to_end(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 403"));
+    let mut sock = TcpStream::connect(&s.addr).await.unwrap();
+    let req = "POST /api/boards HTTP/1.1\r\nHost: test\r\nOrigin: http://test\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    sock.read_to_end(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 201"));
+    s.stop().await;
+}

@@ -4,6 +4,7 @@
 
 use crate::db::{Db, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
+use crate::limits::Bucket;
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +15,11 @@ pub const ASPECT: f32 = 0.5625;
 pub const MAX_MSG: usize = 1024 * 1024;
 pub const MAX_POINTS: usize = 20_000;
 pub const MAX_STROKES: usize = 10_000;
+/// Stored stroke data per board, sheet in use plus shelf. Bounds memory and
+/// disk whatever the stroke count: one stroke can be close to half a megabyte.
+pub const MAX_BOARD_BYTES: usize = 16 * 1024 * 1024;
+/// Stroke ids a board remembers, undone ones included.
+pub const MAX_IDS: usize = 50_000;
 pub const MAX_LIVE_ROOM: usize = 64;
 pub const MAX_LIVE_CONN: usize = 4;
 pub const MAX_LAYERS: usize = 200;
@@ -91,6 +97,9 @@ struct Stroke {
 struct Sheet {
     k: u32,
     strokes: Vec<Stroke>,
+    /// The `sv` preview message, built on first request. A shelved sheet
+    /// never changes, so it is built once and shared.
+    view: Option<Utf8Bytes>,
 }
 
 struct Layer {
@@ -114,6 +123,10 @@ struct State {
     /// Crumpled sheets, oldest first.
     shelf: Vec<Sheet>,
     next_sheet: u32,
+    /// Bytes of stroke JSON held, sheet in use plus shelf.
+    bytes: usize,
+    /// The snapshot's `ss` chunks, shared by every join until the sheet changes.
+    snap: Option<Vec<Utf8Bytes>>,
     /// Every stroke id the board has ever stored, undone ones included.
     ids: HashSet<String>,
     layers: Vec<Layer>,
@@ -286,7 +299,7 @@ impl Room {
                     let i = match shelf.iter().position(|s| s.k == r.sheet) {
                         Some(i) => i,
                         None => {
-                            shelf.push(Sheet { k: r.sheet, strokes: Vec::new() });
+                            shelf.push(Sheet { k: r.sheet, strokes: Vec::new(), view: None });
                             shelf.len() - 1
                         }
                     };
@@ -303,12 +316,13 @@ impl Room {
             ids.insert(r.id);
         }
         shelf.sort_by_key(|s| s.k);
+        let bytes = strokes.iter().chain(shelf.iter().flat_map(|s| s.strokes.iter())).map(|s| s.json.len()).sum();
         let layers = loaded
             .layers
             .into_iter()
             .map(|(n, who, color)| Layer { n, who, color })
             .collect();
-        let (tx, _) = broadcast::channel(1024);
+        let (tx, _) = broadcast::channel(256);
         Room {
             board,
             tx,
@@ -317,6 +331,8 @@ impl Room {
                 strokes,
                 shelf,
                 next_sheet,
+                bytes,
+                snap: None,
                 ids,
                 layers,
                 live: HashMap::new(),
@@ -392,10 +408,15 @@ impl Room {
         hello.push('}');
         snapshot.push(hello.into());
 
-        let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
-        for chunk in drawn.chunks(SNAPSHOT_CHUNK) {
-            snapshot.push(strokes_msg(r#"{"t":"ss","a":["#, chunk.iter().map(|s| s.json.as_str())).into());
+        if st.snap.is_none() {
+            let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
+            let chunks = drawn
+                .chunks(SNAPSHOT_CHUNK)
+                .map(|c| strokes_msg(r#"{"t":"ss","a":["#, c.iter().map(|s| s.json.as_str())).into())
+                .collect();
+            st.snap = Some(chunks);
         }
+        snapshot.extend(st.snap.iter().flatten().cloned());
         for (id, s) in &st.live {
             let w = width_json(s.w);
             snapshot.push(format!(r#"{{"t":"b","id":"{id}","l":{},"c":"{}","w":{w}}}"#, s.layer, s.c).into());
@@ -421,7 +442,9 @@ impl Room {
     }
 
     /// Apply one message from a connection that has joined.
-    pub fn handle(&self, peer: Peer, text: &str, db: &Db) {
+    /// `heavy` is the connection's budget for the operations that send a whole
+    /// sheet or layer (crumple, bring back, preview, layer restore).
+    pub fn handle(&self, peer: Peer, text: &str, db: &Db, heavy: &mut Bucket) {
         if peer.role != Role::Edit {
             return; // viewers can't change the board
         }
@@ -468,7 +491,9 @@ impl Room {
                     return;
                 }
                 let live = match st.live.get(&id) {
-                    Some(s) if s.conn == conn => st.live.remove(&id),
+                    // By layer, not connection: after a reconnect the same
+                    // browser finishes what its old socket began.
+                    Some(s) if s.layer == peer.layer => st.live.remove(&id),
                     Some(_) => return, // someone else's live stroke
                     None => None,
                 };
@@ -492,7 +517,7 @@ impl Room {
                     return;
                 }
                 let was_live = match st.live.get(&id) {
-                    Some(s) if s.conn == conn => {
+                    Some(s) if s.layer == peer.layer => {
                         st.live.remove(&id);
                         true
                     }
@@ -524,7 +549,7 @@ impl Room {
                 if !valid_id(&id) {
                     return;
                 }
-                if st.live.get(&id).is_some_and(|s| s.conn == conn) {
+                if st.live.get(&id).is_some_and(|s| s.layer == peer.layer) {
                     st.live.remove(&id);
                     self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
                     return;
@@ -536,7 +561,9 @@ impl Room {
                 else {
                     return;
                 };
-                st.strokes.remove(i);
+                let gone = st.strokes.remove(i);
+                st.bytes = st.bytes.saturating_sub(gone.json.len());
+                st.snap = None;
                 db.stroke_state(self.board, id.clone(), UNDONE);
                 self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
             }
@@ -547,24 +574,27 @@ impl Room {
                     any = true;
                 }
                 if any {
+                    st.snap = None;
                     db.layer_state(self.board, l, LIVE, DELETED);
                     self.all(format!(r#"{{"t":"ld","l":{l}}}"#));
                 }
             }
             In::Crumple {} => {
-                if st.strokes.is_empty() {
+                if st.strokes.is_empty() || !heavy.take() {
                     return;
                 }
+                st.snap = None;
                 let k = st.next_sheet;
                 st.next_sheet += 1;
                 let sheet = std::mem::take(&mut st.strokes);
                 db.sheet_move(self.board, 0, k);
-                st.shelf.push(Sheet { k, strokes: sheet });
+                st.shelf.push(Sheet { k, strokes: sheet, view: None });
                 let mut dropped = String::from("null");
                 if st.shelf.len() > MAX_SHELF {
                     let old = st.shelf.remove(0);
                     for s in &old.strokes {
                         st.ids.remove(&s.id);
+                        st.bytes = st.bytes.saturating_sub(s.json.len());
                     }
                     db.sheet_drop(self.board, old.k);
                     dropped = old.k.to_string();
@@ -577,16 +607,23 @@ impl Room {
             }
             In::Uncrumple { k } => {
                 let Some(i) = st.shelf.iter().position(|s| s.k == k) else { return };
+                if !heavy.take() {
+                    return;
+                }
+                st.snap = None;
                 let back = st.shelf.remove(i);
                 let cur = std::mem::replace(&mut st.strokes, back.strokes);
                 // Storage: first move the sheet in use out of the way, then bring k in.
                 let nk = st.next_sheet;
                 st.next_sheet += 1;
-                db.sheet_move(self.board, 0, nk);
-                db.sheet_move(self.board, k, 0);
-                if !cur.is_empty() {
-                    st.shelf.push(Sheet { k: nk, strokes: cur });
+                if cur.is_empty() {
+                    // Only undone rows can be left on sheet 0; they go for good.
+                    db.sheet_drop(self.board, 0);
+                } else {
+                    db.sheet_move(self.board, 0, nk);
+                    st.shelf.push(Sheet { k: nk, strokes: cur, view: None });
                 }
+                db.sheet_move(self.board, k, 0);
                 let head = format!(
                     r#"{{"t":"un","k":{k},"by":{},"shelf":{},"layers":[{}],"a":["#,
                     peer.layer,
@@ -597,12 +634,23 @@ impl Room {
                 self.all(strokes_msg(&head, drawn));
             }
             In::SheetView { k } => {
-                let Some(sheet) = st.shelf.iter().find(|s| s.k == k) else { return };
-                let head = format!(r#"{{"t":"sv","k":{k},"a":["#);
-                let drawn = sheet.strokes.iter().filter(|s| s.state == LIVE).map(|s| s.json.as_str());
-                self.only(conn, strokes_msg(&head, drawn));
+                let Some(sheet) = st.shelf.iter_mut().find(|s| s.k == k) else { return };
+                if sheet.view.is_none() {
+                    if !heavy.take() {
+                        return;
+                    }
+                    let head = format!(r#"{{"t":"sv","k":{k},"a":["#);
+                    let drawn = sheet.strokes.iter().filter(|s| s.state == LIVE).map(|s| s.json.as_str());
+                    sheet.view = Some(strokes_msg(&head, drawn).into());
+                }
+                let text = sheet.view.clone().expect("just built");
+                let _ = self.tx.send(Out { skip: 0, only: conn, text });
             }
             In::LayerRestore { l } => {
+                if !st.strokes.iter().any(|s| s.layer == l && s.state == DELETED) || !heavy.take() {
+                    return;
+                }
+                st.snap = None;
                 let mut back: Vec<&str> = Vec::new();
                 for s in st.strokes.iter_mut().filter(|s| s.layer == l && s.state == DELETED) {
                     s.state = LIVE;
@@ -645,7 +693,9 @@ impl Room {
         if st.ids.contains(&id) {
             // A resend. Confirm it again if it is still this layer's stroke.
             drop_live(self);
-            match st.strokes.iter().rev().find(|s| s.id == id) {
+            // It may have been crumpled onto the shelf since; that still counts.
+            let held = st.strokes.iter().chain(st.shelf.iter().flat_map(|s| s.strokes.iter()));
+            match held.rev().find(|s| s.id == id) {
                 Some(s) if s.layer == peer.layer => {
                     self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{}}}"#, s.seq));
                 }
@@ -653,19 +703,25 @@ impl Room {
             }
             return;
         }
-        if st.strokes.len() + st.shelf.iter().map(|s| s.strokes.len()).sum::<usize>() >= MAX_STROKES {
+        let (wj, pj) = (width_json(w), pts_json(&pts));
+        let size = pj.len() + txt.as_ref().map_or(0, |t| t.len() * 2) + 96;
+        if st.strokes.len() + st.shelf.iter().map(|s| s.strokes.len()).sum::<usize>() >= MAX_STROKES
+            || st.bytes + size > MAX_BOARD_BYTES
+            || st.ids.len() >= MAX_IDS
+        {
             drop_live(self);
             self.only(conn, refusal(&id, "this board is full"));
             return;
         }
         let seq = st.next_seq;
         st.next_seq += 1;
-        let (wj, pj) = (width_json(w), pts_json(&pts));
         let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
         self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{seq}}}"#));
         db.add_stroke(self.board, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt);
         st.ids.insert(id.clone());
+        st.bytes += json.len();
+        st.snap = None;
         st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
     }
 }

@@ -14,9 +14,12 @@ board in a browser window on a laptop, and share that window in a video call.
 - **Crumple:** wipes the board for everyone and puts it on a shelf of up to five crumpled boards. **Shelf**
   shows them with a small preview; **Bring back** swaps one in and crumples the board in use in its place.
   A sixth crumple throws the oldest away. The toast after a crumple has an Undo.
+- **The board fills the window.** The board itself is always 16:9, so at 100% a window of another shape
+  cuts a little off two sides; the map at the bottom left shows what is off screen. The zoom button (or `0`)
+  switches between filling the window and showing the whole board.
 - **Zoom** up to 8x, local to your browser. Two-finger pinch, trackpad pinch, Ctrl or Cmd + wheel, the
   toolbar buttons, or the `+`, `-` and `0` keys. Scrolling pans; so does a middle-button drag or Space + drag.
-  The **Move** tool makes any drag (pen, finger or mouse) pan. While zoomed in, a small map at the bottom
+  The **Move** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom
   left shows where you are; tap or drag on it to go there. On a view link one finger or the mouse pans.
 
 ## Tablet and pen
@@ -64,7 +67,8 @@ Environment variables for `wb-relay`:
 | `WB_TRUST_PROXY` | unset | Set to `1` behind a reverse proxy you run, so rate limits use the last `X-Forwarded-For` address. Leave unset when the relay faces the network directly. |
 | `WB_WEB_DIR` | unset | Serve the page from this directory instead of the copy in the binary (development). |
 
-The relay speaks plain HTTP. Put it behind a TLS proxy (Caddy) for anything beyond your own machine. The
+The relay speaks plain HTTP. Put it behind a TLS proxy (nginx or Caddy; see `deploy/`) for anything beyond
+your own machine. Requests from pages on another site (a foreign `Origin`) are refused. The
 page uses `wss:` on its own when served over HTTPS.
 
 ## How it works
@@ -85,7 +89,7 @@ page uses `wss:` on its own when served over HTTPS.
 
 ## Limits
 
-See the table at the end of `PROTOCOL.md`. The main ones: 10,000 strokes per board, 20,000 points per
+See the table at the end of `PROTOCOL.md`. The main ones: 10,000 strokes and 16 MB of stroke data per board, 20,000 points per
 stroke, 200 contributors per board, 100 connections per board.
 
 ## Not yet proven

@@ -345,8 +345,17 @@ fn apply(
             .execute(params![board, seq as i64, id, layer, color, width, pts, txt])?;
         }
         Cmd::StrokeState { board, id, state } => {
-            conn.prepare_cached("UPDATE strokes SET state = ? WHERE board = ? AND id = ?")?
+            if state == UNDONE {
+                // An undone stroke is never drawn again: keep the row for its
+                // id, drop its points so undo can't be used to fill the disk.
+                conn.prepare_cached(
+                    "UPDATE strokes SET state = ?, pts = '[]', txt = NULL WHERE board = ? AND id = ?",
+                )?
                 .execute(params![state, board, id])?;
+            } else {
+                conn.prepare_cached("UPDATE strokes SET state = ? WHERE board = ? AND id = ?")?
+                    .execute(params![state, board, id])?;
+            }
         }
         Cmd::LayerState { board, layer, from, to } => {
             conn.prepare_cached(

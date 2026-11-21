@@ -132,6 +132,18 @@ async fn serve_asset(app: &App, route: &str, headers: &HeaderMap) -> Response {
     secure(res)
 }
 
+/// A browser page on another site must not be able to use its visitors to
+/// make boards or open sockets here. Browsers always send Origin on those
+/// requests; other clients may omit it.
+fn foreign_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin_host = origin.split_once("://").map_or(origin, |(_, h)| h);
+    !origin_host.eq_ignore_ascii_case(host)
+}
+
 fn client_ip(app: &App, headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     if app.cfg.trust_proxy {
         let forwarded = headers
@@ -151,6 +163,9 @@ async fn create_board(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    if foreign_origin(&headers) {
+        return plain(StatusCode::FORBIDDEN, "wrong origin");
+    }
     let ip = client_ip(&app, &headers, addr);
     if !app.ips.may_create(ip) {
         return plain(StatusCode::TOO_MANY_REQUESTS, "too many new boards; wait a moment");
@@ -176,6 +191,9 @@ async fn ws_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if foreign_origin(&headers) {
+        return plain(StatusCode::FORBIDDEN, "wrong origin");
+    }
     let ip = client_ip(&app, &headers, addr);
     let Some(guard) = app.ips.connect(ip) else {
         return plain(StatusCode::TOO_MANY_REQUESTS, "too many connections from this address");
@@ -287,6 +305,10 @@ async fn relay(
     }
     let peer = joined.peer;
     let mut bucket = Bucket::new(600.0, 300.0);
+    // Bytes: a burst of 2 MB (a few very long strokes), then 256 KB a second.
+    let mut bytes = Bucket::new(2.0 * 1024.0 * 1024.0, 256.0 * 1024.0);
+    // Whole-sheet operations (crumple, bring back, preview, layer restore).
+    let mut heavy = Bucket::new(12.0, 0.5);
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = Instant::now();
@@ -295,10 +317,10 @@ async fn relay(
             m = sock.recv() => match m {
                 Some(Ok(Message::Text(t))) => {
                     heard = Instant::now();
-                    if !bucket.take() {
+                    if !bucket.take() || !bytes.take_n(t.len() as f64) {
                         return Some(("rate", "sending too fast"));
                     }
-                    room.handle(peer, &t, &app.db);
+                    room.handle(peer, &t, &app.db, &mut heavy);
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => heard = Instant::now(),
                 Some(Ok(Message::Binary(_) | Message::Close(_))) | Some(Err(_)) | None => return None,

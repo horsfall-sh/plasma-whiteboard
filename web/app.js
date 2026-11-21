@@ -35,6 +35,7 @@ const shelfPanel = $('#shelfPanel'), shelfList = $('#shelfList');
 
 // ---- state -----------------------------------------------------------------
 
+let vw = 1, vh = 1;             // the window, CSS px
 let bw = 1;                    // board width in CSS px
 let key = '';                  // the key in the link
 let role = 'view';             // 'edit' | 'view', from hello
@@ -188,7 +189,7 @@ function seg(ctx, s, i) {
 function drawFull(ctx, s, v) {
   const P = s.pts, n = P.length / 3;
   if (!n) return;
-  if (v && v.z > 1 && offScreen(s, v)) return;
+  if (v && offScreen(s, v)) return;
   if (s.txt != null) return drawText(ctx, s);
   prep(ctx, s);
   if (n === 1) return dot(ctx, s);
@@ -239,12 +240,24 @@ function bbox(s) {
 }
 function offScreen(s, v) {
   const b = bbox(s);
-  return b[2] < v.x || b[3] < v.y || b[0] > v.x + 1 / v.z || b[1] > v.y + ASPECT / v.z;
+  return b[2] < v.x || b[3] < v.y || b[0] > v.x + visW(v.z) || b[1] > v.y + visH(v.z);
 }
 
 // ---- the view (zoom and pan) -------------------------------------------------
 
+// The canvases fill the window. `bw` is the board's width in px at 100%, the
+// zoom at which the board just covers the window; below that the whole board
+// shows with a margin. Pan is the board point at the window's top left, so it
+// goes negative when the board is narrower than the window.
 const curView = () => ({ z: zoom, x: panX, y: panY });
+const visW = (z) => vw / (bw * z), visH = (z) => vh / (bw * z); // board units on screen
+const minZoom = () => Math.min(vw, vh / ASPECT) / bw;            // the whole board fits
+const clampPan = (p, vis, size) => (vis >= size ? (size - vis) / 2 : Math.min(size - vis, Math.max(0, p)));
+const paperEl = $('#paper');
+function placePaper() {
+  const k = bw * zoom;
+  paperEl.style.cssText = `left:${-panX * k}px;top:${-panY * k}px;width:${k}px;height:${k * ASPECT}px`;
+}
 function setCtxView(ctx, v) {
   const k = dpr * v.z;
   ctx.setTransform(k, 0, 0, k, -v.x * bw * k, -v.y * bw * k);
@@ -265,13 +278,13 @@ let viewTimer = 0;
 // Change the view. `settle`: redraw sharply now (end of a gesture, a button);
 // otherwise shortly after the last change (wheel).
 function setView(z, x, y, settle) {
-  z = Math.min(MAX_ZOOM, Math.max(1, z));
-  if (z < 1.02) z = 1;
-  x = Math.min(1 - 1 / z, Math.max(0, x));
-  y = Math.min(ASPECT * (1 - 1 / z), Math.max(0, y));
+  z = Math.min(MAX_ZOOM, Math.max(minZoom(), z));
+  if (Math.abs(z - 1) < 0.02) z = 1;
+  x = clampPan(x, visW(z), 1);
+  y = clampPan(y, visH(z), ASPECT);
   const same = z === zoom && x === panX && y === panY;
   zoom = z; panX = x; panY = y;
-  if (!same) { stretchBase(); redrawLive(); placeEditor(); showZoom(); }
+  if (!same) { placePaper(); stretchBase(); redrawLive(); placeEditor(); showZoom(); }
   clearTimeout(viewTimer);
   if (settle) settleView(); else viewTimer = setTimeout(settleView, 140);
 }
@@ -282,30 +295,38 @@ function settleView() {
 // Zoom by factor f keeping the screen point (sx, sy) (px from the board's
 // top left) over the same board point.
 function zoomAt(f, sx, sy, settle) {
-  const z = Math.min(MAX_ZOOM, Math.max(1, zoom * f));
+  const z = Math.min(MAX_ZOOM, Math.max(minZoom(), zoom * f));
   const bx = panX + sx / (bw * zoom), by = panY + sy / (bw * zoom);
   setView(z, bx - sx / (bw * z), by - sy / (bw * z), settle);
 }
-function zoomStep(f) { zoomAt(f, bw / 2, (bw * ASPECT) / 2, true); }
+function zoomStep(f) { zoomAt(f, vw / 2, vh / 2, true); }
+// The zoom button and the 0 key: fill the window; again, show the whole board.
+function zoomHome() {
+  const z = zoom === 1 && minZoom() < 0.98 ? minZoom() : 1;
+  setView(z, 0.5 - visW(z) / 2, ASPECT / 2 - visH(z) / 2, true);
+}
 // The zoom label, and the small map (bottom left) that shows which part of the
 // board is on screen while zoomed in.
 const navEl = $('#nav'), navBox = $('#navBox');
 function showZoom() {
   $('#zoomReset').textContent = `${Math.round(zoom * 100)}%`;
-  navEl.hidden = zoom === 1;
-  if (zoom === 1) return;
-  navBox.style.left = `${panX * 100}%`; navBox.style.top = `${(panY / ASPECT) * 100}%`;
-  navBox.style.width = navBox.style.height = `${100 / zoom}%`;
+  const W = visW(zoom), H = visH(zoom);
+  const all = W >= 1 - 1e-6 && H >= ASPECT - 1e-6; // the whole board is on screen
+  navEl.hidden = all;
+  if (all) return;
+  navBox.style.left = `${Math.max(0, panX) * 100}%`; navBox.style.top = `${(Math.max(0, panY) / ASPECT) * 100}%`;
+  navBox.style.width = `${Math.min(1, W) * 100}%`; navBox.style.height = `${Math.min(1, H / ASPECT) * 100}%`;
 }
 // Tap or drag on the map to put that spot at the centre of the screen.
 function navTo(e) {
   const r = navEl.getBoundingClientRect();
   const bx = (e.clientX - r.left) / r.width, by = ((e.clientY - r.top) / r.height) * ASPECT;
-  setView(zoom, bx - 0.5 / zoom, by - (0.5 * ASPECT) / zoom);
+  setView(zoom, bx - visW(zoom) / 2, by - visH(zoom) / 2);
 }
 navEl.addEventListener('pointerdown', (e) => { e.preventDefault(); try { navEl.setPointerCapture(e.pointerId); } catch { /* gone */ } navTo(e); });
-navEl.addEventListener('pointermove', (e) => { if (e.buttons || e.pointerType !== 'mouse') navTo(e); });
+navEl.addEventListener('pointermove', (e) => { if (navEl.hasPointerCapture(e.pointerId)) navTo(e); }); // not a hovering pen
 navEl.addEventListener('pointerup', settleView);
+navEl.addEventListener('pointercancel', settleView);
 // Board point under a pointer event.
 function boardPoint(e, rect) {
   return [
@@ -375,14 +396,23 @@ function redrawBase(direct) {
 }
 
 function layout() {
-  const vw = innerWidth, vh = innerHeight;
-  bw = Math.max(1, Math.floor(Math.min(vw, vh / ASPECT)));
-  const bh = Math.floor(bw * ASPECT);
-  boardEl.style.cssText = `width:${bw}px;height:${bh}px;left:${(vw - bw) >> 1}px;top:${(vh - bh) >> 1}px`;
+  // Keep the same board point at the middle of the window.
+  const cx = laidOut ? panX + visW(zoom) / 2 : 0.5, cy = laidOut ? panY + visH(zoom) / 2 : ASPECT / 2;
+  vw = Math.max(1, innerWidth); vh = Math.max(1, innerHeight);
+  bw = Math.max(vw, vh / ASPECT);
+  // Start filling the window, unless that would cut off more than about a
+  // third of the board (a phone held upright): then start with all of it.
+  if (!laidOut) zoom = minZoom() < 0.7 ? minZoom() : 1;
+  laidOut = true;
+  zoom = Math.min(MAX_ZOOM, Math.max(minZoom(), zoom));
+  panX = clampPan(cx - visW(zoom) / 2, visW(zoom), 1);
+  panY = clampPan(cy - visH(zoom) / 2, visH(zoom), ASPECT);
   dpr = Math.min(devicePixelRatio || 1, 2); // cap for slow GPUs
-  for (const cv of [base, live, spare]) { cv.width = Math.round(bw * dpr); cv.height = Math.round(bh * dpr); }
+  for (const cv of [base, live, spare]) { cv.width = Math.round(vw * dpr); cv.height = Math.round(vh * dpr); }
+  placePaper(); showZoom();
   redrawBase(true); redrawLive(); placeEditor();
 }
+let laidOut = false;
 addEventListener('resize', layout);
 if (window.visualViewport) visualViewport.addEventListener('resize', () => { if (innerWidth && innerHeight) placeEditor(); });
 
@@ -495,8 +525,10 @@ function onMessage(m) {
       if (Array.isArray(m.a)) for (const s of m.a) insertStroke(strokeFrom(s), true);
       break;
     case 'ready': onReady(); break;
-    case 'b': begin(m.id, m.l, m.c, m.w); break;
-    case 'p': extend(m.id, m.pts); break;
+    // After a reconnect the snapshot can replay my own unfinished stroke as
+    // the old socket left it. Mine is the better copy.
+    case 'b': if (!isMine(m.id)) begin(m.id, m.l, m.c, m.w); break;
+    case 'p': if (!isMine(m.id)) extend(m.id, m.pts); break;
     case 'e':
       if (liveStrokes.delete(m.id)) redrawLive();
       insertStroke(strokeFrom(m));
@@ -514,6 +546,7 @@ function onMessage(m) {
       toast(m.m ? `Stroke not saved: ${m.m}` : 'Stroke not saved');
       break;
     case 'u':
+      if (cur && cur.id === m.id) break; // the old socket's copy of the stroke I am drawing
       pending.delete(m.id);
       if (liveStrokes.delete(m.id)) redrawLive();
       removeStroke(m.id);
@@ -537,8 +570,11 @@ const strokeFrom = (m) => {
   return s;
 };
 
+const isMine = (id) => (cur && cur.id === id) || pending.has(id);
+
 function onHello(m) {
   retry = 500;
+  asked.clear(); // preview requests sent on the old socket are gone
   role = m.role === 'edit' ? 'edit' : 'view';
   me = role === 'edit' && m.me != null ? m.me : null;
   viewKey = m.view || null;
@@ -690,15 +726,21 @@ live.addEventListener('pointerdown', (e) => {
   const t = e.pointerType, now = performance.now();
   if (t === 'pen') { penSeen = true; penAt = now; }
   if (t === 'touch') {
+    lastTouchAt = now;
     // A hand landing while the pen is at work is not a gesture.
     if ((cur && cur.pen) || now - penAt < 400) return;
+    // A first finger means no others are down: forget any whose lift was lost.
+    if (e.isPrimary && touches.size) { touches.clear(); pinch = null; }
     touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (touches.size === 2) { e.preventDefault(); startPinch(); return; }
     if (touches.size > 2) return;
   }
   if (pinch) return;
   e.preventDefault();
-  if (editor) { closeEditor(true); return; } // a tap outside the text box finishes it
+  if (editor) { // a tap outside the text box finishes it; a resting hand does not
+    if (!(t === 'touch' && penSeen)) closeEditor(true);
+    return;
+  }
   const viewer = role !== 'edit' || me == null;
   const primary = t !== 'mouse' || e.button === 0;
   if ((t === 'mouse' && (e.button === 1 || (e.button === 0 && spaceDown))) ||
@@ -730,7 +772,7 @@ live.addEventListener('pointermove', (e) => {
     if (pinch && touches.size >= 2) {
       const [a, b] = [...touches.values()];
       const rect = boardEl.getBoundingClientRect();
-      const z = Math.min(MAX_ZOOM, Math.max(1, pinch.z0 * Math.hypot(a.x - b.x, a.y - b.y) / pinch.d0));
+      const z = Math.min(MAX_ZOOM, Math.max(minZoom(), pinch.z0 * Math.hypot(a.x - b.x, a.y - b.y) / pinch.d0));
       const mx = (a.x + b.x) / 2 - rect.left, my = (a.y + b.y) / 2 - rect.top;
       setView(z, pinch.bx - mx / (bw * z), pinch.by - my / (bw * z));
       return;
@@ -780,6 +822,15 @@ function pointerEnd(e) {
 }
 live.addEventListener('pointerup', pointerEnd);
 live.addEventListener('pointercancel', pointerEnd);
+// A lift can go missing (the app is sent to the background mid-stroke). Without
+// these the stroke in hand would block all drawing until a reload.
+live.addEventListener('lostpointercapture', pointerEnd);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  if (cur) endStroke({ pointerId: cur.pointerId });
+  touches.clear(); pinch = drag = textTap = null;
+  settleView();
+});
 live.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // Trackpad and wheel: pinch (or Ctrl/Cmd + wheel) zooms, scrolling pans.
@@ -796,11 +847,12 @@ addEventListener('wheel', (e) => {
 }, { passive: false });
 
 // Safari: stop the page itself zooming; on a Mac trackpad use the gesture.
-let gestureZoom = 1;
+let gestureZoom = 1, lastTouchAt = -1e9;
 addEventListener('gesturestart', (e) => { e.preventDefault(); gestureZoom = zoom; });
 addEventListener('gesturechange', (e) => {
   e.preventDefault();
   if (touches.size || !e.scale) return; // fingers on the board are handled as pointers
+  if (cur || performance.now() - lastTouchAt < 1000) return; // a resting hand, not a trackpad
   const rect = boardEl.getBoundingClientRect();
   zoomAt((gestureZoom * e.scale) / zoom, e.clientX - rect.left, e.clientY - rect.top);
 });
@@ -819,7 +871,7 @@ function placeEditor() {
   const left = (editor.x - panX) * bw * zoom, top = (editor.y - panY) * bw * zoom;
   ta.style.left = `${left}px`; ta.style.top = `${top}px`;
   ta.style.fontSize = `${px}px`; ta.style.color = editor.c;
-  ta.style.width = `${Math.max(60, bw - left - 2)}px`;
+  ta.style.width = `${Math.max(60, (1 - panX) * bw * zoom - left - 2)}px`;
   ta.style.height = 'auto';
   ta.style.height = `${Math.max(ta.scrollHeight, px * LINE_HEIGHT)}px`;
 }
@@ -836,11 +888,12 @@ function openEditor(x, y, old) {
 function closeEditor(save) {
   if (!editor) return;
   const ed = editor; editor = null;
-  const txt = ta.value.replace(/\r/g, '').split('\n').slice(0, 20).join('\n').replace(/\s+$/, '');
+  const txt = ta.value.replace(/\t/g, ' ').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '').split('\n').slice(0, 20).join('\n').replace(/\s+$/, '');
   ta.hidden = true; ta.value = ''; ta.blur();
   const old = ed.old;
   if (old && (!save || txt === old.txt)) { insertStroke(old); return; } // unchanged: put it back
   if (old) { // replaced or emptied: the old one goes, as an undo
+    if (byId.has(old.id)) removeStroke(old.id); // a reconnect may have put it back
     pending.delete(old.id);
     if (online && ready) send({ t: 'u', id: old.id }); else undoQueue.push(old.id);
   }
@@ -874,6 +927,7 @@ ta.addEventListener('keydown', (e) => {
 
 function undo() {
   if (role !== 'edit') return;
+  if (editor) { closeEditor(false); return; } // undo while typing cancels the text box
   while (mine.length) {
     const id = mine.pop();
     if (!byId.has(id)) continue; // already gone (layer deleted, refused)
@@ -891,7 +945,7 @@ addEventListener('keydown', (e) => {
   else if (e.target instanceof HTMLInputElement || e.ctrlKey || e.metaKey || e.altKey) return;
   else if (e.key === '+' || e.key === '=') zoomStep(1.5);
   else if (e.key === '-') zoomStep(1 / 1.5);
-  else if (e.key === '0') setView(1, 0, 0, true);
+  else if (e.key === '0') zoomHome();
   else if (e.key === ' ') { spaceDown = true; e.preventDefault(); }
 });
 addEventListener('keyup', (e) => { if (e.key === ' ') spaceDown = false; });
@@ -942,7 +996,7 @@ $('#bar').addEventListener('click', (e) => {
   else if (b.id === 'moveBtn') { tool = tool === 'move' ? 'pen' : 'move'; markTools(); }
   else if (b.id === 'zoomIn') zoomStep(1.5);
   else if (b.id === 'zoomOut') zoomStep(1 / 1.5);
-  else if (b.id === 'zoomReset') setView(1, 0, 0, true);
+  else if (b.id === 'zoomReset') zoomHome();
   else if (b.id === 'undo') undo();
   else if (b.id === 'layersBtn') openPanel(layersPanel.hidden ? layersPanel : null);
   else if (b.id === 'shareBtn') openPanel(sharePanel.hidden ? sharePanel : null);
@@ -1122,18 +1176,22 @@ function paperCanvas() {
 function edge(c, ctx) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#c9ced6'; ctx.lineWidth = 3; ctx.strokeRect(0, 0, c.width, c.height); return c; }
 // What the board shows right now.
 function paperOfScreen() {
+  // Only when the whole board is on screen and sharp; otherwise draw it.
+  if (visW(zoom) < 1 || visH(zoom) < ASPECT || rv.z !== zoom || rv.x !== panX || rv.y !== panY || cursor < strokes.length) return paperOfStrokes();
   const [c, ctx] = paperCanvas();
-  ctx.drawImage(base, 0, 0, c.width, c.height);
-  ctx.drawImage(live, 0, 0, c.width, c.height);
+  const k = bw * zoom * dpr;
+  for (const cv of [base, live]) ctx.drawImage(cv, -panX * k, -panY * k, k, k * ASPECT, 0, 0, c.width, c.height);
   return edge(c, ctx);
 }
-// The current strokes at the current view, drawn in one go.
+// The whole board from its strokes, drawn in one go. A very full board gets
+// plain paper instead: drawing it all at once would freeze a slow tablet.
 function paperOfStrokes() {
   const [c, ctx] = paperCanvas();
-  const k = (c.width / bw) * zoom;
-  ctx.setTransform(k, 0, 0, k, -panX * bw * k, -panY * bw * k);
-  const v = curView();
-  for (const s of strokes) if (!hidden.has(s.l)) drawFull(ctx, s, v);
+  if (strokes.length <= 1500) {
+    const k = c.width / bw;
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    for (const s of strokes) if (!hidden.has(s.l)) drawFull(ctx, s);
+  }
   return edge(c, ctx);
 }
 
@@ -1141,31 +1199,42 @@ function paperOfStrokes() {
 // at once if the animation can't run here.
 function playPaper(tex, reverse, ms) {
   return new Promise((done) => {
-    const g = !calm && paper && tex.width > 0 && glInit();
-    if (!g) return done();
-    const { gl } = g;
-    fx.width = base.width; fx.height = base.height;
-    gl.viewport(0, 0, fx.width, fx.height);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tex);
-    paper.cr_setup(GRID_COLS, GRID_ROWS, (Math.random() * 0x7fffffff) | 0, ASPECT);
-    // The wad flies to the Shelf button.
-    const br = boardEl.getBoundingClientRect(), sr = $('#shelfBtn').getBoundingClientRect();
-    const tx = sr.width ? (sr.left + sr.width / 2 - br.left) / bw : 0.06;
-    const ty = sr.width ? (sr.top + sr.height / 2 - br.top) / bw : 0.05;
-    paper.cr_target(Math.min(1.05, Math.max(-0.05, tx)), Math.min(ASPECT + 0.05, Math.max(-0.05, ty)));
-    fx.hidden = false;
-    const t0 = performance.now();
-    const tick = (now) => {
-      const p = Math.min(1, Math.max(0, (now - t0) / ms));
-      const ptr = paper.cr_frame(reverse ? 1 - p : p);
-      gl.bindBuffer(gl.ARRAY_BUFFER, g.pos);
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(paper.memory.buffer, ptr, g.n * 4));
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      gl.drawElements(gl.TRIANGLES, g.count, gl.UNSIGNED_SHORT, 0);
-      if (p < 1) requestAnimationFrame(tick);
-      else { fx.hidden = true; done(); }
-    };
-    requestAnimationFrame(tick);
+    // Whatever goes wrong, the animation ends and the board shows again.
+    let over = false;
+    const finish = () => { if (over) return; over = true; clearTimeout(guard); fx.hidden = true; fx.width = fx.height = 1; done(); };
+    const guard = setTimeout(finish, ms + 1500);
+    try {
+      const g = !calm && !document.hidden && paper && tex.width > 0 && glInit();
+      if (!g) return finish();
+      const { gl } = g;
+      // The canvas sits on the paper, wherever the view has it.
+      const k = bw * zoom;
+      fx.style.cssText = `left:${-panX * k}px;top:${-panY * k}px;width:${k}px;height:${k * ASPECT}px`;
+      fx.width = Math.min(1600, Math.round(k * dpr)); fx.height = Math.round(fx.width * ASPECT);
+      gl.viewport(0, 0, fx.width, fx.height);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tex);
+      paper.cr_setup(GRID_COLS, GRID_ROWS, (Math.random() * 0x7fffffff) | 0, ASPECT);
+      // The wad flies to the Shelf button.
+      const sr = $('#shelfBtn').getBoundingClientRect();
+      const tx = sr.width ? (sr.left + sr.width / 2) / k + panX : 0.06;
+      const ty = sr.width ? (sr.top + sr.height / 2) / k + panY : 0.05;
+      paper.cr_target(Math.min(1.05, Math.max(-0.05, tx)), Math.min(ASPECT + 0.05, Math.max(-0.05, ty)));
+      fx.hidden = false;
+      const t0 = performance.now();
+      const tick = (now) => {
+        if (over) return;
+        try {
+          const p = Math.min(1, Math.max(0, (now - t0) / ms));
+          const ptr = paper.cr_frame(reverse ? 1 - p : p);
+          gl.bindBuffer(gl.ARRAY_BUFFER, g.pos);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(paper.memory.buffer, ptr, g.n * 4));
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+          gl.drawElements(gl.TRIANGLES, g.count, gl.UNSIGNED_SHORT, 0);
+          if (p < 1) requestAnimationFrame(tick); else finish();
+        } catch { finish(); }
+      };
+      requestAnimationFrame(tick);
+    } catch { finish(); }
   });
 }
 
@@ -1186,18 +1255,20 @@ function crumple() {
 }
 
 function onCrumpled(m) {
+  if (editor) editor.old = null; // the text being edited went with the sheet
   const tex = paperOfScreen();
   clearSheet();
   for (const L of layers.values()) L.del = false;
   shelf = Array.isArray(m.shelf) ? m.shelf : [];
   redrawBase(true); layersChanged(); shelfChanged();
-  fxChain = fxChain.then(() => playPaper(tex, false, 950));
+  fxChain = fxChain.then(() => playPaper(tex, false, 950)).catch(() => {});
   const text = m.drop != null ? 'Board crumpled. The oldest crumpled board was thrown away.' : 'Board crumpled and put on the shelf.';
   if (role === 'edit') toast(text, 'Undo', () => send({ t: 'un', k: m.k }), 8000);
   else toast(text, null, null, 4000);
 }
 
 function onUncrumpled(m) {
+  if (editor) editor.old = null;
   const old = strokes.some((s) => !pending.has(s.id)) ? paperOfScreen() : null;
   clearSheet();
   const mineLeft = strokes.splice(0);
@@ -1216,6 +1287,7 @@ function onUncrumpled(m) {
   fxChain = fxChain
     .then(() => (old ? playPaper(old, false, 450) : null))
     .then(() => playPaper(tex, true, 800))
+    .catch(() => {})
     .then(() => { base.style.visibility = ''; });
 }
 

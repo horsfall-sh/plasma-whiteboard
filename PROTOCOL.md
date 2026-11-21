@@ -97,6 +97,9 @@ same sequence. A client that falls too far behind is disconnected and gets a fre
 | Text annotation | 500 characters, 20 lines |
 | Strokes kept per board (sheet in use plus shelf, visible plus restorable) | 10,000 |
 | Crumpled sheets on the shelf | 5 |
+| Stroke data kept per board (sheet in use plus shelf) | 16 MB |
+| Bytes per connection | burst of 2 MB, then 256 KB a second |
+| Whole-sheet operations per connection (`cr`, `un`, `sv`, `lr`) | burst of 12, then one every 2 s; over the limit they are ignored |
 | Live strokes per board / per connection | 64 / 4 |
 | Contributors per board | 200 (later browsers join as viewers) |
 | Connections per board / per address | 100 / 40 |

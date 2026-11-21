@@ -29,9 +29,14 @@ impl Bucket {
     }
 
     pub fn take(&mut self) -> bool {
+        self.take_n(1.0)
+    }
+
+    /// Take `n` tokens at once (bytes, for a byte-rate limit).
+    pub fn take_n(&mut self, n: f64) -> bool {
         self.refill();
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= n {
+            self.tokens -= n;
             true
         } else {
             false
