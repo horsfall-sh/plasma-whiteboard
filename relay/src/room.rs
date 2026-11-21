@@ -157,9 +157,14 @@ pub struct Joined {
 
 // ---- numbers on the wire ----------------------------------------------------
 
-/// Write a value in 0..=1 rounded to 5 decimals, without trailing zeros.
+/// Write a small value (a few units either side of zero) rounded to 5
+/// decimals, without trailing zeros.
 fn push5(out: &mut String, v: f32) {
-    let n = (f64::from(v) * 1e5).round().max(0.0) as u32;
+    let r = (f64::from(v) * 1e5).round();
+    if r < 0.0 {
+        out.push('-');
+    }
+    let n = r.abs() as u32;
     let (int, mut frac) = (n / 100_000, n % 100_000);
     out.push_str(&int.to_string());
     if frac == 0 {
@@ -782,6 +787,7 @@ mod tests {
     fn numbers_round_to_five_places() {
         let j = pts_json(&[0.0, 0.5625, 1.0, 0.123456, 0.1, 0.000004]);
         assert_eq!(j, "[0,0.5625,1,0.12346,0.1,0]");
+        assert_eq!(pts_json(&[-1.0, -0.5625, 0.5, -0.000004, -0.25, 1.0]), "[-1,-0.5625,0.5,0,-0.25,1]");
         assert_eq!(width_json(0.004), "0.004");
         assert_eq!(width_json(0.0000001), "0.00001");
     }

@@ -402,9 +402,10 @@ async fn bad_input_is_refused_or_clamped() {
     v.quiet().await;
 
     // Points outside the board are pulled onto it; long decimals are rounded.
-    a.send(json!({"t": "s", "id": "wild", "c": "#112233", "w": 0.004, "pts": [-5, 9, 3, 0.123456789, 0.2, 0.5]})).await;
+    a.send(json!({"t": "s", "id": "wild", "c": "#112233", "w": 0.004, "pts": [-5, 9, 3, 0.123456789, 0.2, 0.5, -0.25, -0.1, 0.5]})).await;
     a.expect("ok").await;
-    assert_eq!(v.expect("e").await["pts"], json!([0, 0.5625, 1, 0.12346, 0.2, 0.5]));
+    // The surface is 3 by 3 pages: x -1..2, y -0.5625..1.125.
+    assert_eq!(v.expect("e").await["pts"], json!([-1, 1.125, 1, 0.12346, 0.2, 0.5, -0.25, -0.1, 0.5]));
 
     // Another connection can't feed or finish my live stroke.
     let (mut b, _, _) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
