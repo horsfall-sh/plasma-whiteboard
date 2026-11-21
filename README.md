@@ -19,6 +19,8 @@ board in a browser window on a laptop, and share that window in a video call.
   window with a little of its neighbours showing, so a line can run from one page onto the next. The zoom
   button (or `0`) switches between the current page and all nine. The map at the bottom left shows where
   you are; tap or drag on it to go anywhere.
+- **Tools:** pencil, eraser and Text are separate buttons; picking one switches to it. While a stroke is being
+  drawn the toolbar, page arrows and map fade and let the pen pass through them.
 - **Zoom** up to 8x, local to your browser. Two-finger pinch, trackpad pinch, Ctrl or Cmd + wheel, the
   toolbar buttons, or the `+`, `-` and `0` keys. Scrolling pans; so does a middle-button drag or Space + drag.
   The **Move** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom

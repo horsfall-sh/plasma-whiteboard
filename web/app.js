@@ -610,7 +610,7 @@ function onHello(m) {
   const keep = cur && role === 'edit' ? liveStrokes.get(cur.id) : null;
   dropBoard();
   if (keep) { keep.l = me; liveStrokes.set(keep.id, keep); cur.sent = false; cur.out = []; }
-  else cur = null;
+  else { cur = null; document.body.classList.remove('drawing'); }
   for (const L of Array.isArray(m.layers) ? m.layers : []) layers.set(L.l, { l: L.l, c: L.c, del: !!L.del });
 
   const mineNow = me != null && layers.get(me) ? layers.get(me).c : null;
@@ -729,7 +729,7 @@ function queueFlush() {
 function abandonStroke() {
   if (!cur) return;
   const id = cur.id, sent = cur.sent;
-  cur = null;
+  cur = null; document.body.classList.remove('drawing');
   if (liveStrokes.delete(id)) redrawLive();
   if (sent) send({ t: 'u', id });
 }
@@ -783,6 +783,7 @@ live.addEventListener('pointerdown', (e) => {
   const id = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
   const s = begin(id, me, erase ? ERASER_COLOR : color, erase ? width * ERASER_SCALE : width);
   cur = { id, pointerId: e.pointerId, out: [], sent: online && ready, pen: t === 'pen' };
+  document.body.classList.add('drawing');
   if (cur.sent) send({ t: 'b', id, c: s.c, w: s.w });
   addPoint(e, boardEl.getBoundingClientRect());
   queueFlush();
@@ -818,7 +819,7 @@ live.addEventListener('pointermove', (e) => {
 function endStroke(e) {
   if (!cur || e.pointerId !== cur.pointerId) return;
   const id = cur.id, sent = cur.sent, out = cur.out, s = liveStrokes.get(id);
-  cur = null;
+  cur = null; document.body.classList.remove('drawing');
   if (!s) return;
   if (sent && out.length) send({ t: 'p', id, pts: out });
   liveStrokes.delete(id);
@@ -999,9 +1000,10 @@ function buildSwatches() {
 }
 function markTools() {
   for (const b of document.querySelectorAll('#bar [data-c]')) {
-    const on = (tool === 'pen' || tool === 'text') && b.dataset.c === color;
+    const on = b.dataset.c === color; // the colour pen and text use
     b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));
   }
+  const pb = $('#penBtn'); pb.classList.toggle('on', tool === 'pen'); pb.setAttribute('aria-pressed', String(tool === 'pen'));
   eraserBtn.classList.toggle('on', tool === 'erase'); eraserBtn.setAttribute('aria-pressed', String(tool === 'erase'));
   textBtn.classList.toggle('on', tool === 'text'); textBtn.setAttribute('aria-pressed', String(tool === 'text'));
   document.body.classList.toggle('text', tool === 'text');
@@ -1017,6 +1019,7 @@ $('#bar').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.c) { color = b.dataset.c; if (tool !== 'text') tool = 'pen'; markTools(); }
   else if (b.dataset.w) { width = Number(b.dataset.w); markTools(); }
+  else if (b.id === 'penBtn') { tool = 'pen'; markTools(); }
   else if (b.id === 'eraser') { tool = tool === 'erase' ? 'pen' : 'erase'; markTools(); }
   else if (b.id === 'textBtn') { tool = tool === 'text' ? 'pen' : 'text'; markTools(); }
   else if (b.id === 'crumpleBtn') crumple();
