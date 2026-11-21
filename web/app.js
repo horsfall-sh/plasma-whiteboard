@@ -29,7 +29,9 @@ const el = (tag, cls, text) => {
 
 const boardEl = $('#board'), base = $('#base'), live = $('#live');
 const bctx = base.getContext('2d');
-const lctx = live.getContext('2d', { desynchronized: true }) || live.getContext('2d');
+// No `desynchronized` hint: Chrome on Android then draws this canvas opaque
+// (black), hiding the paper and the finished strokes under it.
+const lctx = live.getContext('2d');
 const spare = document.createElement('canvas'); // off-screen target for flicker-free redraws
 const sctx = spare.getContext('2d');
 const statusEl = $('#status'), statusText = $('#status span');
