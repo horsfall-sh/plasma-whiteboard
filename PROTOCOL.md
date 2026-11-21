@@ -32,7 +32,7 @@ oldest shelved sheet for good. Undo and layer delete or restore act on the sheet
 
 ## Coordinates
 
-Points are flat arrays of `x, y, pressure` triples. `x` is 0 to 1, `y` is 0 to 0.5625, pressure is 0 to 1.
+Points are flat arrays of `x, y, pressure` triples. The unit is the width of one page. The centre page is `x` 0 to 1, `y` 0 to 0.5625; the surface is a 3 by 3 grid of pages around it, so `x` runs from -1 to 2 and `y` from -0.5625 to 1.125. Pressure is 0 to 1. The relay clamps points to these ranges.
 The relay clamps values to those ranges and writes them back out rounded to 5 decimals.
 
 ## WebSocket

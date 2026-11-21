@@ -14,9 +14,11 @@ board in a browser window on a laptop, and share that window in a video call.
 - **Crumple:** wipes the board for everyone and puts it on a shelf of up to five crumpled boards. **Shelf**
   shows them with a small preview; **Bring back** swaps one in and crumples the board in use in its place.
   A sixth crumple throws the oldest away. The toast after a crumple has an Undo.
-- **The board fills the window.** The board itself is always 16:9, so at 100% a window of another shape
-  cuts a little off two sides; the map at the bottom left shows what is off screen. The zoom button (or `0`)
-  switches between filling the window and showing the whole board.
+- **Nine connected pages.** The board is one continuous sheet of 3 by 3 pages; you start on the centre one.
+  The arrows at the window's edges (or the arrow keys) move a page at a time. At 100% a page fills the
+  window with a little of its neighbours showing, so a line can run from one page onto the next. The zoom
+  button (or `0`) switches between the current page and all nine. The map at the bottom left shows where
+  you are; tap or drag on it to go anywhere.
 - **Zoom** up to 8x, local to your browser. Two-finger pinch, trackpad pinch, Ctrl or Cmd + wheel, the
   toolbar buttons, or the `+`, `-` and `0` keys. Scrolling pans; so does a middle-button drag or Space + drag.
   The **Move** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom
@@ -78,7 +80,7 @@ page uses `wss:` on its own when served over HTTPS.
 - **Identity.** On an edit link the browser makes a random secret for that board and keeps it in
   `localStorage`. The relay maps it to a layer number and assigns the colour. The same browser gets the same
   layer back after a reload or a relay restart. Clearing site data makes a new contributor.
-- **Strokes.** Points are vectors in board-width units (x 0 to 1, y 0 to 0.5625). The page shows a stroke
+- **Strokes.** Points are vectors in page-width units (centre page x 0 to 1, y 0 to 0.5625; the surface is 3 by 3 pages). The page shows a stroke
   live while it is drawn, simplifies it when the pen lifts, and sends the final points. The relay gives each
   stored stroke a sequence number; clients draw in that order. Strokes are never edited: undo, layer delete
   and restore flip a state flag.

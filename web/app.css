@@ -6,7 +6,25 @@ html, body {
 [hidden] { display: none !important; }
 
 #board { position: absolute; inset: 0; overflow: hidden; }
-#paper { position: absolute; background: #fff; box-shadow: 0 2px 16px rgba(0,0,0,.4); }
+#paper, #nav {
+  background:
+    linear-gradient(#cfd5dd, #cfd5dd) 33.333% 0 / 1px 100% no-repeat,
+    linear-gradient(#cfd5dd, #cfd5dd) 66.667% 0 / 1px 100% no-repeat,
+    linear-gradient(#cfd5dd, #cfd5dd) 0 33.333% / 100% 1px no-repeat,
+    linear-gradient(#cfd5dd, #cfd5dd) 0 66.667% / 100% 1px no-repeat,
+    #fff;
+}
+#paper { position: absolute; box-shadow: 0 2px 16px rgba(0,0,0,.4); }
+.pg {
+  position: fixed; z-index: 3; width: 34px; height: 64px; padding: 0; border: 0; border-radius: 8px;
+  background: rgba(35,38,43,.72); color: #e8eaed; font: 28px/1 system-ui, sans-serif; cursor: pointer;
+  touch-action: manipulation;
+}
+.pg:hover { background: rgba(35,38,43,.92); }
+#pgL { left: 6px; top: 50%; margin-top: -32px; }
+#pgR { right: 6px; top: 50%; margin-top: -32px; }
+#pgU { left: 50%; top: 72px; margin-left: -17px; transform: rotate(90deg); }
+#pgD { left: 50%; bottom: 40px; margin-left: -17px; transform: rotate(90deg); }
 canvas {
   position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none;
   transform-origin: 0 0; -webkit-touch-callout: none;
@@ -122,7 +140,7 @@ body.edit #bar #swatches { display: contents; }
 body.edit.move #live, body:not(.edit) #live { cursor: grab; }
 #nav {
   position: fixed; left: 8px; bottom: 8px; z-index: 3; width: 144px; height: 81px;
-  background: rgba(255,255,255,.92); border: 2px solid #23262b; border-radius: 6px;
+  border: 2px solid #23262b; border-radius: 6px;
   box-shadow: 0 2px 12px rgba(0,0,0,.5); touch-action: none; cursor: pointer; overflow: hidden;
 }
 #navBox {

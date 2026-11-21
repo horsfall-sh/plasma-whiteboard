@@ -208,8 +208,13 @@ fn clean_pts(mut v: Vec<f32>) -> Option<Vec<f32>> {
         if !x.is_finite() {
             return None;
         }
-        let hi = if i % 3 == 1 { ASPECT } else { 1.0 };
-        *x = x.clamp(0.0, hi);
+        // The surface is a 3 by 3 grid of pages; the centre page is x 0..1, y 0..ASPECT.
+        let (lo, hi) = match i % 3 {
+            0 => (-1.0, 2.0),
+            1 => (-ASPECT, 2.0 * ASPECT),
+            _ => (0.0, 1.0),
+        };
+        *x = x.clamp(lo, hi);
     }
     Some(v)
 }
@@ -783,7 +788,8 @@ mod tests {
 
     #[test]
     fn points_are_clamped_and_checked() {
-        assert_eq!(clean_pts(vec![-1.0, 2.0, 5.0]).unwrap(), vec![0.0, ASPECT, 1.0]);
+        assert_eq!(clean_pts(vec![-1.5, 2.0, 5.0]).unwrap(), vec![-1.0, 2.0 * ASPECT, 1.0]);
+        assert_eq!(clean_pts(vec![2.5, -3.0, -1.0]).unwrap(), vec![2.0, -ASPECT, 0.0]);
         assert!(clean_pts(vec![0.1, 0.1]).is_none());
         assert!(clean_pts(vec![0.1, f32::NAN, 0.5]).is_none());
         assert!(clean_pts(vec![0.1, f32::INFINITY, 0.5]).is_none());

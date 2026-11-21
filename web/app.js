@@ -1,8 +1,12 @@
 (() => {
 'use strict';
-// Coordinates are in board-width units: x in 0..1, y in 0..ASPECT. The same
-// stroke therefore lands in the same place on every screen size.
+// Coordinates are in page-width units. The centre page is x in 0..1, y in
+// 0..ASPECT; the surface is a 3 by 3 grid of pages around it, one continuous
+// sheet, so a line can run from one page onto the next. The same stroke lands
+// in the same place on every screen size.
 const ASPECT = 9 / 16;
+const WX = -1, WY = -ASPECT, WW = 3, WH = 3 * ASPECT; // the whole surface
+const OVERLAP = 1.08; // at 100% a page shows with a little of its neighbours
 const EPS = 0.0004;          // simplification tolerance (under 1px on a 1600px board)
 const PRESSURE_SPAN = 0.15;  // must match smooth/src/lib.rs
 const ERASER_SCALE = 6;
@@ -251,12 +255,13 @@ function offScreen(s, v) {
 // goes negative when the board is narrower than the window.
 const curView = () => ({ z: zoom, x: panX, y: panY });
 const visW = (z) => vw / (bw * z), visH = (z) => vh / (bw * z); // board units on screen
-const minZoom = () => Math.min(vw, vh / ASPECT) / bw;            // the whole board fits
-const clampPan = (p, vis, size) => (vis >= size ? (size - vis) / 2 : Math.min(size - vis, Math.max(0, p)));
+const minZoom = () => Math.min(vw / WW, vh / WH) / bw;         // every page fits
+const clampPan = (p, vis, lo, size) => (vis >= size ? lo + (size - vis) / 2 : Math.min(lo + size - vis, Math.max(lo, p)));
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const paperEl = $('#paper');
 function placePaper() {
   const k = bw * zoom;
-  paperEl.style.cssText = `left:${-panX * k}px;top:${-panY * k}px;width:${k}px;height:${k * ASPECT}px`;
+  paperEl.style.cssText = `left:${(WX - panX) * k}px;top:${(WY - panY) * k}px;width:${WW * k}px;height:${WH * k}px`;
 }
 function setCtxView(ctx, v) {
   const k = dpr * v.z;
@@ -280,8 +285,8 @@ let viewTimer = 0;
 function setView(z, x, y, settle) {
   z = Math.min(MAX_ZOOM, Math.max(minZoom(), z));
   if (Math.abs(z - 1) < 0.02) z = 1;
-  x = clampPan(x, visW(z), 1);
-  y = clampPan(y, visH(z), ASPECT);
+  x = clampPan(x, visW(z), WX, WW);
+  y = clampPan(y, visH(z), WY, WH);
   const same = z === zoom && x === panX && y === panY;
   zoom = z; panX = x; panY = y;
   if (!same) { placePaper(); stretchBase(); redrawLive(); placeEditor(); showZoom(); }
@@ -302,25 +307,38 @@ function zoomAt(f, sx, sy, settle) {
 function zoomStep(f) { zoomAt(f, vw / 2, vh / 2, true); }
 // The zoom button and the 0 key: fill the window; again, show the whole board.
 function zoomHome() {
-  const z = zoom === 1 && minZoom() < 0.98 ? minZoom() : 1;
-  setView(z, 0.5 - visW(z) / 2, ASPECT / 2 - visH(z) / 2, true);
+  if (zoom === 1) setView(minZoom(), WX, WY, true); else goPage(...pageAt());
 }
+// The page under the middle of the window: [column, row], each -1, 0 or 1.
+function pageAt() {
+  return [clamp(Math.floor(panX + visW(zoom) / 2), -1, 1), clamp(Math.floor((panY + visH(zoom) / 2) / ASPECT), -1, 1)];
+}
+function goPage(i, j) {
+  i = clamp(i, -1, 1); j = clamp(j, -1, 1);
+  setView(1, i + 0.5 - visW(1) / 2, (j + 0.5) * ASPECT - visH(1) / 2, true);
+}
+function pageStep(di, dj) { const [i, j] = pageAt(); goPage(i + di, j + dj); }
+const pgBtn = { pgL: [-1, 0], pgR: [1, 0], pgU: [0, -1], pgD: [0, 1] };
+for (const id of Object.keys(pgBtn)) $('#' + id).addEventListener('click', () => pageStep(...pgBtn[id]));
 // The zoom label, and the small map (bottom left) that shows which part of the
 // board is on screen while zoomed in.
 const navEl = $('#nav'), navBox = $('#navBox');
 function showZoom() {
   $('#zoomReset').textContent = `${Math.round(zoom * 100)}%`;
   const W = visW(zoom), H = visH(zoom);
-  const all = W >= 1 - 1e-6 && H >= ASPECT - 1e-6; // the whole board is on screen
+  const all = W >= WW - 1e-6 && H >= WH - 1e-6; // every page is on screen
+  const [pi, pj] = pageAt();
+  $('#pgL').hidden = all || pi <= -1; $('#pgR').hidden = all || pi >= 1;
+  $('#pgU').hidden = all || pj <= -1; $('#pgD').hidden = all || pj >= 1;
   navEl.hidden = all;
   if (all) return;
-  navBox.style.left = `${Math.max(0, panX) * 100}%`; navBox.style.top = `${(Math.max(0, panY) / ASPECT) * 100}%`;
-  navBox.style.width = `${Math.min(1, W) * 100}%`; navBox.style.height = `${Math.min(1, H / ASPECT) * 100}%`;
+  navBox.style.left = `${((Math.max(WX, panX) - WX) / WW) * 100}%`; navBox.style.top = `${((Math.max(WY, panY) - WY) / WH) * 100}%`;
+  navBox.style.width = `${(Math.min(WW, W) / WW) * 100}%`; navBox.style.height = `${(Math.min(WH, H) / WH) * 100}%`;
 }
 // Tap or drag on the map to put that spot at the centre of the screen.
 function navTo(e) {
   const r = navEl.getBoundingClientRect();
-  const bx = (e.clientX - r.left) / r.width, by = ((e.clientY - r.top) / r.height) * ASPECT;
+  const bx = WX + ((e.clientX - r.left) / r.width) * WW, by = WY + ((e.clientY - r.top) / r.height) * WH;
   setView(zoom, bx - visW(zoom) / 2, by - visH(zoom) / 2);
 }
 navEl.addEventListener('pointerdown', (e) => { e.preventDefault(); try { navEl.setPointerCapture(e.pointerId); } catch { /* gone */ } navTo(e); });
@@ -330,8 +348,8 @@ navEl.addEventListener('pointercancel', settleView);
 // Board point under a pointer event.
 function boardPoint(e, rect) {
   return [
-    Math.min(1, Math.max(0, panX + (e.clientX - rect.left) / (bw * zoom))),
-    Math.min(ASPECT, Math.max(0, panY + (e.clientY - rect.top) / (bw * zoom))),
+    clamp(panX + (e.clientX - rect.left) / (bw * zoom), WX, WX + WW),
+    clamp(panY + (e.clientY - rect.top) / (bw * zoom), WY, WY + WH),
   ];
 }
 
@@ -399,14 +417,15 @@ function layout() {
   // Keep the same board point at the middle of the window.
   const cx = laidOut ? panX + visW(zoom) / 2 : 0.5, cy = laidOut ? panY + visH(zoom) / 2 : ASPECT / 2;
   vw = Math.max(1, innerWidth); vh = Math.max(1, innerHeight);
-  bw = Math.max(vw, vh / ASPECT);
+  bw = Math.max(vw, vh / ASPECT) / OVERLAP;
   // Start filling the window, unless that would cut off more than about a
   // third of the board (a phone held upright): then start with all of it.
-  if (!laidOut) zoom = minZoom() < 0.7 ? minZoom() : 1;
+  const pageFit = Math.min(vw, vh / ASPECT) / bw;
+  if (!laidOut) zoom = pageFit < 0.7 ? pageFit : 1;
   laidOut = true;
   zoom = Math.min(MAX_ZOOM, Math.max(minZoom(), zoom));
-  panX = clampPan(cx - visW(zoom) / 2, visW(zoom), 1);
-  panY = clampPan(cy - visH(zoom) / 2, visH(zoom), ASPECT);
+  panX = clampPan(cx - visW(zoom) / 2, visW(zoom), WX, WW);
+  panY = clampPan(cy - visH(zoom) / 2, visH(zoom), WY, WH);
   dpr = Math.min(devicePixelRatio || 1, 2); // cap for slow GPUs
   for (const cv of [base, live, spare]) { cv.width = Math.round(vw * dpr); cv.height = Math.round(vh * dpr); }
   placePaper(); showZoom();
@@ -871,7 +890,7 @@ function placeEditor() {
   const left = (editor.x - panX) * bw * zoom, top = (editor.y - panY) * bw * zoom;
   ta.style.left = `${left}px`; ta.style.top = `${top}px`;
   ta.style.fontSize = `${px}px`; ta.style.color = editor.c;
-  ta.style.width = `${Math.max(60, (1 - panX) * bw * zoom - left - 2)}px`;
+  ta.style.width = `${Math.max(60, (WX + WW - panX) * bw * zoom - left - 2)}px`;
   ta.style.height = 'auto';
   ta.style.height = `${Math.max(ta.scrollHeight, px * LINE_HEIGHT)}px`;
 }
@@ -914,7 +933,7 @@ function textAt(e) {
     if (x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]) return openEditor(s.pts[0], s.pts[1], s);
   }
   const h = width * TEXT_SCALE * LINE_HEIGHT;
-  openEditor(x, Math.max(0, Math.min(ASPECT - h, y - h / 2)));
+  openEditor(x, clamp(y - h / 2, WY, WY + WH - h));
 }
 
 ta.addEventListener('input', placeEditor);
@@ -946,6 +965,10 @@ addEventListener('keydown', (e) => {
   else if (e.key === '+' || e.key === '=') zoomStep(1.5);
   else if (e.key === '-') zoomStep(1 / 1.5);
   else if (e.key === '0') zoomHome();
+  else if (e.key === 'ArrowLeft') pageStep(-1, 0);
+  else if (e.key === 'ArrowRight') pageStep(1, 0);
+  else if (e.key === 'ArrowUp') pageStep(0, -1);
+  else if (e.key === 'ArrowDown') pageStep(0, 1);
   else if (e.key === ' ') { spaceDown = true; e.preventDefault(); }
 });
 addEventListener('keyup', (e) => { if (e.key === ' ') spaceDown = false; });
@@ -1136,7 +1159,7 @@ function glInit() {
   gl.linkProgram(prog);
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
   gl.useProgram(prog);
-  gl.uniform1f(gl.getUniformLocation(prog, 'asp'), ASPECT);
+  const asp = gl.getUniformLocation(prog, 'asp');
   const C = GRID_COLS, R = GRID_ROWS, n = (C + 1) * (R + 1);
   const uv = new Float32Array(n * 2), idx = new Uint16Array(C * R * 6);
   for (let j = 0; j <= R; j++) for (let i = 0; i <= C; i++) { uv[(j * (C + 1) + i) * 2] = i / C; uv[(j * (C + 1) + i) * 2 + 1] = j / R; }
@@ -1162,13 +1185,13 @@ function glInit() {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0, 0, 0, 0);
-  return (glState = { gl, pos, n, count: idx.length });
+  return (glState = { gl, pos, n, count: idx.length, asp });
 }
 
 // A picture of a sheet of paper, to wrap round the mesh.
 function paperCanvas() {
   const c = document.createElement('canvas');
-  c.width = Math.min(1024, base.width); c.height = Math.round(c.width * ASPECT);
+  c.width = Math.min(1600, base.width); c.height = Math.max(1, Math.round((c.width * vh) / vw));
   const ctx = c.getContext('2d');
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
   return [c, ctx];
@@ -1177,20 +1200,19 @@ function edge(c, ctx) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#
 // What the board shows right now.
 function paperOfScreen() {
   // Only when the whole board is on screen and sharp; otherwise draw it.
-  if (visW(zoom) < 1 || visH(zoom) < ASPECT || rv.z !== zoom || rv.x !== panX || rv.y !== panY || cursor < strokes.length) return paperOfStrokes();
+  if (rv.z !== zoom || rv.x !== panX || rv.y !== panY || cursor < strokes.length) return paperOfStrokes();
   const [c, ctx] = paperCanvas();
-  const k = bw * zoom * dpr;
-  for (const cv of [base, live]) ctx.drawImage(cv, -panX * k, -panY * k, k, k * ASPECT, 0, 0, c.width, c.height);
+  for (const cv of [base, live]) ctx.drawImage(cv, 0, 0, c.width, c.height);
   return edge(c, ctx);
 }
-// The whole board from its strokes, drawn in one go. A very full board gets
+// What the window would show, from the strokes, drawn in one go. A very full board gets
 // plain paper instead: drawing it all at once would freeze a slow tablet.
 function paperOfStrokes() {
   const [c, ctx] = paperCanvas();
   if (strokes.length <= 1500) {
-    const k = c.width / bw;
-    ctx.setTransform(k, 0, 0, k, 0, 0);
-    for (const s of strokes) if (!hidden.has(s.l)) drawFull(ctx, s);
+    const k = (c.width / vw) * zoom, v = curView();
+    ctx.setTransform(k, 0, 0, k, -panX * bw * k, -panY * bw * k);
+    for (const s of strokes) if (!hidden.has(s.l)) drawFull(ctx, s, v);
   }
   return edge(c, ctx);
 }
@@ -1207,18 +1229,18 @@ function playPaper(tex, reverse, ms) {
       const g = !calm && !document.hidden && paper && tex.width > 0 && glInit();
       if (!g) return finish();
       const { gl } = g;
-      // The canvas sits on the paper, wherever the view has it.
-      const k = bw * zoom;
-      fx.style.cssText = `left:${-panX * k}px;top:${-panY * k}px;width:${k}px;height:${k * ASPECT}px`;
-      fx.width = Math.min(1600, Math.round(k * dpr)); fx.height = Math.round(fx.width * ASPECT);
+      // The sheet of paper is what the window shows.
+      const a = vh / vw;
+      fx.width = Math.min(1600, base.width); fx.height = Math.max(1, Math.round(fx.width * a));
       gl.viewport(0, 0, fx.width, fx.height);
+      gl.uniform1f(g.asp, a);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tex);
-      paper.cr_setup(GRID_COLS, GRID_ROWS, (Math.random() * 0x7fffffff) | 0, ASPECT);
+      paper.cr_setup(GRID_COLS, GRID_ROWS, (Math.random() * 0x7fffffff) | 0, a);
       // The wad flies to the Shelf button.
       const sr = $('#shelfBtn').getBoundingClientRect();
-      const tx = sr.width ? (sr.left + sr.width / 2) / k + panX : 0.06;
-      const ty = sr.width ? (sr.top + sr.height / 2) / k + panY : 0.05;
-      paper.cr_target(Math.min(1.05, Math.max(-0.05, tx)), Math.min(ASPECT + 0.05, Math.max(-0.05, ty)));
+      const tx = sr.width ? (sr.left + sr.width / 2) / vw : 0.06;
+      const ty = sr.width ? (sr.top + sr.height / 2) / vw : 0.05;
+      paper.cr_target(clamp(tx, -0.05, 1.05), clamp(ty, -0.05, a + 0.05));
       fx.hidden = false;
       const t0 = performance.now();
       const tick = (now) => {
@@ -1326,8 +1348,8 @@ function onSheetView(m) {
   asked.delete(m.k);
   if (!shelf.some((s) => s.k === m.k) || !Array.isArray(m.a)) return;
   const c = document.createElement('canvas'); c.width = 256; c.height = 144;
-  const ctx = c.getContext('2d'), k = c.width / bw;
-  ctx.setTransform(k, 0, 0, k, 0, 0);
+  const ctx = c.getContext('2d'), k = c.width / (WW * bw); // all nine pages
+  ctx.setTransform(k, 0, 0, k, -WX * bw * k, -WY * bw * k);
   for (const raw of m.a) drawFull(ctx, strokeFrom(raw));
   previews.set(m.k, c);
   renderShelf();
