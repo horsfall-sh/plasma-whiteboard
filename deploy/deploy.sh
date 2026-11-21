@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install or update the relay on the server. Usage: deploy/deploy.sh root@host
-# Build first with `make linux`. The Caddy site block (deploy/Caddyfile.site)
-# is added by hand once; this script never edits the Caddyfile.
+# Build first with `make linux`. The TLS proxy (deploy/HOST.md) is set up once;
+# this script never touches it.
 set -eu
 HOST="$1"
 BIN=relay/target-linux/release/wb-relay
@@ -11,6 +11,7 @@ scp deploy/whiteboard.service "$HOST:/etc/systemd/system/whiteboard.service"
 ssh "$HOST" 'set -e
   chmod 755 /usr/local/bin/wb-relay.new
   mv /usr/local/bin/wb-relay.new /usr/local/bin/wb-relay
+  command -v restorecon >/dev/null && restorecon /usr/local/bin/wb-relay /etc/systemd/system/whiteboard.service
   systemctl daemon-reload
   systemctl enable whiteboard >/dev/null 2>&1
   systemctl restart whiteboard
