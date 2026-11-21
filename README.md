@@ -9,6 +9,20 @@ board in a browser window on a laptop, and share that window in a video call.
 - Each browser is a contributor with its own colour and its own layer.
 - Hiding a layer affects only your browser. Deleting a layer affects everyone and can be undone.
 - Boards are stored in SQLite and survive a restart.
+- **Text annotations:** pick Text, tap the board, type. Enter finishes, Shift+Enter starts a new line, Escape
+  cancels. Tap your own text with the Text tool to edit it. Size follows S, M, L.
+- **Zoom** up to 8x, local to your browser. Two-finger pinch, trackpad pinch, Ctrl or Cmd + wheel, the
+  toolbar buttons, or the `+`, `-` and `0` keys. Scrolling pans; so does a middle-button drag or Space + drag.
+  On a view link one finger or the mouse pans.
+
+## Tablet and pen
+
+- The pen draws, with pressure. The eraser end of a pen erases.
+- Two fingers pinch to zoom and pan. They never draw.
+- One finger draws until a pen has touched the board in that browser. After that single fingers are ignored,
+  so a resting hand leaves no marks. Touches that land while the pen is down, or within 0.4 s of it, are
+  ignored too.
+- Text boxes are ordinary text fields, so handwriting-to-text input (Scribble on an iPad) works in them.
 
 ## Parts
 
@@ -71,7 +85,8 @@ stroke, 200 contributors per board, 100 connections per board.
 
 ## Not yet proven
 
-- **A real pen.** Pressure, palm rejection (finger touches are ignored once a pen has been seen) and the
-  pen's eraser end have only been exercised with a mouse and scripted pointer events.
+- **A real pen and tablet.** Pressure, palm rejection, the pen's eraser end and two-finger pinch have been
+  exercised with a mouse and with scripted pen and touch events in Chrome, not with real hardware. On an
+  iPad the on-screen keyboard may cover a text box placed low on the board.
 - **A slow tablet.** Redraws are time-sliced at 6 ms per frame and the device pixel ratio is capped at 2,
   but this has not been measured on real hardware.

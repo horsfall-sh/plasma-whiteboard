@@ -24,6 +24,8 @@ pub struct StrokeRow {
     pub color: String,
     pub width: f64,
     pub pts: String,
+    /// Set for a text annotation; None for a pen stroke.
+    pub txt: Option<String>,
     pub state: u8,
 }
 
@@ -61,6 +63,7 @@ enum Cmd {
         color: String,
         width: f64,
         pts: String,
+        txt: Option<String>,
     },
     StrokeState {
         board: i64,
@@ -117,6 +120,7 @@ CREATE TABLE IF NOT EXISTS strokes(
   width REAL NOT NULL,
   pts TEXT NOT NULL,
   state INTEGER NOT NULL DEFAULT 0,
+  txt TEXT,
   PRIMARY KEY(board, seq)) WITHOUT ROWID;
 CREATE UNIQUE INDEX IF NOT EXISTS strokes_id ON strokes(board, id);
 ";
@@ -128,6 +132,13 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // Databases made before text annotations lack the column.
+        let has_txt: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('strokes') WHERE name = 'txt'")?
+            .exists([])?;
+        if !has_txt {
+            conn.execute_batch("ALTER TABLE strokes ADD COLUMN txt TEXT")?;
+        }
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("wb-db".into())
@@ -175,8 +186,9 @@ impl Db {
         color: String,
         width: f64,
         pts: String,
+        txt: Option<String>,
     ) {
-        self.send(Cmd::AddStroke { board, seq, id, layer, color, width, pts });
+        self.send(Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt });
     }
 
     pub fn stroke_state(&self, board: i64, id: String, state: u8) {
@@ -273,7 +285,7 @@ fn apply(
                     out.layers.push(row?);
                 }
                 let mut q = conn.prepare_cached(
-                    "SELECT seq, id, layer, color, width, pts, state FROM strokes WHERE board = ? ORDER BY seq",
+                    "SELECT seq, id, layer, color, width, pts, state, txt FROM strokes WHERE board = ? ORDER BY seq",
                 )?;
                 let rows = q.query_map(params![board], |r| {
                     Ok(StrokeRow {
@@ -284,6 +296,7 @@ fn apply(
                         width: r.get(4)?,
                         pts: r.get(5)?,
                         state: r.get(6)?,
+                        txt: r.get(7)?,
                     })
                 })?;
                 for row in rows {
@@ -296,11 +309,11 @@ fn apply(
             conn.prepare_cached("INSERT INTO layers(board, n, who_hash, color) VALUES(?,?,?,?)")?
                 .execute(params![board, n, who, color])?;
         }
-        Cmd::AddStroke { board, seq, id, layer, color, width, pts } => {
+        Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt } => {
             conn.prepare_cached(
-                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts, txt) VALUES(?,?,?,?,?,?,?,?)",
             )?
-            .execute(params![board, seq as i64, id, layer, color, width, pts])?;
+            .execute(params![board, seq as i64, id, layer, color, width, pts, txt])?;
         }
         Cmd::StrokeState { board, id, state } => {
             conn.prepare_cached("UPDATE strokes SET state = ? WHERE board = ? AND id = ?")?

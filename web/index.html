@@ -12,11 +12,13 @@
 <div id="board">
   <canvas id="base"></canvas>
   <canvas id="live"></canvas>
+  <textarea id="textEdit" rows="1" maxlength="500" spellcheck="false" autocapitalize="sentences" aria-label="Text annotation" hidden></textarea>
 </div>
 
 <div id="bar" role="toolbar" aria-label="Whiteboard tools">
   <span id="swatches" class="tools"></span>
   <button type="button" id="eraser" class="tools" aria-label="Eraser" aria-pressed="false">Erase</button>
+  <button type="button" id="textBtn" class="tools" aria-label="Text annotation" aria-pressed="false">Text</button>
   <span class="sep tools"></span>
   <button type="button" class="tools" data-w="0.002" aria-label="Small pen" aria-pressed="false">S</button>
   <button type="button" class="tools on" data-w="0.004" aria-label="Medium pen" aria-pressed="true">M</button>
@@ -24,6 +26,10 @@
   <span class="sep tools"></span>
   <button type="button" id="undo" class="tools wide" aria-label="Undo my last stroke">Undo</button>
   <span class="sep tools"></span>
+  <button type="button" id="zoomOut" aria-label="Zoom out">&minus;</button>
+  <button type="button" id="zoomReset" class="wide" aria-label="Reset zoom to the whole board">100%</button>
+  <button type="button" id="zoomIn" aria-label="Zoom in">+</button>
+  <span class="sep"></span>
   <button type="button" id="layersBtn" class="wide" aria-label="Layers" aria-expanded="false" aria-controls="layersPanel">Layers</button>
   <button type="button" id="shareBtn" class="wide" aria-label="Share links" aria-expanded="false" aria-controls="sharePanel">Share</button>
 </div>

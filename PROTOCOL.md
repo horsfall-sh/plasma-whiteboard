@@ -15,6 +15,14 @@ The contract between the page (`web/`) and the relay (`relay/`). Change both sid
 - `GET /` serves the page, which calls `POST /api/boards` and moves to `/b/<edit key>` with
   `history.replaceState` (no reload).
 
+## Text annotations
+
+A text annotation is stored in the same log as strokes and belongs to its author's layer, so hide, delete,
+restore, undo and ordering work the same way. It is never edited in place: the page edits one by undoing it
+and sending a new one. The page draws it in a sans-serif font, line height 1.25, anchored at its top left.
+
+Zoom and pan are local to each browser and never go on the wire.
+
 ## Coordinates
 
 Points are flat arrays of `x, y, pressure` triples. `x` is 0 to 1, `y` is 0 to 0.5625, pressure is 0 to 1.
@@ -33,7 +41,7 @@ the connection. The key is sent in the first message, never in the URL.
 | `b` | `id`, `c`, `w` | Begin a live stroke. `id`: 1 to 40 characters of `[A-Za-z0-9_-]`, unique in the board. `c`: `#rrggbb`. `w`: width in board units, over 0 and at most 0.2. |
 | `p` | `id`, `pts` | More points for my live stroke. |
 | `e` | `id`, `c`, `w`, `pts` | End my live stroke. `pts` is the final simplified point list. If it is missing or empty the relay keeps the points it collected from `p`. `c` and `w` repeat the values from `b`, so that when the relay has no live stroke with this `id` (the stroke began while offline) it stores the stroke as if it were an `s`. |
-| `s` | `id`, `c`, `w`, `pts` | A whole finished stroke in one message. Used to resend strokes that were not confirmed before a disconnect. Sending an `id` the relay already holds from the same layer is confirmed again with `ok` and not stored twice. |
+| `s` | `id`, `c`, `w`, `pts`, `txt`? | A whole finished stroke in one message. With `txt` it is a **text annotation**: `pts` is then exactly one point (the top left of the text), `w` is the font size in board units, and `txt` is 1 to 500 characters on at most 20 lines, with no control characters other than newline. Used to resend strokes that were not confirmed before a disconnect. Sending an `id` the relay already holds from the same layer is confirmed again with `ok` and not stored twice. |
 | `u` | `id` | Undo one of my own strokes. |
 | `ld` | `l` | Delete layer `l` for everyone (any editor). |
 | `lr` | `l` | Restore the deleted strokes of layer `l` (any editor). |
@@ -45,11 +53,11 @@ Messages from a viewer other than `join` are ignored.
 | `t` | Fields | Meaning |
 | --- | --- | --- |
 | `hello` | `role`, `me`, `view`, `layers` | Sent after a good `join`. `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. **The client drops all board state when it receives this**; the snapshot follows. |
-| `ss` | `a` | Snapshot chunk: an array of finished strokes `{id, l, q, c, w, pts}` in `q` order. |
+| `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`. |
 | `ready` | | Snapshot complete. The client now resends unconfirmed strokes with `s`. |
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
 | `p` | `id`, `pts` | Points for a live stroke. |
-| `e` | `id`, `l`, `q`, `c`, `w`, `pts` | A stroke was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
+| `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`? | A stroke or text annotation was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
 | `ok` | `id`, `q` | To the author: the stroke is stored, with sequence number `q`. |
 | `no` | `id`, `m` | To the author: the stroke was refused (board full, bad data). The client removes it. |
 | `u` | `id` | A stroke was removed (undone, or a live stroke abandoned). Not sent to the author of an undo. |
@@ -73,6 +81,7 @@ same sequence. A client that falls too far behind is disconnected and gets a fre
 | --- | --- |
 | Message size | 1 MiB |
 | Points per stroke | 20,000 |
+| Text annotation | 500 characters, 20 lines |
 | Strokes kept per board (visible plus restorable) | 10,000 |
 | Live strokes per board / per connection | 64 / 4 |
 | Contributors per board | 200 (later browsers join as viewers) |

@@ -485,3 +485,49 @@ async fn presence_counts_connections() {
     assert_eq!((m["t"].as_str(), m["n"].as_u64()), (Some("n"), Some(1)));
     s.stop().await;
 }
+
+#[tokio::test]
+async fn text_annotations() {
+    let s = start(&temp_db("text")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+
+    let text = "Load balancer \"LB-1\"\nline two <b>";
+    a.send(json!({"t": "s", "id": "t1", "c": "#0a66d8", "w": 0.02, "pts": [0.25, 0.1, 0.5], "txt": text})).await;
+    a.expect("ok").await;
+    let e = v.expect("e").await;
+    assert_eq!(e["txt"], text);
+    assert_eq!(e["pts"], json!([0.25, 0.1, 0.5]));
+    assert_eq!(e["w"], 0.02);
+
+    // Refused: more than one point, empty text, control characters, too long.
+    for (id, pts, txt) in [
+        ("t2", json!([0.1, 0.1, 0.5, 0.2, 0.2, 0.5]), "two points".to_string()),
+        ("t3", json!([0.1, 0.1, 0.5]), "   ".to_string()),
+        ("t4", json!([0.1, 0.1, 0.5]), "bell\u{7}".to_string()),
+        ("t5", json!([0.1, 0.1, 0.5]), "x".repeat(501)),
+    ] {
+        a.send(json!({"t": "s", "id": id, "c": "#0a66d8", "w": 0.02, "pts": pts, "txt": txt})).await;
+        assert_eq!(a.expect("no").await["id"], id);
+    }
+    v.quiet().await;
+
+    // Text is part of the layer: deleted and restored with it, and it survives a restart.
+    a.send(json!({"t": "ld", "l": 1})).await;
+    a.expect("ld").await;
+    v.expect("ld").await;
+    drop(a);
+    drop(v);
+    let db = s.stop().await;
+    let s = start(&db).await;
+    let (mut a, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    assert!(strokes.is_empty());
+    a.send(json!({"t": "lr", "l": 1})).await;
+    assert_eq!(a.expect("lr").await["a"][0]["txt"], text);
+    // The author can undo it like a stroke.
+    a.send(json!({"t": "u", "id": "t1"})).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    assert!(strokes.is_empty());
+    s.stop().await;
+}

@@ -19,6 +19,8 @@ pub const MAX_LIVE_CONN: usize = 4;
 pub const MAX_LAYERS: usize = 200;
 pub const MAX_ROOM_CONNS: usize = 100;
 pub const MAX_WIDTH: f32 = 0.2;
+pub const MAX_TEXT_CHARS: usize = 500;
+pub const MAX_TEXT_LINES: usize = 20;
 const SNAPSHOT_CHUNK: usize = 200;
 
 /// A message on its way to the board's connections.
@@ -48,7 +50,15 @@ pub enum In {
         pts: Option<Vec<f32>>,
     },
     #[serde(rename = "s")]
-    Stroke { id: String, c: String, w: f32, pts: Vec<f32> },
+    Stroke {
+        id: String,
+        c: String,
+        w: f32,
+        pts: Vec<f32>,
+        /// Present for a text annotation: `pts` is then its one anchor point
+        /// and `w` its font size.
+        txt: Option<String>,
+    },
     #[serde(rename = "u")]
     Undo { id: String },
     #[serde(rename = "ld")]
@@ -175,8 +185,37 @@ fn valid_width(w: f32) -> bool {
     w.is_finite() && w > 0.0 && w <= MAX_WIDTH
 }
 
-fn stroke_json(id: &str, layer: u32, seq: u64, c: &str, w: &str, pts: &str) -> String {
-    format!(r#"{{"id":"{id}","l":{layer},"q":{seq},"c":"{c}","w":{w},"pts":{pts}}}"#)
+fn stroke_json(
+    id: &str,
+    layer: u32,
+    seq: u64,
+    c: &str,
+    w: &str,
+    pts: &str,
+    txt: Option<&str>,
+) -> String {
+    match txt {
+        None => format!(r#"{{"id":"{id}","l":{layer},"q":{seq},"c":"{c}","w":{w},"pts":{pts}}}"#),
+        Some(t) => {
+            let t = serde_json::to_string(t).expect("a string always serialises");
+            format!(r#"{{"id":"{id}","l":{layer},"q":{seq},"c":"{c}","w":{w},"pts":{pts},"txt":{t}}}"#)
+        }
+    }
+}
+
+/// Check the text of an annotation. Returns it with line endings normalised
+/// and trailing space removed, or None to refuse it.
+fn clean_text(t: &str) -> Option<String> {
+    let t = t.replace("\r\n", "\n").replace('\r', "\n");
+    let t = t.trim_end();
+    if t.trim().is_empty()
+        || t.chars().count() > MAX_TEXT_CHARS
+        || t.lines().count() > MAX_TEXT_LINES
+        || t.chars().any(|c| c != '\n' && c.is_control())
+    {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 /// Colour for the n-th contributor (n from 1). Ten fixed colours that read
@@ -222,7 +261,7 @@ impl Room {
                     seq: r.seq,
                     layer: r.layer,
                     state: r.state,
-                    json: stroke_json(&r.id, r.layer, r.seq, &r.color, &w, &r.pts),
+                    json: stroke_json(&r.id, r.layer, r.seq, &r.color, &w, &r.pts, r.txt.as_deref()),
                     id: r.id.clone(),
                 });
             }
@@ -412,9 +451,9 @@ impl Room {
                         }
                     },
                 };
-                self.commit(&mut st, peer, id, c, w, pts, was_live, db);
+                self.commit(&mut st, peer, id, c, w, pts, None, was_live, db);
             }
-            In::Stroke { id, c, w, pts } => {
+            In::Stroke { id, c, w, pts, txt } => {
                 if !valid_id(&id) {
                     return;
                 }
@@ -427,9 +466,17 @@ impl Room {
                     None => false,
                 };
                 let pts = clean_pts(pts).filter(|p| !p.is_empty());
-                match pts {
-                    Some(pts) if valid_color(&c) && valid_width(w) => {
-                        self.commit(&mut st, peer, id, c, w, pts, was_live, db);
+                // A text annotation has exactly one point and good text.
+                let txt = match txt {
+                    None => Ok(None),
+                    Some(t) => match (clean_text(&t), &pts) {
+                        (Some(t), Some(p)) if p.len() == 3 => Ok(Some(t)),
+                        _ => Err(()),
+                    },
+                };
+                match (pts, txt) {
+                    (Some(pts), Ok(txt)) if valid_color(&c) && valid_width(w) => {
+                        self.commit(&mut st, peer, id, c, w, pts, txt, was_live, db);
                     }
                     _ => {
                         if was_live {
@@ -495,6 +542,7 @@ impl Room {
         c: String,
         w: f32,
         pts: Vec<f32>,
+        txt: Option<String>,
         was_live: bool,
         db: &Db,
     ) {
@@ -528,10 +576,10 @@ impl Room {
         let seq = st.next_seq;
         st.next_seq += 1;
         let (wj, pj) = (width_json(w), pts_json(&pts));
-        let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj);
+        let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
         self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{seq}}}"#));
-        db.add_stroke(self.board, seq, id.clone(), peer.layer, c, f64::from(w), pj);
+        db.add_stroke(self.board, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt);
         st.ids.insert(id.clone());
         st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
     }
@@ -573,6 +621,19 @@ mod tests {
         assert!(clean_pts(vec![0.1, f32::INFINITY, 0.5]).is_none());
         assert!(clean_pts(vec![0.0; (MAX_POINTS + 1) * 3]).is_none());
         assert!(clean_pts(vec![0.0; MAX_POINTS * 3]).is_some());
+    }
+
+    #[test]
+    fn text_is_checked() {
+        assert_eq!(clean_text("hi\r\nthere  ").unwrap(), "hi\nthere");
+        assert!(clean_text("   \n ").is_none());
+        assert!(clean_text("bell\u{7}").is_none());
+        assert!(clean_text(&"x".repeat(MAX_TEXT_CHARS + 1)).is_none());
+        assert!(clean_text(&"x\n".repeat(MAX_TEXT_LINES + 1)).is_none());
+        assert!(clean_text("naïve “quotes” \\ \" 日本語").is_some());
+        let j = stroke_json("a", 1, 2, "#111111", "0.02", "[0.1,0.2,0.5]", Some("say \"hi\"\n</script>"));
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["txt"], "say \"hi\"\n</script>");
     }
 
     #[test]
