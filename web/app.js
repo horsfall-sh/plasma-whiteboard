@@ -261,7 +261,10 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const paperEl = $('#paper');
 function placePaper() {
   const k = bw * zoom;
-  paperEl.style.cssText = `left:${(WX - panX) * k}px;top:${(WY - panY) * k}px;width:${WW * k}px;height:${WH * k}px`;
+  // One property at a time: Safari's CSP (style-src 'self') refuses cssText.
+  const st = paperEl.style;
+  st.left = `${(WX - panX) * k}px`; st.top = `${(WY - panY) * k}px`;
+  st.width = `${WW * k}px`; st.height = `${WH * k}px`;
 }
 function setCtxView(ctx, v) {
   const k = dpr * v.z;

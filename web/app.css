@@ -159,3 +159,10 @@ body.edit.move #live, body:not(.edit) #live { cursor: grab; }
 }
 #shelfList .who { flex: 1; min-width: 0; }
 #shelfList .who small { display: block; color: #9aa3ad; }
+
+/* ---- narrow screens: one row of tools that scrolls sideways ---- */
+@media (max-width: 760px) {
+  #bar { flex-wrap: nowrap; overflow-x: auto; overscroll-behavior: contain; touch-action: pan-x; scrollbar-width: none; }
+  #bar::-webkit-scrollbar { display: none; }
+  #bar button, #bar .sep { flex: none; }
+}
