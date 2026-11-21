@@ -170,3 +170,17 @@ body.edit.move #live, body:not(.edit) #live { cursor: grab; }
   #bar::-webkit-scrollbar { display: none; }
   #bar button, #bar .sep { flex: none; }
 }
+
+/* ---- what a button does, by colour ---- */
+#bar .act-bin { color: #ff7b72; }                 /* crumple: the delete, kept on the shelf */
+#bar .act-bin:hover { background: #5a2a2a; }
+#bar .act-shelf, #bar .act-undo { color: #f2c66d; } /* going back: undo, the shelf */
+#bar .act-move { color: #79b8ff; }                /* moving around */
+#bar .act-share { color: #7ee2a8; }
+#bar #penBtn, #bar #eraser, #bar #textBtn { color: #fff; }
+#bar .act-shelf { position: relative; }
+#shelfN {
+  position: absolute; right: 1px; top: 0; min-width: 13px; padding: 0 2px; border-radius: 7px;
+  background: #f2c66d; color: #23262b; font: 700 10px/13px system-ui, sans-serif; text-align: center;
+}
+#shelfN:empty { display: none; }

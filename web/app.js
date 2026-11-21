@@ -1344,7 +1344,7 @@ function onUncrumpled(m) {
 }
 
 function shelfChanged() {
-  $('#shelfBtn').textContent = shelf.length ? `Shelf ${shelf.length}` : 'Shelf';
+  $('#shelfN').textContent = shelf.length ? String(shelf.length) : '';
   for (const k of [...previews.keys()]) if (!shelf.some((s) => s.k === k)) previews.delete(k);
   renderShelf();
 }
