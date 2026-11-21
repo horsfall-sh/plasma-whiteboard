@@ -1,0 +1,28 @@
+[package]
+name = "wb-relay"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wb-relay"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+getrandom = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

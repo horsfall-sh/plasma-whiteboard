@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="referrer" content="no-referrer">
+<title>Whiteboard</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="board">
+  <canvas id="base"></canvas>
+  <canvas id="live"></canvas>
+</div>
+
+<div id="bar" role="toolbar" aria-label="Whiteboard tools">
+  <span id="swatches" class="tools"></span>
+  <button type="button" id="eraser" class="tools" aria-label="Eraser" aria-pressed="false">Erase</button>
+  <span class="sep tools"></span>
+  <button type="button" class="tools" data-w="0.002" aria-label="Small pen" aria-pressed="false">S</button>
+  <button type="button" class="tools on" data-w="0.004" aria-label="Medium pen" aria-pressed="true">M</button>
+  <button type="button" class="tools" data-w="0.009" aria-label="Large pen" aria-pressed="false">L</button>
+  <span class="sep tools"></span>
+  <button type="button" id="undo" class="tools wide" aria-label="Undo my last stroke">Undo</button>
+  <span class="sep tools"></span>
+  <button type="button" id="layersBtn" class="wide" aria-label="Layers" aria-expanded="false" aria-controls="layersPanel">Layers</button>
+  <button type="button" id="shareBtn" class="wide" aria-label="Share links" aria-expanded="false" aria-controls="sharePanel">Share</button>
+</div>
+
+<section id="layersPanel" class="panel" aria-label="Layers" hidden>
+  <header>
+    <h2>Layers</h2>
+    <button type="button" class="close" data-close aria-label="Close layers">Close</button>
+  </header>
+  <p class="hint">Hide changes only your view. Delete removes a layer for everyone and can be restored.</p>
+  <ul id="layerList"></ul>
+</section>
+
+<section id="sharePanel" class="panel" aria-label="Share" hidden>
+  <header>
+    <h2>Share</h2>
+    <button type="button" class="close" data-close aria-label="Close share">Close</button>
+  </header>
+  <div class="link" id="editRow">
+    <label for="editLink">Edit link (anyone with it can draw)</label>
+    <div class="row">
+      <input id="editLink" type="text" readonly spellcheck="false">
+      <button type="button" data-copy="editLink" aria-label="Copy edit link">Copy</button>
+    </div>
+  </div>
+  <div class="link" id="viewRow">
+    <label for="viewLink">View-only link</label>
+    <div class="row">
+      <input id="viewLink" type="text" readonly spellcheck="false">
+      <button type="button" data-copy="viewLink" aria-label="Copy view-only link">Copy</button>
+    </div>
+  </div>
+  <p><a id="newBoard" href="/" target="_blank" rel="noopener">New board</a></p>
+</section>
+
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<div id="msg" role="alert" hidden></div>
+<div id="status"><b></b><span>connecting</span></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>
