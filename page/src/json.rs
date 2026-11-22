@@ -114,10 +114,13 @@ pub fn push_num(out: &mut String, v: f64) {
     // Rust's `{:e}` finds how many digits the shortest round-trip form needs ("d.ddde-5" or
     // "de7"), but where two such digit strings are equally close it does not always pick the
     // even one, which ECMA-262 requires. Formatting again at that precision is exact and rounds
-    // a tie to even, and the nearest string of that length still reads back to `v`.
+    // a tie to even. Just above a power of two the gap below `v` is half the gap above, so that
+    // nearest string can fall outside the values that read back to `v`; then the shortest form
+    // is the only string of that length that does, and it is used as it is.
     let short = format!("{:e}", v.abs());
     let k = short.split_once('e').map_or(1, |(m, _)| m.chars().filter(|c| *c != '.').count());
-    let e = format!("{:.*e}", k - 1, v.abs());
+    let even = format!("{:.*e}", k - 1, v.abs());
+    let e = if even.parse::<f64>().ok() == Some(v.abs()) { even } else { short };
     let (mant, exp) = e.split_once('e').expect("{:e} has an exponent");
     let exp: i32 = exp.parse().expect("an integer exponent");
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
@@ -232,5 +235,25 @@ mod tests {
             m.stringify(),
             r#"{"t":"s","id":"x1","w":0.004,"pts":[0,0.5,1],"ok":true,"who":null}"#
         );
+    }
+    #[test]
+    fn powers_of_two_read_back_exactly() {
+        // where the gap below a value is half the gap above, the nearest string of the shortest
+        // length can fall outside the lower half-gap; every power of two must still read back
+        let mut v = f64::from_bits(1); // 2^-1074
+        let mut seen = 0;
+        while v.is_finite() {
+            for x in [v, -v, v * 3.0, v * 1.5] {
+                if !x.is_finite() {
+                    continue;
+                }
+                let mut s = String::new();
+                push_num(&mut s, x);
+                assert_eq!(s.parse::<f64>().ok(), Some(x), "{s}");
+            }
+            v *= 2.0;
+            seen += 1;
+        }
+        assert_eq!(seen, 2098);
     }
 }
