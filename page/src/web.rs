@@ -1563,6 +1563,12 @@ impl net::Host for Page {
         self.ls_remove(SHARING_KEY);
     }
 
+    fn share_lost(&mut self) {
+        // LOCAL_KEY still holds the whole private board: nothing was forgotten yet
+        self.ls_remove(SHARING_KEY);
+        let _ = win().location().replace("/");
+    }
+
     fn sheet_view(&mut self, k: i64, a: Vec<Item>) {
         self.draw_sheet(k, a);
     }

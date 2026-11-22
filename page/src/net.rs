@@ -94,6 +94,9 @@ pub trait Host {
     /// `LOCAL_KEY`, which keeps the shelf, and remove `SHARING_KEY`. `kept` are the items the
     /// relay refused (a full board or storage): they stay on the private board, never lost.
     fn forget_local(&mut self, kept: &[Item]);
+    /// The board a share was going to is gone or not valid: remove `SHARING_KEY`, keep
+    /// `LOCAL_KEY` as it is, and go back to the private board at `/` (council H2).
+    fn share_lost(&mut self);
 
     /// `onSheetView` after its checks: draw the preview of sheet `k`, if it is still on the shelf.
     fn sheet_view(&mut self, k: i64, a: Vec<Item>);
@@ -580,6 +583,15 @@ impl Conn {
 
     /// `onError`.
     fn error(&mut self, h: &mut impl Host, code: &str, m: Option<String>) {
+        // a share (new or resumed after a reload) whose board has expired or is not valid: the
+        // private board is still whole, so go back to it; a stored key must never trap `/`
+        if self.uploading && matches!(code, "gone" | "bad") {
+            self.stopped = true;
+            self.uploading = false;
+            self.kept.clear();
+            h.share_lost();
+            return;
+        }
         match code {
             "gone" => {
                 self.stopped = true;
@@ -816,6 +828,9 @@ mod tests {
         }
         fn message(&mut self, text: &str, then: Then) {
             self.log.push(format!("message {text} {then:?}"));
+        }
+        fn share_lost(&mut self) {
+            self.log.push("share_lost".into());
         }
         fn forget_local(&mut self, kept: &[Item]) {
             self.log.push("forget_local".into());
@@ -1276,6 +1291,31 @@ mod tests {
         let mut r = Conn::default();
         r.resume_share();
         assert!(!r.local && r.uploading);
+    }
+
+    /// Council H2: a share whose board has gone (expired, or a database reset) or is not
+    /// valid goes back to the private board and clears the stored key. On 5884277 it showed
+    /// "doesn't exist" with a New board link to `/`, which resumed the same share: a loop.
+    #[test]
+    fn a_share_to_a_gone_board_goes_back_to_the_private_board() {
+        for code in ["gone", "bad"] {
+            let (mut h, mut inp) = (Rec::default(), Input::default());
+            let mut c = Conn::default();
+            c.resume_share();
+            c.start(&mut h, "KEY");
+            h.take();
+            c.frame(&mut h, &mut inp, c.sock, &format!(r#"{{"t":"err","code":"{code}"}}"#));
+            let log = h.take();
+            assert_eq!(log, ["share_lost"], "{code}");
+            assert!(!c.uploading && c.stopped, "{code}");
+        }
+        // a plain link to a gone board still says so
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = Conn::default();
+        c.start(&mut h, "KEY");
+        h.take();
+        c.frame(&mut h, &mut inp, c.sock, r#"{"t":"err","code":"gone"}"#);
+        assert!(h.take().iter().any(|l| l.starts_with("message This board doesn't exist")));
     }
 
     /// Council H1: a refused item of a share is kept on the private board, never dropped, and
