@@ -120,6 +120,10 @@ From the council's passes 1 to 3. Each is minor or a nit and stays open in this 
   leaving boards, and keep it empty with about 2 joins a minute; a new board's creator there
   then joins view-only. A share made then stops with a message, and the private board is kept
   whole (P3-A).
+  Dissent: the security reviewer on the council's pass-3 panel rates G7 major, not a known
+  limitation. One person behind a shared address (NAT, an office, family Wi-Fi) can drain the
+  new-layer allowance for everyone there, and a creator seated view-only sees their drawing
+  vanish from the board, though it is still kept locally.
 - A transient database error while a board is looked up reads as "gone", so a share resumed
   then is abandoned. The private board is kept, but the edit link to the half-filled board is
   forgotten.
