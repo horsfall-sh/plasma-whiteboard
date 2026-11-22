@@ -243,10 +243,17 @@ impl Local {
         (st, mine)
     }
 
-    /// What [`LOCAL_KEY`] holds once a share has finished: no items (they are on the relay
-    /// now) but the same shelf and sheet number, because crumpled sheets are not shared.
-    pub fn after_share(&self) -> String {
-        self.text(&Board::default())
+    /// What [`LOCAL_KEY`] holds once a share has finished: only `kept`, the items the relay
+    /// refused (usually none; the rest are on the relay now), with the same shelf and sheet
+    /// number, because crumpled sheets are not shared. `stored` is what [`LOCAL_KEY`] holds
+    /// now. `None` when writing would throw work away, the same guards as [`Local::save`]: the
+    /// stored board could not be read (F1), or another tab wrote it since this one last read
+    /// or wrote it (council H3).
+    pub fn after_share(&self, kept: &Board, stored: Option<&str>) -> Option<String> {
+        if self.damaged || self.elsewhere(stored) {
+            return None;
+        }
+        Some(self.text(kept))
     }
 
     /// `localShelfList`: the shelf as the relay lists it.
@@ -488,11 +495,26 @@ mod tests {
         }
     }
 
+    /// Council H3: the last write of a share goes through the save guards. On 5884277 it
+    /// wrote over a damaged board (which F1 keeps for the user) and over another tab's newer
+    /// board.
+    #[test]
+    fn a_finished_share_never_writes_over_a_damaged_or_newer_board() {
+        let (st, _) = Local::load(Some(JS_WROTE), &mut Board::default());
+        assert!(st.after_share(&Board::default(), Some(JS_WROTE)).is_some(), "as this tab left it");
+        let newer = r#"{"v":1,"a":[],"shelf":[],"k":9}"#;
+        assert_eq!(st.after_share(&Board::default(), Some(newer)), None, "another tab wrote since");
+        let broken = r#"{"v":1,"a":[{"broken"#;
+        let (st, _) = Local::load(Some(broken), &mut Board::default());
+        assert!(st.damaged());
+        assert_eq!(st.after_share(&Board::default(), Some(broken)), None, "F1 keeps it");
+    }
+
     #[test]
     fn a_finished_share_keeps_the_shelf_and_a_reload_can_resume_it() {
         let mut b = Board::default();
         let (st, _) = Local::load(Some(JS_WROTE), &mut b);
-        let after = st.after_share();
+        let after = st.after_share(&Board::default(), Some(JS_WROTE)).unwrap();
         let (back, mine) = Local::load(Some(&after), &mut Board::default());
         assert!(mine.is_empty(), "the items went to the relay");
         assert_eq!((back.shelf, back.next_k), (st.shelf, 5), "crumpled sheets stay in this browser");

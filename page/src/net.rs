@@ -633,9 +633,11 @@ impl Conn {
         Some(Out::SheetView { k })
     }
 
-    /// `shareNow` may start: a private board not already being shared. Sets `uploading`.
-    pub fn share_begin(&mut self) -> bool {
-        if !self.local || self.uploading {
+    /// `shareNow` may start: a private board not already being shared, in a tab that may
+    /// write it (`may_write`: it holds the lock and the board is not damaged; council H3).
+    /// Sets `uploading`.
+    pub fn share_begin(&mut self, may_write: bool) -> bool {
+        if !self.local || self.uploading || !may_write {
             return false;
         }
         self.uploading = true;
@@ -1280,12 +1282,13 @@ mod tests {
     #[test]
     fn sharing_runs_once_and_a_failure_keeps_the_board_private() {
         let mut c = Conn::default();
-        assert!(!c.share_begin(), "not a private board");
+        assert!(!c.share_begin(true), "not a private board");
         c.start_local();
-        assert!(c.share_begin() && c.uploading);
-        assert!(!c.share_begin(), "already sharing");
+        assert!(!c.share_begin(false) && !c.uploading, "a read-only tab or a damaged board (H3)");
+        assert!(c.share_begin(true) && c.uploading);
+        assert!(!c.share_begin(true), "already sharing");
         c.share_failed();
-        assert!(c.share_begin());
+        assert!(c.share_begin(true));
         c.shared();
         assert!(!c.local && c.uploading, "uploading lasts until the last answer");
         let mut r = Conn::default();
@@ -1325,7 +1328,7 @@ mod tests {
         let (mut h, mut inp) = (Rec::default(), Input::default());
         let mut c = online(&mut h, &mut inp, false);
         c.local = true;
-        assert!(c.share_begin());
+        assert!(c.share_begin(true));
         c.shared();
         for id in ["a", "b", "c"] {
             h.b.pending.insert(id.into(), it(id, 2, None));
@@ -1346,7 +1349,7 @@ mod tests {
         c = online(&mut h, &mut inp, false);
         c.kept.push(it("old", 2, None));
         c.local = true;
-        assert!(c.share_begin());
+        assert!(c.share_begin(true));
         c.shared();
         c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
         let log = h.take();

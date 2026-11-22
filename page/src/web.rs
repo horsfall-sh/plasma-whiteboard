@@ -1550,16 +1550,14 @@ impl net::Host for Page {
     }
 
     fn forget_local(&mut self, kept: &[Item]) {
-        let text = if kept.is_empty() {
-            self.local.after_share()
-        } else {
-            let mut b = Board::default();
-            for i in kept {
-                b.insert(i.clone());
-            }
-            self.local.text(&b)
-        };
-        self.ls_set(LOCAL_KEY, &text);
+        let mut b = Board::default();
+        for i in kept {
+            b.insert(i.clone());
+        }
+        // through the save guards (H3): never over a damaged board or another tab's newer one
+        if let Some(text) = self.local.after_share(&b, self.ls_get(LOCAL_KEY).as_deref()) {
+            self.ls_set(LOCAL_KEY, &text);
+        }
         self.ls_remove(SHARING_KEY);
     }
 
@@ -2122,7 +2120,15 @@ fn hold_lock(waited: bool) -> JsValue {
 /// `shareNow`: make a board on the relay and move the private board to it.
 fn share_now() {
     let go = with(|a| {
-        if !a.conn.share_begin() {
+        let may_write = a.page.writer && !a.page.local.damaged();
+        if !a.conn.share_begin(may_write) {
+            if a.conn.local && !a.conn.uploading {
+                if a.page.local.damaged() {
+                    a.page.show_damaged();
+                } else if !a.page.writer {
+                    a.page.show_toast("This board is open in another tab. Share it from there.", None, 6000);
+                }
+            }
             return false;
         }
         if let Some(b) = by_id::<HtmlButtonElement>("shareNow") {
