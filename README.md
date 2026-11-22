@@ -134,3 +134,7 @@ stroke, 200 contributors per board, 100 connections per board.
   iPad the on-screen keyboard may cover a text box placed low on the board.
 - **A slow tablet.** Redraws are time-sliced at 6 ms per frame and the device pixel ratio is capped at 2,
   but this has not been measured on real hardware.
+
+## Licence
+
+Apache License 2.0. See `LICENSE` and `NOTICE`.
