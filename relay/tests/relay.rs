@@ -813,6 +813,69 @@ async fn a_board_has_a_size_budget_and_undo_frees_it() {
 }
 
 #[tokio::test]
+async fn a_slow_link_gets_its_snapshot_and_everything_said_meanwhile() {
+    use wb_relay::keys;
+    let db = temp_db("slow");
+    let s = start(&db).await;
+    new_board(&s.addr).await; // the schema is in place
+    // A board of about 12 MB: its snapshot cannot all go out while nobody reads.
+    let edit = keys::random_key();
+    let view = keys::view_key(&edit);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&view), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]])
+            .unwrap();
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        let pts = format!("[{}]", v.join(","));
+        for seq in 1..=30 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,1,'#112233',0.004,?)",
+                rusqlite::params![id, seq, format!("s{seq}"), pts],
+            )
+            .unwrap();
+        }
+    }
+    let (mut b, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
+    assert_eq!(strokes.len(), 30);
+
+    // A joins and does not read yet, while the board is busy: more broadcasts
+    // than the ring holds go by during its snapshot.
+    let mut a = Client::open(&s.addr).await;
+    a.send(json!({"t": "join", "key": view})).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.send(json!({"t": "b", "id": "live", "c": "#112233", "w": 0.004})).await;
+    for i in 0..400 {
+        b.send(json!({"t": "p", "id": "live", "pts": [f64::from(i) / 1000.0, 0.1, 0.5]})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A gets the whole snapshot, then every one of them, in order.
+    a.expect("hello").await;
+    let mut got = 0;
+    loop {
+        let m = a.next().await;
+        match m["t"].as_str().unwrap() {
+            "ss" => got += m["a"].as_array().unwrap().len(),
+            "ready" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(got, 30);
+    assert_eq!(a.expect("b").await["id"], "live");
+    for i in 0..400 {
+        let m = a.expect("p").await;
+        assert_eq!(m["pts"][0].as_f64(), Some(f64::from(i) / 1000.0));
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
 async fn other_sites_cannot_use_the_relay() {
     let s = start(&temp_db("origin")).await;
     let mut sock = TcpStream::connect(&s.addr).await.unwrap();

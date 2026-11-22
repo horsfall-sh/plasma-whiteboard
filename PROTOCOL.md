@@ -82,7 +82,7 @@ Messages from a viewer other than `join` are ignored.
 | `n` | `n`, `on` | Number of connections on the board now, and the layers that have one open. |
 | `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. Also sent (`n` null, the layer's first colour) when an empty layer no one is on is handed to a new contributor. |
 | `pg` | `l`, `k`, `pts` | A ping from layer `l` with letter `k` (A to Z, then round again). Sent to everyone, including the sender. |
-| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, the server at capacity, or the board could not be read or written (retry later). `rate`: sending too fast. `bad`: malformed join. Not fatal: `full`, sent right after `hello` when an edit link joins as a viewer because the board has no room for another contributor (or the address was given too many new layers lately); the page says so and stays connected. |
+| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, the server at capacity, or the board could not be read or written (retry later). `rate`: sending too fast. `slow`: the connection fell too far behind the board's broadcasts to keep up (wait the longest before reconnecting). `bad`: malformed join. Not fatal: `full`, sent right after `hello` when an edit link joins as a viewer because the board has no room for another contributor (or the address was given too many new layers lately); the page says so and stays connected. |
 
 `q` is a per-board sequence number. Strokes are drawn in `q` order. A stroke is never changed after it is
 stored; undo, layer delete and restore only flip its state.
@@ -90,7 +90,7 @@ stored; undo, layer delete and restore only flip its state.
 ### Ordering
 
 The relay handles one board's messages one at a time and broadcasts in that order, so every client sees the
-same sequence. A client that falls too far behind is disconnected and gets a fresh snapshot when it reconnects.
+same sequence. What is broadcast while a joining client's snapshot is still being sent is held for it (up to 8 MB) and sent right after, so a slow link is not dropped just for joining a big, busy board. A client that falls too far behind is disconnected with `slow` and gets a fresh snapshot when it reconnects; the page waits from the shortest delay again only after a connection has stayed ready for 30 s.
 
 ## Limits
 

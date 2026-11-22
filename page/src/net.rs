@@ -14,10 +14,14 @@ use crate::proto::{In, Item, Layer, Out, ShelfEntry};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 
-/// The first reconnect wait, and the wait again after each `hello`, ms.
+/// The first reconnect wait, and the wait again once a connection has settled, ms.
 pub const RETRY_MIN: u32 = 500;
 /// The longest reconnect wait, ms.
 pub const RETRY_MAX: u32 = 8000;
+/// How long a socket must stay ready before the reconnect wait starts again from
+/// [`RETRY_MIN`], ms. Resetting on `hello` let a link too slow for its board loop:
+/// connect, take the snapshot, fall behind, be dropped, at once again.
+pub const SETTLE_MS: u32 = 30_000;
 /// The wait between upload bites, ms.
 pub const BITE_MS: u32 = 500;
 
@@ -28,6 +32,8 @@ pub enum Timer {
     Reconnect,
     /// Call [`Conn::bite`] with this socket.
     Bite(u64),
+    /// Call [`Conn::settled`] with this socket.
+    Settled(u64),
 }
 
 /// What a message card offers.
@@ -402,7 +408,6 @@ impl Conn {
         layers: &[crate::proto::LayerInfo],
         shelf: Vec<ShelfEntry>,
     ) {
-        self.retry = RETRY_MIN;
         self.asked.clear(); // preview requests sent on the old socket are gone
         self.edit = edit;
         self.me = if edit { me } else { None };
@@ -444,6 +449,7 @@ impl Conn {
     /// `onReady`.
     fn on_ready(&mut self, h: &mut impl Host) {
         self.ready = true;
+        h.schedule(SETTLE_MS, Timer::Settled(self.sock));
         let me = if self.edit { self.me } else { None };
         let r = h.board().ready(me);
         if me.is_none() {
@@ -462,6 +468,14 @@ impl Conn {
         // limits allow (about 100 items or 120 KB every half second).
         self.todo = r.todo;
         self.bite(h, self.sock);
+    }
+
+    /// Socket `sock` has been ready for [`SETTLE_MS`]: if it is still the one in use and
+    /// still ready, the next reconnect waits from [`RETRY_MIN`] again.
+    pub fn settled(&mut self, sock: u64) {
+        if sock == self.sock && self.ready {
+            self.retry = RETRY_MIN;
+        }
     }
 
     /// One `bite` of the upload, on socket `sock`. It stops when the socket changed; the next
@@ -557,6 +571,11 @@ impl Conn {
                 self.show_status(h, "board is busy, retrying");
             }
             "rate" => self.retry = self.retry.max(2000),
+            // Too slow a link for how busy the board is: wait the longest before trying again.
+            "slow" => {
+                self.retry = RETRY_MAX;
+                self.show_status(h, "connection too slow for this board, retrying");
+            }
             // An edit link opened view-only: say so rather than leave it silent.
             "full" => h.toast(
                 m.as_deref().unwrap_or("This board has no room for another contributor, so it opened view-only."),
@@ -828,7 +847,41 @@ mod tests {
             [500, 1000, 2000, 4000, 8000, 8000].iter().map(|ms| format!("schedule {ms} Reconnect")).collect();
         assert_eq!(waits, want);
         c.frame(&mut h, &mut inp, 7, HELLO_EDIT);
-        assert_eq!(c.retry, RETRY_MIN, "hello resets the wait");
+        assert_eq!(c.retry, RETRY_MAX, "hello alone does not reset the wait");
+        c.frame(&mut h, &mut inp, 7, r#"{"t":"ready"}"#);
+        assert!(h.take().contains(&format!("schedule {SETTLE_MS} Settled(7)")));
+        c.settled(6);
+        assert_eq!(c.retry, RETRY_MAX, "an old socket settling changes nothing");
+        c.settled(7);
+        assert_eq!(c.retry, RETRY_MIN, "a socket that stayed ready resets the wait");
+    }
+
+    #[test]
+    fn a_link_dropped_soon_after_ready_keeps_backing_off() {
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = Conn::default();
+        assert_eq!(c.start(&mut h, "KEY"), Some(1));
+        let mut waits = vec![];
+        for sock in 1..=5 {
+            c.frame(&mut h, &mut inp, sock, HELLO_EDIT);
+            c.frame(&mut h, &mut inp, sock, r#"{"t":"ready"}"#);
+            // Dropped before it settled; its timer fires late, on a dead socket.
+            c.closed(&mut h, &mut inp, sock);
+            c.settled(sock);
+            assert_eq!(c.connect(), Some(sock + 1));
+            waits.extend(h.take().into_iter().filter(|l| l.ends_with("Reconnect")));
+        }
+        let want: Vec<String> =
+            [500, 1000, 2000, 4000, 8000].iter().map(|ms| format!("schedule {ms} Reconnect")).collect();
+        assert_eq!(waits, want);
+        // Told it is too slow: the longest wait, and the reason shown.
+        c.frame(&mut h, &mut inp, 6, HELLO_EDIT);
+        c.closed(&mut h, &mut inp, 6);
+        c.connect();
+        c.retry = RETRY_MIN;
+        c.frame(&mut h, &mut inp, 7, r#"{"t":"err","code":"slow"}"#);
+        assert_eq!(c.retry, RETRY_MAX);
+        assert!(h.take().iter().any(|l| l.contains("connection too slow for this board")));
     }
 
     #[test]
@@ -915,7 +968,7 @@ mod tests {
         assert_eq!(h.sent.len(), 101, "the queued undo, then the first 100 items");
         assert_eq!(h.sent[0], r#"{"t":"u","id":"gone1"}"#);
         assert!(h.sent[1].starts_with(r#"{"t":"s","id":"s000""#));
-        assert_eq!(h.take(), ["base true", "gone gone1", "layers", "schedule 500 Bite(1)"]);
+        assert_eq!(h.take(), ["schedule 30000 Settled(1)", "base true", "gone gone1", "layers", "schedule 500 Bite(1)"]);
         assert_eq!(h.b.strokes.len(), 250, "put back on the board, on my layer");
         assert!(h.b.strokes.iter().all(|s| s.l == Some(2)));
 
@@ -952,7 +1005,7 @@ mod tests {
         h.take();
         c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
         assert!(c.ready && h.b.pending.is_empty() && h.sent.is_empty());
-        assert!(h.take().is_empty());
+        assert_eq!(h.take(), ["schedule 30000 Settled(1)"]);
     }
 
     #[test]

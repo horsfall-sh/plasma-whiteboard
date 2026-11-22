@@ -11,7 +11,7 @@ pub mod rooms;
 use axum::{
     body::Body,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
         ConnectInfo, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
@@ -25,6 +25,7 @@ use room::{In, Room, MAX_MSG};
 use rooms::{Refused, Rooms};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -288,6 +289,73 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
 }
 
 const LOST: (&str, &str) = ("busy", "this board had a storage error; reconnecting");
+const SLOW: (&str, &str) = ("slow", "this connection cannot keep up with this board; reconnecting");
+
+/// What a connection may queue of the board's broadcasts while its snapshot
+/// is still being sent. The frames are shared with every other receiver, so
+/// this bounds the queue's length rather than memory the connection owns.
+const CATCH_UP_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether a broadcast is for this peer.
+fn for_peer(out: &room::Out, peer: room::Peer) -> bool {
+    out.skip != peer.conn && (out.only == 0 || out.only == peer.conn)
+}
+
+/// Send the snapshot, reading the board's broadcasts at the same time, so a
+/// slow link with a big snapshot does not overflow the broadcast ring and
+/// get dropped, only to reconnect and do the same again. What arrives
+/// meanwhile is queued and sent after the snapshot, in order.
+async fn catch_up(
+    sock: &mut WebSocket,
+    joined: &mut room::Joined,
+) -> Result<(), Option<(&'static str, &'static str)>> {
+    let peer = joined.peer;
+    let mut snapshot = std::mem::take(&mut joined.snapshot).into_iter();
+    let mut queue: VecDeque<Utf8Bytes> = VecDeque::new();
+    let mut held = 0usize;
+    loop {
+        let text = match snapshot.next() {
+            Some(t) => t,
+            None => match queue.pop_front() {
+                Some(t) => {
+                    held -= t.len();
+                    t
+                }
+                None => return Ok(()),
+            },
+        };
+        let sent = send(sock, Message::Text(text));
+        tokio::pin!(sent);
+        loop {
+            tokio::select! {
+                biased;
+                ok = &mut sent => {
+                    if !ok {
+                        return Err(None);
+                    }
+                    break;
+                }
+                out = joined.rx.recv() => match out {
+                    Ok(out) => {
+                        if out.end {
+                            return Err(Some(LOST));
+                        }
+                        if !for_peer(&out, peer) {
+                            continue;
+                        }
+                        held += out.text.len();
+                        if held > CATCH_UP_BYTES {
+                            return Err(Some(SLOW));
+                        }
+                        queue.push_back(out.text);
+                    }
+                    Err(RecvError::Lagged(_)) => return Err(Some(SLOW)),
+                    Err(RecvError::Closed) => return Err(None),
+                },
+            }
+        }
+    }
+}
 
 /// Pump messages both ways until the connection ends. Returns an error to
 /// report to the client, if any.
@@ -298,10 +366,8 @@ async fn relay(
     joined: &mut room::Joined,
     mut budget: Budget,
 ) -> Option<(&'static str, &'static str)> {
-    for text in joined.snapshot.drain(..) {
-        if !send(sock, Message::Text(text)).await {
-            return None;
-        }
+    if let Err(why) = catch_up(sock, joined).await {
+        return why;
     }
     let peer = joined.peer;
     // Subscribed before this check, so a loss after it arrives as an `end`.
@@ -332,16 +398,17 @@ async fn relay(
                     if out.end {
                         return Some(LOST);
                     }
-                    if out.skip == peer.conn || (out.only != 0 && out.only != peer.conn) {
+                    if !for_peer(&out, peer) {
                         continue;
                     }
                     if !send(sock, Message::Text(out.text)).await {
                         return None;
                     }
                 }
-                // Too far behind: drop the connection; the page reconnects
-                // and gets a fresh snapshot.
-                Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => return None,
+                // Too far behind: drop the connection, saying why; the page
+                // backs off, reconnects and gets a fresh snapshot.
+                Err(RecvError::Lagged(_)) => return Some(SLOW),
+                Err(RecvError::Closed) => return None,
             },
             _ = ping.tick() => {
                 if heard.elapsed() > Duration::from_secs(80) {
