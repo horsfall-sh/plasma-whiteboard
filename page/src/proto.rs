@@ -291,6 +291,18 @@ pub fn truthy(v: Option<&Value>) -> bool {
 mod tests {
     use super::*;
 
+    /// A number read off the wire is the double JSON.parse gives, so it is written back the
+    /// same. Without serde_json's float_roundtrip, 3.9907793928864868 read as ...863.
+    #[test]
+    fn numbers_read_back_exactly() {
+        for t in ["3.9907793928864868", "0.2006145653048538", "1.7976931348623157e+308", "5e-324", "0.1"] {
+            let frame = format!(r#"{{"t":"p","id":"a","pts":[{t}]}}"#);
+            let Some(In::Points { pts: Some(p), .. }) = In::parse(&frame) else { panic!("{frame}") };
+            assert_eq!(p[0], t.parse::<f64>().unwrap(), "{t}");
+            assert_eq!(crate::json::num_to_string(p[0]), t);
+        }
+    }
+
     /// Each outgoing frame, as the JavaScript page's `JSON.stringify` wrote it.
     #[test]
     fn outgoing_frames_match_the_javascript_page_byte_for_byte() {

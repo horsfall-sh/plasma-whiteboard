@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 wb-smooth = { path = "../smooth" }
 wb-crumple = { path = "../crumple" }
 indexmap = "2"
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 
 [profile.release]
 opt-level = "s"
