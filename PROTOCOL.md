@@ -11,7 +11,7 @@ The contract between the page (`web/`) and the relay (`relay/`). Change both sid
 - The database stores only SHA-256 hashes of both keys.
 - Link form: `https://host/b/<key>`. The same page serves both; the relay decides the role from the key.
 - `POST /api/boards` (no body) returns `201 {"edit":"<key>","view":"<key>"}`. `429` when one address makes
-  boards too fast.
+  boards too fast, `503` when storage is near its quota.
 - `GET /` serves the page, which calls `POST /api/boards` and moves to `/b/<edit key>` with
   `history.replaceState` (no reload).
 
@@ -71,7 +71,7 @@ Messages from a viewer other than `join` are ignored.
 | `p` | `id`, `pts` | Points for a live stroke. |
 | `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`? | A stroke or text annotation was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
 | `ok` | `id`, `q` | To the author: the stroke is committed to storage, with sequence number `q`. It is sent only after the commit, so the page may forget its own copy. A stroke that fails to store gets no `ok`: the board ends every connection with `busy`, and the page resends it on reconnect. |
-| `no` | `id`, `m` | To the author: the stroke was refused (board full, server out of memory, bad data). The client removes it. |
+| `no` | `id`, `m` | To the author: the stroke was refused (board full, server out of memory, storage full, bad data). The client removes it. |
 | `u` | `id` | A stroke was removed (undone, or a live stroke abandoned). Not sent to the author of an undo. |
 | `l` | `l`, `c` | A new layer (a new contributor joined). Sent to everyone. |
 | `ld` | `l` | Layer `l` was deleted: drop its finished strokes and mark it restorable. Sent to everyone, including the sender. |

@@ -858,6 +858,12 @@ impl Room {
             }
             return;
         }
+        if db.is_full() {
+            // Refused before it is sent on: a stroke the others see must be stored.
+            drop_live(self);
+            self.only(conn, refusal(&id, "storage is full; try again later"));
+            return;
+        }
         let (wj, pj) = (width_json(w), pts_json(&pts));
         let size = pj.len() + txt.as_ref().map_or(0, |t| t.len() * 2) + 96;
         if st.strokes.len() + st.shelf.iter().map(|s| s.strokes.len()).sum::<usize>() >= MAX_STROKES

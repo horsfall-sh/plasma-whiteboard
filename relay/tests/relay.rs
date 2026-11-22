@@ -36,6 +36,7 @@ fn config(db: &str) -> Config {
         unload_grace: GRACE,
         max_loaded: usize::MAX / 2,
         max_rooms: 1000,
+        max_db: 1 << 30,
     }
 }
 
@@ -974,5 +975,32 @@ async fn a_stroke_past_the_shared_memory_budget_is_refused_and_undo_gives_room_b
     a.send(json!({"t": "u", "id": format!("a{}", drawn - 1)})).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     a.draw("again").await;
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn storage_near_its_quota_refuses_new_strokes_and_boards_without_losing_any() {
+    // A quota a few dozen pages past what the empty schema takes.
+    let s = start_with(Config { max_db: 160 * 1024, ..config(&temp_db("quota")) }).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let pts: Vec<f64> = (0..201).map(|i| f64::from(i % 50) / 100.0).collect();
+    let mut stored = 0;
+    let refused = loop {
+        a.send(json!({"t": "s", "id": format!("a{stored}"), "c": "#112233", "w": 0.004, "pts": pts})).await;
+        let m = a.next().await;
+        if m["t"] == "no" {
+            break m;
+        }
+        assert_eq!(m["t"], "ok", "a stroke is stored or refused, never lost: {m}");
+        stored += 1;
+        assert!(stored < 2000, "the quota never said no");
+    };
+    assert!(stored > 0, "{refused}");
+    assert!(refused["m"].as_str().unwrap().contains("storage"), "{refused}");
+    assert_eq!(http(&s.addr, "POST", "/api/boards").await.0, 503, "no new boards either");
+    // Every stroke told ok is there.
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    assert_eq!(strokes.len(), stored);
     s.stop().await;
 }

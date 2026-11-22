@@ -140,9 +140,31 @@ enum Cmd {
     },
 }
 
+/// The default storage quota, in bytes.
+pub const MAX_DB: u64 = 1024 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Db {
     tx: mpsc::Sender<Job>,
+    full: Arc<AtomicBool>,
+}
+
+/// Storage is near its quota once fewer pages than this are left: a
+/// twentieth of the quota, at least a few pages. Writes already queued
+/// can still be stored; new strokes and boards are refused.
+fn reserve(max_pages: u64) -> u64 {
+    (max_pages / 20).max(4)
+}
+
+/// Whether storage is near its quota. Pages on the free list are reused
+/// before the file grows, so they count as room.
+fn near_quota(conn: &Connection) -> bool {
+    let get = |p: &str| conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, i64>(0)).map(|v| v.max(0) as u64);
+    match (get("max_page_count"), get("page_count"), get("freelist_count")) {
+        (Ok(max), Ok(pages), Ok(free)) => pages.saturating_sub(free) + reserve(max) >= max,
+        // Can't tell: fail closed.
+        _ => true,
+    }
 }
 
 pub fn now() -> i64 {
@@ -181,7 +203,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS strokes_id ON strokes(board, id);
 ";
 
 impl Db {
+    /// Open the database with the default quota.
     pub fn open(path: &str) -> rusqlite::Result<Db> {
+        Db::open_with(path, MAX_DB)
+    }
+
+    /// Open the database, letting it grow to at most `max_bytes`. Past that
+    /// a write fails rather than fill the disk; well before it, new strokes
+    /// and boards are refused (see [`Db::is_full`]).
+    pub fn open_with(path: &str, max_bytes: u64) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // FULL: a commit is on disk before anything is acknowledged. NORMAL
@@ -202,12 +232,26 @@ impl Db {
         if !has_sheet {
             conn.execute_batch("ALTER TABLE strokes ADD COLUMN sheet INTEGER NOT NULL DEFAULT 0")?;
         }
+        let page = conn.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))?.max(512) as u64;
+        let max_pages = (max_bytes / page).max(1);
+        let set = conn.query_row(&format!("PRAGMA max_page_count = {max_pages}"), [], |r| r.get::<_, i64>(0))?;
+        if set as u64 != max_pages {
+            // The file is already larger than the quota: SQLite keeps it.
+            eprintln!("wb-relay: storage is past its quota already; new strokes will be refused");
+        }
+        let full = Arc::new(AtomicBool::new(near_quota(&conn)));
         let (tx, rx) = mpsc::channel();
+        let flag = full.clone();
         std::thread::Builder::new()
             .name("wb-db".into())
-            .spawn(move || run(conn, rx))
+            .spawn(move || run(conn, rx, flag))
             .expect("could not start the storage thread");
-        Ok(Db { tx })
+        Ok(Db { tx, full })
+    }
+
+    /// Storage is near its quota: refuse anything that would add to it.
+    pub fn is_full(&self) -> bool {
+        self.full.load(Ordering::Acquire)
     }
 
     fn send(&self, c: Cmd) {
@@ -313,7 +357,7 @@ impl Db {
 /// Runs after the transaction ends; true if it committed.
 type After = Box<dyn FnOnce(bool)>;
 
-fn run(conn: Connection, rx: mpsc::Receiver<Job>) {
+fn run(conn: Connection, rx: mpsc::Receiver<Job>, full: Arc<AtomicBool>) {
     while let Ok(first) = rx.recv() {
         let mut after: Vec<After> = Vec::new();
         let mut writes: Vec<(Arc<Link>, Option<Ack>, bool)> = Vec::new();
@@ -349,6 +393,9 @@ fn run(conn: Connection, rx: mpsc::Receiver<Job>) {
         if !committed {
             let _ = conn.execute_batch("ROLLBACK");
         }
+        // Before the acks and replies: a client told ok and drawing again
+        // must see the quota its own stroke reached.
+        full.store(near_quota(&conn), Ordering::Release);
         // Every lost room first, so no ack goes out for a room that lost an
         // earlier write in the same batch.
         for (link, _, ok) in &writes {

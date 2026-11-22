@@ -52,6 +52,8 @@ pub struct Config {
     pub max_loaded: usize,
     /// Boards loaded at once.
     pub max_rooms: usize,
+    /// How large the database may grow, in bytes.
+    pub max_db: u64,
 }
 
 struct App {
@@ -177,6 +179,9 @@ async fn create_board(
     let ip = client_ip(&app, &headers, addr);
     if !app.ips.may_create(ip) {
         return plain(StatusCode::TOO_MANY_REQUESTS, "too many new boards; wait a moment");
+    }
+    if app.db.is_full() {
+        return plain(StatusCode::SERVICE_UNAVAILABLE, "storage is full; try again later");
     }
     for _ in 0..3 {
         let edit = keys::random_key();
@@ -374,7 +379,7 @@ pub async fn serve(
     cfg: Config,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let db = Db::open(&cfg.db_path).map_err(std::io::Error::other)?;
+    let db = Db::open_with(&cfg.db_path, cfg.max_db).map_err(std::io::Error::other)?;
     let grace = cfg.unload_grace;
     let (max_loaded, max_rooms) = (cfg.max_loaded, cfg.max_rooms);
     let app = Arc::new(App {
