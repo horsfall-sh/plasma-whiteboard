@@ -215,11 +215,12 @@ impl Local {
     }
 
     /// `cr`, done here instead of by the relay: the board goes on the shelf. The caller clears
-    /// `mine` and handles the returned frame as if the relay had sent it.
+    /// `mine`, handles the returned frame as if the relay had sent it, then calls
+    /// [`Local::save`] (`localSend` ends every branch with `saveLocal`).
     pub fn crumple(&mut self, board: &mut Board) -> In {
         let k = self.next_k;
         self.next_k += 1;
-        self.shelf.push(Sheet { k, a: board.strokes.clone() });
+        self.shelf.push(Sheet { k, a: board.strokes.iter().map(item_of).collect() });
         let drop = if self.shelf.len() > SHELF_MAX { Some(self.shelf.remove(0).k) } else { None };
         board.pending.clear();
         In::Crumpled { k, by: Some(1), drop, shelf: self.shelf_list() }
@@ -227,34 +228,47 @@ impl Local {
 
     /// `un`: sheet `k` comes back off the shelf, and the board as it is goes on it (when it has
     /// anything). `None` when there is no sheet `k`. The caller clears `mine`, handles the frame,
-    /// then calls [`Local::repend`].
-    pub fn uncrumple(&mut self, board: &mut Board, k: i64) -> Option<In> {
+    /// then calls [`Repend::apply`] and [`Local::save`].
+    pub fn uncrumple(&mut self, board: &mut Board, k: i64) -> Option<(In, Repend)> {
         let i = self.shelf.iter().position(|h| h.k == k)?;
         let sheet = self.shelf.remove(i);
         if !board.strokes.is_empty() {
-            self.shelf.push(Sheet { k: self.next_k, a: board.strokes.clone() });
+            self.shelf.push(Sheet { k: self.next_k, a: board.strokes.iter().map(item_of).collect() });
             self.next_k += 1;
             if self.shelf.len() > SHELF_MAX {
                 self.shelf.remove(0);
             }
         }
         board.pending.clear();
-        Some(In::Uncrumpled { k, by: Some(1), shelf: self.shelf_list(), layers: None, a: sheet.a })
+        Some((In::Uncrumpled { k, by: Some(1), shelf: self.shelf_list(), layers: None, a: sheet.a }, Repend(())))
     }
 
-    /// After an `un` is handled: every item on the board is unconfirmed again and goes to the
-    /// relay on share.
-    pub fn repend(board: &mut Board) {
+    /// `sv`: a look at sheet `k`. `None` when there is no sheet `k`. The caller handles the
+    /// frame, then calls [`Local::save`].
+    pub fn sheet_view(&self, k: i64) -> Option<In> {
+        let h = self.shelf.iter().find(|h| h.k == k)?;
+        Some(In::SheetView { k, a: Some(h.a.clone()) })
+    }
+}
+
+/// `itemOf`: an item as the private board keeps it, in layer 1 with no `q`.
+pub fn item_of(s: &Item) -> Item {
+    Item { id: s.id.clone(), l: Some(1), q: None, c: s.c.clone(), w: s.w, pts: s.pts.clone(), txt: s.txt.clone() }
+}
+
+/// The step an `un` owes once its frame is handled: every item on the board is unconfirmed
+/// again and goes to the relay on share. Not applying it leaves the restored sheet out of a
+/// later share, so it must be used.
+#[must_use = "apply it once the Uncrumpled frame is handled"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Repend(());
+
+impl Repend {
+    pub fn apply(self, board: &mut Board) {
         for s in &mut board.strokes {
             s.q = None;
             board.pending.insert(s.id.clone(), s.clone());
         }
-    }
-
-    /// `sv`: a look at sheet `k`. `None` when there is no sheet `k`.
-    pub fn sheet_view(&self, k: i64) -> Option<In> {
-        let h = self.shelf.iter().find(|h| h.k == k)?;
-        Some(In::SheetView { k, a: Some(h.a.clone()) })
     }
 }
 
@@ -398,20 +412,38 @@ mod tests {
         b.drop_all();
         assert_eq!(st.uncrumple(&mut b, 9), None);
         // an empty board does not go on the shelf
-        let In::Uncrumpled { k: 1, a, shelf, .. } = st.uncrumple(&mut b, 1).unwrap() else { panic!() };
+        let (In::Uncrumpled { k: 1, a, shelf, .. }, repend) = st.uncrumple(&mut b, 1).unwrap() else { panic!() };
         assert_eq!((a.len(), shelf.len(), st.next_k), (1, 0, 2));
         for s in a {
             b.insert(s);
         }
         b.strokes[0].q = Some(4.0);
-        Local::repend(&mut b);
+        repend.apply(&mut b);
         assert_eq!((b.strokes[0].q, b.pending.len()), (None, 1));
         // a board with items does, as sheet 2; the sheet view sees it
         st.crumple(&mut b); // sheet 2
-        let In::Uncrumpled { shelf, .. } = st.uncrumple(&mut b, 2).unwrap() else { panic!() };
+        let (In::Uncrumpled { shelf, .. }, _) = st.uncrumple(&mut b, 2).unwrap() else { panic!() };
         assert_eq!(shelf, [ShelfEntry { k: 3, n: 1 }]);
         assert!(matches!(st.sheet_view(3), Some(In::SheetView { k: 3, a: Some(a) }) if a.len() == 1));
         assert_eq!(st.sheet_view(2), None);
+    }
+
+    #[test]
+    fn the_shelf_holds_items_as_item_of_makes_them() {
+        // a shared board's items (other layers, confirmed) made private keep only itemOf's fields
+        let mut st = Local::default();
+        let mut b = board(&["a"]);
+        b.strokes[0].l = Some(7);
+        b.strokes[0].q = Some(3.0);
+        st.crumple(&mut b);
+        assert_eq!(st.shelf[0].a[0], Item { l: Some(1), q: None, ..b.strokes[0].clone() });
+        b.strokes[0].l = Some(7);
+        b.strokes[0].q = Some(3.0);
+        let k = st.next_k;
+        st.crumple(&mut b);
+        let (In::Uncrumpled { a, .. }, _) = st.uncrumple(&mut b, k).unwrap() else { panic!() };
+        assert_eq!((a[0].l, a[0].q), (Some(1), None));
+        assert_eq!(item_of(&Item { txt: Some("t".into()), ..b.strokes[0].clone() }).txt.as_deref(), Some("t"));
     }
 
     #[test]
