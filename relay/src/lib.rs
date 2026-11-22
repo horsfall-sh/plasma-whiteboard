@@ -257,7 +257,8 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
     // board can't be unloaded between the two.
     let (room, joined) = {
         let mut rooms = app.rooms.lock().await;
-        let room = match rooms.get(&board) {
+        // A lost room is replaced; its own connections are on their way out.
+        let room = match rooms.get(&board).filter(|r| !r.is_dead()) {
             Some(r) => r.clone(),
             None => {
                 // A board that can't be read is refused, never loaded empty.
@@ -272,7 +273,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
         };
         let joined = room.join(conn, role, who_hash, view.as_deref(), &app.db);
         if joined.is_err() && room.conns() == 0 {
-            rooms.remove(&board);
+            forget(&mut rooms, &room);
         }
         (room, joined)
     };
@@ -286,7 +287,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
         let mut rooms = app.rooms.lock().await;
         room.leave(joined.peer);
         if room.conns() == 0 {
-            rooms.remove(&board);
+            forget(&mut rooms, &room);
         }
     }
     match reason {
@@ -294,6 +295,15 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
         None => hang_up(sock).await,
     }
 }
+
+/// Drop an empty room from the registry, unless a newer one has taken its place.
+fn forget(rooms: &mut HashMap<i64, Arc<Room>>, room: &Arc<Room>) {
+    if rooms.get(&room.board).is_some_and(|r| Arc::ptr_eq(r, room)) {
+        rooms.remove(&room.board);
+    }
+}
+
+const LOST: (&str, &str) = ("busy", "this board had a storage error; reconnecting");
 
 /// Pump messages both ways until the connection ends. Returns an error to
 /// report to the client, if any.
@@ -310,6 +320,10 @@ async fn relay(
         }
     }
     let peer = joined.peer;
+    // Subscribed before this check, so a loss after it arrives as an `end`.
+    if room.is_dead() {
+        return Some(LOST);
+    }
     let mut bucket = Bucket::new(600.0, 300.0);
     // Bytes: a burst of 2 MB (a few very long strokes), then 256 KB a second.
     let mut bytes = Bucket::new(2.0 * 1024.0 * 1024.0, 256.0 * 1024.0);
@@ -331,6 +345,9 @@ async fn relay(
             },
             out = joined.rx.recv() => match out {
                 Ok(out) => {
+                    if out.end {
+                        return Some(LOST);
+                    }
                     if out.skip == peer.conn || (out.only != 0 && out.only != peer.conn) {
                         continue;
                     }

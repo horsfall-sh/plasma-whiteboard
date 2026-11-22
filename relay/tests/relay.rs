@@ -233,6 +233,49 @@ async fn draw_view_and_late_join() {
 }
 
 #[tokio::test]
+async fn ok_means_stored_and_a_lost_write_drops_the_room() {
+    let s = start(&temp_db("lostwrite")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    a.draw("a1").await;
+
+    // Every stroke insert fails from here on.
+    let conn = rusqlite::Connection::open(&s.db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER no_more BEFORE INSERT ON strokes BEGIN SELECT RAISE(ABORT, 'test'); END;",
+    )
+    .unwrap();
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+    a.send(json!({"t": "s", "id": "a2", "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+    // No ok for a stroke that was not stored: the room is dropped instead.
+    let m = a.next().await;
+    assert_eq!((&m["t"], &m["code"]), (&json!("err"), &json!("busy")), "{m}");
+    assert!(a.raw().await.is_none(), "the connection ends");
+    loop {
+        let m = v.next().await;
+        if m["t"] == "err" {
+            assert_eq!(m["code"], "busy", "{m}");
+            break;
+        }
+        assert_eq!(m["t"], "e", "{m}");
+    }
+
+    // The next join reads the board from storage: a2 was never kept.
+    conn.execute_batch("DROP TRIGGER no_more;").unwrap();
+    let (mut a, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1"]);
+    // The page resends it, and now it is stored.
+    a.draw("a2").await;
+    let db = s.stop().await;
+    let s = start(&db).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1", "a2"]);
+    s.stop().await;
+}
+
+#[tokio::test]
 async fn a_board_that_cannot_be_read_is_refused_not_loaded_empty() {
     let s = start(&temp_db("unreadable")).await;
     let (edit, view) = new_board(&s.addr).await;

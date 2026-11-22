@@ -2,13 +2,13 @@
 //! message. All changes happen under one lock and are broadcast in that order,
 //! so every client sees the same sequence.
 
-use crate::db::{Db, Loaded, Role, DELETED, LIVE, UNDONE};
+use crate::db::{Db, Link, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
 use crate::limits::Budget;
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -43,6 +43,8 @@ pub struct Out {
     /// The one connection that receives it (0: everyone).
     pub only: u64,
     pub text: Utf8Bytes,
+    /// The room is lost (a write failed): every connection ends with busy.
+    pub end: bool,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +157,7 @@ struct State {
 pub struct Room {
     pub board: i64,
     tx: broadcast::Sender<Out>,
+    link: Arc<Link>,
     st: Mutex<State>,
 }
 
@@ -351,9 +354,14 @@ impl Room {
             .map(|(n, who, color)| Layer { n, who, color, name: None, on: 0, pinged: None })
             .collect();
         let (tx, _) = broadcast::channel(256);
+        let end = tx.clone();
+        let link = Link::new(board, move || {
+            let _ = end.send(Out { skip: 0, only: 0, text: Utf8Bytes::from_static(""), end: true });
+        });
         Room {
             board,
             tx,
+            link,
             st: Mutex::new(State {
                 next_seq,
                 strokes,
@@ -371,13 +379,19 @@ impl Room {
     }
 
     fn all(&self, text: String) {
-        let _ = self.tx.send(Out { skip: 0, only: 0, text: text.into() });
+        let _ = self.tx.send(Out { skip: 0, only: 0, text: text.into(), end: false });
     }
     fn others(&self, conn: u64, text: String) {
-        let _ = self.tx.send(Out { skip: conn, only: 0, text: text.into() });
+        let _ = self.tx.send(Out { skip: conn, only: 0, text: text.into(), end: false });
     }
     fn only(&self, conn: u64, text: String) {
-        let _ = self.tx.send(Out { skip: 0, only: conn, text: text.into() });
+        let _ = self.tx.send(Out { skip: 0, only: conn, text: text.into(), end: false });
+    }
+
+    /// A write failed: what this room holds is not what is stored. It takes
+    /// no one new, and is read again from storage on the next join.
+    pub fn is_dead(&self) -> bool {
+        self.link.is_dead()
     }
 
     pub fn conns(&self) -> usize {
@@ -408,7 +422,7 @@ impl Room {
             } else if st.layers.len() < MAX_LAYERS {
                 layer = st.layers.len() as u32 + 1;
                 let color = layer_color(layer);
-                db.add_layer(self.board, layer, who, color.clone());
+                db.add_layer(&self.link, layer, who, color.clone());
                 self.all(format!(r#"{{"t":"l","l":{layer},"c":"{color}"}}"#));
                 st.layers.push(Layer { n: layer, who, color, name: None, on: 1, pinged: None });
             } else {
@@ -639,7 +653,7 @@ impl Room {
                 let gone = st.strokes.remove(i);
                 st.bytes = st.bytes.saturating_sub(gone.json.len());
                 st.snap = None;
-                db.stroke_state(self.board, id.clone(), UNDONE);
+                db.stroke_state(&self.link, id.clone(), UNDONE);
                 self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
             }
             In::LayerDelete { l } => {
@@ -650,7 +664,7 @@ impl Room {
                 }
                 if any {
                     st.snap = None;
-                    db.layer_state(self.board, l, LIVE, DELETED);
+                    db.layer_state(&self.link, l, LIVE, DELETED);
                     self.all(format!(r#"{{"t":"ld","l":{l}}}"#));
                 }
             }
@@ -662,7 +676,7 @@ impl Room {
                 let k = st.next_sheet;
                 st.next_sheet += 1;
                 let sheet = std::mem::take(&mut st.strokes);
-                db.sheet_move(self.board, 0, k);
+                db.sheet_move(&self.link, 0, k);
                 st.shelf.push(Sheet { k, strokes: sheet, view: None });
                 let mut dropped = String::from("null");
                 if st.shelf.len() > MAX_SHELF {
@@ -671,7 +685,7 @@ impl Room {
                         st.ids.remove(&s.id);
                         st.bytes = st.bytes.saturating_sub(s.json.len());
                     }
-                    db.sheet_drop(self.board, old.k);
+                    db.sheet_drop(&self.link, old.k);
                     dropped = old.k.to_string();
                 }
                 self.all(format!(
@@ -693,12 +707,12 @@ impl Room {
                 st.next_sheet += 1;
                 if cur.is_empty() {
                     // Only undone rows can be left on sheet 0; they go for good.
-                    db.sheet_drop(self.board, 0);
+                    db.sheet_drop(&self.link, 0);
                 } else {
-                    db.sheet_move(self.board, 0, nk);
+                    db.sheet_move(&self.link, 0, nk);
                     st.shelf.push(Sheet { k: nk, strokes: cur, view: None });
                 }
-                db.sheet_move(self.board, k, 0);
+                db.sheet_move(&self.link, k, 0);
                 let head = format!(
                     r#"{{"t":"un","k":{k},"by":{},"shelf":{},"layers":[{}],"a":["#,
                     peer.layer,
@@ -723,7 +737,7 @@ impl Room {
                 if !budget.send(text.len()) {
                     return;
                 }
-                let _ = self.tx.send(Out { skip: 0, only: conn, text });
+                let _ = self.tx.send(Out { skip: 0, only: conn, text, end: false });
             }
             In::LayerRestore { l } => {
                 if !st.strokes.iter().any(|s| s.layer == l && s.state == DELETED) || !heavy.take() {
@@ -736,12 +750,23 @@ impl Room {
                     back.push(&s.json);
                 }
                 if !back.is_empty() {
-                    db.layer_state(self.board, l, DELETED, LIVE);
+                    db.layer_state(&self.link, l, DELETED, LIVE);
                     let head = format!(r#"{{"t":"lr","l":{l},"a":["#);
                     self.all(strokes_msg(&head, back.into_iter()));
                 }
             }
         }
+    }
+
+    /// The author's `ok`, to send from the storage thread once the stroke is
+    /// committed. An ok is a promise that the stroke is on disk: the page
+    /// forgets its own copy on it.
+    fn ok_once_stored(&self, conn: u64, id: &str, seq: u64) -> crate::db::Ack {
+        let tx = self.tx.clone();
+        let text = format!(r#"{{"t":"ok","id":"{id}","q":{seq}}}"#);
+        Box::new(move || {
+            let _ = tx.send(Out { skip: 0, only: conn, text: text.into(), end: false });
+        })
     }
 
     /// Store a finished stroke and tell everyone.
@@ -776,7 +801,9 @@ impl Room {
             let held = st.strokes.iter().chain(st.shelf.iter().flat_map(|s| s.strokes.iter()));
             match held.rev().find(|s| s.id == id) {
                 Some(s) if s.layer == peer.layer => {
-                    self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{}}}"#, s.seq));
+                    // Not before the first copy is committed.
+                    let ok = self.ok_once_stored(conn, &id, s.seq);
+                    db.ack(&self.link, ok);
                 }
                 _ => self.only(conn, format!(r#"{{"t":"u","id":"{id}"}}"#)),
             }
@@ -796,8 +823,8 @@ impl Room {
         st.next_seq += 1;
         let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
-        self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{seq}}}"#));
-        db.add_stroke(self.board, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt);
+        let ok = self.ok_once_stored(conn, &id, seq);
+        db.add_stroke(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, ok);
         st.ids.insert(id.clone());
         st.bytes += json.len();
         st.snap = None;
