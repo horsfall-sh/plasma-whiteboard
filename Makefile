@@ -1,15 +1,20 @@
-# Build the stroke simplifier to WebAssembly, then the relay (which embeds the page).
-WASM := smooth/target/wasm32-unknown-unknown/release/wb_smooth.wasm
+# Build the page to WebAssembly, then the relay (which embeds the page).
+PAGE_WASM := page/target/wasm32-unknown-unknown/release/wb_page.wasm
+# The wasm-bindgen-cli that writes web/page.js must match the wasm-bindgen crate
+# pinned in page/Cargo.toml exactly, or the glue and the module disagree.
+WASM_BINDGEN := 0.2.100
 
 .PHONY: ship all wasm relay test run linux clean
 
 all: relay
 
 wasm:
-	cd smooth && cargo build --release --target wasm32-unknown-unknown
-	cp $(WASM) web/smooth.wasm
-	cd crumple && cargo build --release --target wasm32-unknown-unknown
-	cp crumple/target/wasm32-unknown-unknown/release/wb_crumple.wasm web/crumple.wasm
+	@v=$$(wasm-bindgen --version 2>/dev/null | cut -d' ' -f2); \
+	  test "$$v" = "$(WASM_BINDGEN)" || { \
+	  echo "wasm-bindgen-cli $(WASM_BINDGEN) is needed (found: $${v:-none}). Install it with:" >&2; \
+	  echo "  cargo install wasm-bindgen-cli --version $(WASM_BINDGEN) --locked" >&2; exit 1; }
+	cd page && cargo build --release --locked --target wasm32-unknown-unknown
+	wasm-bindgen --target web --no-typescript --out-dir web --out-name page $(PAGE_WASM)
 
 relay: wasm
 	cd relay && cargo build --release
@@ -19,7 +24,7 @@ test: wasm
 	cd crumple && cargo test
 	cd relay && cargo test
 	cd page && cargo test
-	node --check web/app.js
+	node --check web/boot.js
 
 # Local run on http://127.0.0.1:8787, serving web/ from disk so page edits show on reload.
 run: wasm
@@ -42,7 +47,7 @@ linux: wasm
 	@ls -lh relay/target-linux/release/wb-relay
 
 clean:
-	rm -rf smooth/target crumple/target relay/target relay/target-linux web/smooth.wasm web/crumple.wasm
+	rm -rf smooth/target crumple/target page/target relay/target relay/target-linux web/page.js web/page_bg.wasm
 
 # Test, build for the server and deploy to the live board. Run after every
 # change so the public board always matches the latest commit.

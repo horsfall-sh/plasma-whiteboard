@@ -118,13 +118,14 @@ body.edit #bar #swatches { display: contents; }
 }
 #toast.plain { padding: 12px 14px; }
 
-#msg {
+#msg, .needs {
   position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 6;
   width: min(360px, calc(100vw - 32px)); box-sizing: border-box; padding: 20px;
   text-align: center; background: rgba(20,22,25,.97); border-radius: 14px;
   box-shadow: 0 4px 32px rgba(0,0,0,.6);
 }
 #msg p { margin: 0 0 14px; font-size: 16px; }
+.needs p { margin: 0; font-size: 16px; }
 #msg a {
   display: inline-block; line-height: 44px; padding: 0 16px; border-radius: 10px;
   background: #3a3f47; color: #fff; text-decoration: none;

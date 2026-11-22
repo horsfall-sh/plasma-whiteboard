@@ -36,15 +36,17 @@ on a phone the board starts at 100% so a finger has room to write. See "Tablet a
 
 ## Run it yourself
 
-Needs Rust with the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`); `make linux` also needs Docker.
+Needs Rust with the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`) and wasm-bindgen-cli 0.2.100,
+which must match the `wasm-bindgen` crate the page pins (`cargo install wasm-bindgen-cli --version 0.2.100 --locked`);
+`make linux` also needs Docker.
 
-    make test     # smooth tests, relay unit and end-to-end tests, JS syntax check
+    make test     # page, smooth, crumple and relay tests, boot.js syntax check
     make run      # http://127.0.0.1:8787, page served from web/ so edits show on reload
     make relay    # release binary at relay/target/release/wb-relay
     make linux    # static Linux x86-64 binary in relay/target-linux/release/
 
-Open `http://127.0.0.1:8787/`. The status line at the bottom right shows the connection, your role, the simplifier in
-use (`wasm` or `js`) and how many browsers are on the board.
+Open `http://127.0.0.1:8787/`. The status line at the bottom right shows the connection, your role, the page engine
+(`wasm`) and how many browsers are on the board.
 
 ## Features
 
@@ -115,9 +117,10 @@ private board. One private board per browser for now.
 | Path | What |
 | --- | --- |
 | `relay/` | The relay: one Rust binary (axum, tokio, SQLite in WAL mode). Serves the page, makes boards, relays strokes. The page is embedded in the binary. |
-| `web/` | The page: plain HTML, CSS and JS. No framework and no build step. |
-| `crumple/` | The crumple animation in Rust, built to WebAssembly: each frame it computes a paper mesh (wrinkle, wad, toss), which the page draws with WebGL using a picture of the board as the paper. Without it, or with reduced motion set, crumpling still works, without the animation. |
-| `smooth/` | Stroke simplification in Rust (Ramer-Douglas-Peucker over x, y, pressure), built to WebAssembly. The page falls back to the same algorithm in JS if the module does not load. |
+| `page/` | The page in Rust, built to WebAssembly: the board model, the view, drawing, input, the connection and the browser glue. `make wasm` writes `web/page.js` and `web/page_bg.wasm`. |
+| `web/` | The page's HTML and CSS, and `boot.js`, which loads the WebAssembly page. A browser without WebAssembly is told so. |
+| `crumple/` | The crumple animation's paper mesh (wrinkle, wad, toss), used by the page, which draws it with WebGL using a picture of the board as the paper. Without WebGL, or with reduced motion set, crumpling still works, without the animation. |
+| `smooth/` | Stroke simplification (Ramer-Douglas-Peucker over x, y, pressure), used by the page. |
 | `PROTOCOL.md` | The wire contract between page and relay, and the limits. |
 
 ## Settings
