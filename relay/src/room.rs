@@ -9,6 +9,7 @@ use crate::memory::{weight, Memory};
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -151,7 +152,7 @@ struct State {
     /// What the shared memory budget holds for this board; 0 until admitted.
     charged: usize,
     /// The snapshot's `ss` chunks, shared by every join until the sheet changes.
-    snap: Option<Vec<Utf8Bytes>>,
+    snap: Option<Arc<Snap>>,
     /// Every stroke id the board has ever stored, undone ones included.
     ids: HashSet<String>,
     layers: Vec<Layer>,
@@ -165,11 +166,48 @@ struct State {
     next_ping: u8,
 }
 
+/// One build of the sheet's `ss` chunks, shared by the cache and by every join still
+/// sending it (council H4). A change to the sheet drops the cache, but a slow join keeps
+/// its build alive, and the next join makes a new one. The room's weight counts one build
+/// ([`crate::memory::COPIES`]); every other build alive at the same time is charged to the
+/// shared memory budget until its last holder lets go, so slow joins cannot pin
+/// uncounted copies of a big sheet.
+pub struct Snap {
+    chunks: Vec<Utf8Bytes>,
+    /// This build is the one the room's weight counts (`spare` was free when it was made).
+    counted: bool,
+    /// Bytes charged to the budget for this build; 0 when `counted`.
+    extra: usize,
+    spare: Arc<AtomicBool>,
+    mem: Arc<Memory>,
+}
+
+impl Drop for Snap {
+    fn drop(&mut self) {
+        if self.counted {
+            self.spare.store(false, Ordering::SeqCst);
+        } else {
+            self.mem.shrink(self.extra);
+        }
+    }
+}
+
+/// Why a join was refused.
+#[derive(Debug, PartialEq)]
+pub enum NoJoin {
+    /// No seat for it.
+    Full,
+    /// The memory budget has no room for another build of the snapshot.
+    Busy,
+}
+
 pub struct Room {
     pub board: i64,
     tx: broadcast::Sender<Out>,
     link: Arc<Link>,
     mem: Arc<Memory>,
+    /// Set while a build of the snapshot is alive that the room's weight counts.
+    spare: Arc<AtomicBool>,
     st: Mutex<State>,
 }
 
@@ -195,6 +233,9 @@ pub struct Joined {
     pub rx: broadcast::Receiver<Out>,
     /// hello, the snapshot chunks, live strokes and ready, in order.
     pub snapshot: Vec<Utf8Bytes>,
+    /// The build of the chunks in `snapshot`, held until they are sent so its charge lasts
+    /// as long as the copy does.
+    pub hold: Option<Arc<Snap>>,
 }
 
 // ---- numbers on the wire ----------------------------------------------------
@@ -428,6 +469,7 @@ impl Room {
             tx,
             link,
             mem,
+            spare: Arc::new(AtomicBool::new(false)),
             st: Mutex::new(State {
                 next_seq,
                 strokes,
@@ -480,10 +522,10 @@ impl Room {
         view: Option<&str>,
         db: &Db,
         may_add: impl FnOnce() -> bool,
-    ) -> Result<Joined, ()> {
+    ) -> Result<Joined, NoJoin> {
         let mut st = self.st.lock().unwrap();
         if st.conns >= MAX_ROOM_CONNS {
-            return Err(());
+            return Err(NoJoin::Full);
         }
         // Settle the role before counting it: whoever will be a viewer
         // (including an edit-key holder when the layers are full) takes a
@@ -495,7 +537,7 @@ impl Room {
             Full,
         }
         let seat = match (role, who) {
-            (Role::Edit, None) => return Err(()),
+            (Role::Edit, None) => return Err(NoJoin::Full),
             (Role::Edit, Some(who)) => match st.layers.iter().position(|l| l.who == who) {
                 Some(i) => Seat::Mine(i),
                 None => {
@@ -510,8 +552,28 @@ impl Room {
         };
         let full = role == Role::Edit && matches!(seat, Seat::Full);
         if matches!(seat, Seat::Full) && st.viewers >= MAX_ROOM_VIEWERS {
-            return Err(());
+            return Err(NoJoin::Full);
         }
+        // Before anything changes: a build of the snapshot that must be charged may not fit.
+        let snap = match &st.snap {
+            Some(s) => s.clone(),
+            None => {
+                let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
+                let chunks: Vec<Utf8Bytes> = drawn
+                    .chunks(SNAPSHOT_CHUNK)
+                    .map(|c| strokes_msg(r#"{"t":"ss","a":["#, c.iter().map(|s| s.json.as_str())).into())
+                    .collect();
+                let bytes: usize = chunks.iter().map(|c| c.len()).sum();
+                let counted = self.spare.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+                if !counted && !self.mem.grow(bytes) {
+                    return Err(NoJoin::Busy);
+                }
+                let extra = if counted { 0 } else { bytes };
+                let s = Arc::new(Snap { chunks, counted, extra, spare: self.spare.clone(), mem: self.mem.clone() });
+                st.snap = Some(s.clone());
+                s
+            }
+        };
         let who = who.unwrap_or_default();
         let mut layer = 0;
         match seat {
@@ -571,15 +633,7 @@ impl Room {
             ));
         }
 
-        if st.snap.is_none() {
-            let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
-            let chunks = drawn
-                .chunks(SNAPSHOT_CHUNK)
-                .map(|c| strokes_msg(r#"{"t":"ss","a":["#, c.iter().map(|s| s.json.as_str())).into())
-                .collect();
-            st.snap = Some(chunks);
-        }
-        snapshot.extend(st.snap.iter().flatten().cloned());
+        snapshot.extend(snap.chunks.iter().cloned());
         for (id, s) in &st.live {
             let w = width_json(s.w);
             snapshot.push(format!(r#"{{"t":"b","id":"{id}","l":{},"c":"{}","w":{w}}}"#, s.layer, s.c).into());
@@ -588,7 +642,7 @@ impl Room {
             }
         }
         snapshot.push(Utf8Bytes::from_static(r#"{"t":"ready"}"#));
-        Ok(Joined { peer: Peer { conn, role, layer }, rx, snapshot })
+        Ok(Joined { peer: Peer { conn, role, layer }, rx, snapshot, hold: Some(snap) })
     }
 
     /// Remove a connection and abandon the strokes it left unfinished.

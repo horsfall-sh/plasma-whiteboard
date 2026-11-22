@@ -316,13 +316,17 @@ async fn catch_up(
     loop {
         let text = match snapshot.next() {
             Some(t) => t,
-            None => match queue.pop_front() {
-                Some(t) => {
-                    held -= t.len();
-                    t
+            // the chunks are sent: let their build (and any charge for it) go (H4)
+            None => {
+                joined.hold = None;
+                match queue.pop_front() {
+                    Some(t) => {
+                        held -= t.len();
+                        t
+                    }
+                    None => return Ok(()),
                 }
-                None => return Ok(()),
-            },
+            }
         };
         let sent = send(sock, Message::Text(text));
         tokio::pin!(sent);

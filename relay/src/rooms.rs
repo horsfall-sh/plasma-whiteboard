@@ -4,7 +4,7 @@
 
 use crate::db::Db;
 use crate::memory::{weight, Memory};
-use crate::room::{Joined, Room};
+use crate::room::{Joined, NoJoin, Room};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -93,7 +93,7 @@ impl Rooms {
         &self,
         db: &Db,
         board: i64,
-        join: impl FnOnce(&Room) -> Result<Joined, ()>,
+        join: impl FnOnce(&Room) -> Result<Joined, NoJoin>,
     ) -> Result<(Arc<Room>, Joined), Refused> {
         loop {
             let cell = self.map.lock().unwrap().entry(board).or_default().clone();
@@ -137,12 +137,15 @@ impl Rooms {
                     r
                 }
             };
-            let Ok(joined) = join(&room) else {
-                if room.conns() == 0 {
-                    *slot = None;
-                    self.remove(board, &cell);
+            let joined = match join(&room) {
+                Ok(j) => j,
+                Err(why) => {
+                    if room.conns() == 0 {
+                        *slot = None;
+                        self.remove(board, &cell);
+                    }
+                    return Err(if why == NoJoin::Busy { Refused::Busy } else { Refused::Full });
                 }
-                return Err(Refused::Full);
             };
             return Ok((room, joined));
         }
@@ -300,6 +303,59 @@ mod tests {
         let loaded = db.load(a).await.unwrap();
         assert_eq!(loaded.layers.len(), MAX_LAYERS);
         assert!(loaded.layers.iter().any(|(n, w, _)| *n == 3 && *w == [0xee; 32]));
+    }
+
+    /// Council H4: on 5884277 a slow join kept its own build of a sheet's snapshot alive after
+    /// the sheet changed, and the next join built another, none of it charged: slow joins on
+    /// a busy board could pin a copy of a 16MB sheet each. Now every build beyond the one the
+    /// room's weight counts is charged until its last holder lets go, and a join that would
+    /// not fit is refused as busy.
+    #[tokio::test]
+    async fn every_snapshot_build_a_slow_join_keeps_alive_is_charged() {
+        use crate::limits::{Budget, Bucket};
+        use crate::room::NoJoin;
+        let db = temp_db();
+        let a = db.create_board([13; 32], [14; 32]).await.unwrap();
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
+        let (room, mut ed) =
+            rooms.join(&db, a, |r| r.join(1, Role::Edit, Some([1; 32]), Some("vk"), &db, || true)).await.unwrap();
+        ed.hold = None; // its snapshot is sent, as catch_up does
+        let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
+        let pts: Vec<String> = (0..3000).map(|i| format!("0.{:05},0.25,0.5", i)).collect();
+        let draw = |id: &str, b: &mut Budget| {
+            let s = format!(r##"{{"t":"s","id":"{id}","c":"#112233","w":0.004,"pts":[{}]}}"##, pts.join(","));
+            room.handle(ed.peer, &s, &db, b);
+        };
+        let ss = |j: &Joined| -> usize { j.snapshot.iter().filter(|t| t.starts_with(r#"{"t":"ss""#)).map(|t| t.len()).sum() };
+        let used = || rooms.mem.used().0;
+
+        draw("s1", &mut b);
+        let base = used();
+        let slow1 = room.join(2, Role::View, None, None, &db, || true).unwrap();
+        assert!(ss(&slow1) > 10_000);
+        assert_eq!(used(), base, "the build the room's weight counts is not charged twice");
+
+        draw("s2", &mut b);
+        let base = used();
+        let slow2 = room.join(3, Role::View, None, None, &db, || true).unwrap();
+        assert_eq!(used(), base + ss(&slow2), "a second build alive at once is charged");
+
+        draw("s3", &mut b);
+        let base = used();
+        let fill = usize::MAX / 2 - base - 100;
+        assert!(rooms.mem.grow(fill));
+        let conns = room.conns();
+        assert_eq!(room.join(4, Role::View, None, None, &db, || true).err(), Some(NoJoin::Busy), "no room for a third");
+        assert_eq!(room.conns(), conns, "a refused join changes nothing");
+        rooms.mem.shrink(fill);
+
+        drop(slow1);
+        let next = room.join(5, Role::View, None, None, &db, || true).unwrap();
+        assert_eq!(used(), base, "the counted build was let go, so the next one takes its place");
+        let held = ss(&slow2);
+        drop(slow2);
+        assert_eq!(used(), base - held, "the last holder of a charged build gives the charge back");
+        drop(next);
     }
 
     #[tokio::test]
