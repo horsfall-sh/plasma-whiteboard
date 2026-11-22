@@ -80,10 +80,10 @@ connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; f
 fn assets() -> Vec<Asset> {
     let raw: [(&str, &str, &str, &[u8]); 6] = [
         ("/", "index.html", "text/html; charset=utf-8", include_bytes!("../../web/index.html")),
-        ("/app.js", "app.js", "text/javascript; charset=utf-8", include_bytes!("../../web/app.js")),
+        ("/boot.js", "boot.js", "text/javascript; charset=utf-8", include_bytes!("../../web/boot.js")),
+        ("/page.js", "page.js", "text/javascript; charset=utf-8", include_bytes!("../../web/page.js")),
+        ("/page_bg.wasm", "page_bg.wasm", "application/wasm", include_bytes!("../../web/page_bg.wasm")),
         ("/app.css", "app.css", "text/css; charset=utf-8", include_bytes!("../../web/app.css")),
-        ("/smooth.wasm", "smooth.wasm", "application/wasm", include_bytes!("../../web/smooth.wasm")),
-        ("/crumple.wasm", "crumple.wasm", "application/wasm", include_bytes!("../../web/crumple.wasm")),
         ("/favicon.svg", "favicon.svg", "image/svg+xml", include_bytes!("../../web/favicon.svg")),
     ];
     raw.into_iter()
@@ -480,10 +480,10 @@ pub async fn serve(
     let router = Router::new()
         .route("/", get(page))
         .route("/b/{key}", get(page))
-        .route("/app.js", get(file))
+        .route("/boot.js", get(file))
+        .route("/page.js", get(file))
+        .route("/page_bg.wasm", get(file))
         .route("/app.css", get(file))
-        .route("/smooth.wasm", get(file))
-        .route("/crumple.wasm", get(file))
         .route("/favicon.svg", get(file))
         .route("/favicon.ico", get(|| async { plain(StatusCode::NO_CONTENT, "") }))
         .route("/api/boards", post(create_board))

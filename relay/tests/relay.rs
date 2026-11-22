@@ -176,10 +176,12 @@ async fn page_and_headers() {
     assert!(head.contains("content-security-policy: default-src 'self'"));
     assert!(head.contains("referrer-policy: no-referrer"));
     assert_eq!(http(&s.addr, "GET", "/b/anything").await.0, 200);
-    let (status, head, _) = http(&s.addr, "GET", "/smooth.wasm").await;
+    let (status, head, _) = http(&s.addr, "GET", "/page_bg.wasm").await;
     assert_eq!(status, 200);
     assert!(head.contains("content-type: application/wasm"));
-    assert_eq!(http(&s.addr, "GET", "/app.js").await.0, 200);
+    assert_eq!(http(&s.addr, "GET", "/boot.js").await.0, 200);
+    assert_eq!(http(&s.addr, "GET", "/page.js").await.0, 200);
+    assert_eq!(http(&s.addr, "GET", "/app.js").await.0, 404);
     assert_eq!(http(&s.addr, "GET", "/app.css").await.0, 200);
     assert_eq!(http(&s.addr, "GET", "/nope").await.0, 404);
     assert_eq!(http(&s.addr, "GET", "/api/boards").await.0, 405);
