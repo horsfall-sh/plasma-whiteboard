@@ -290,7 +290,19 @@ fn stroke_json(
 
 /// Check the text of an annotation. Returns it with line endings normalised
 /// and trailing space removed, or None to refuse it.
+/// Characters taken out of names and text: bidi controls, which can make a
+/// name read as something else or flip the text beside it, and invisible
+/// format characters. The zero-width joiner and non-joiner stay: emoji
+/// sequences and scripts such as Persian need them.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
 fn clean_text(t: &str) -> Option<String> {
+    let t: String = t.chars().filter(|&c| !invisible(c)).collect();
     let t = t.replace("\r\n", "\n").replace('\r', "\n");
     let t = t.trim_end();
     if t.trim().is_empty()
@@ -984,6 +996,7 @@ fn count_msg(st: &State) -> String {
 
 /// A display name: 1 to 24 characters, single spaces, nothing unprintable.
 fn clean_name(n: &str) -> Option<String> {
+    let n: String = n.chars().filter(|&c| !invisible(c)).collect();
     let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
     let len = n.chars().count();
     if len == 0 || len > 24 || n.chars().any(char::is_control) {
@@ -1006,7 +1019,6 @@ fn layers_json(st: &State) -> String {
     out
 }
 
-/// The shelf, oldest first: `[{k, n}]` with n the number of drawn items.
 /// About the bytes of a frame holding `strokes`.
 fn sheet_size<'a>(strokes: impl Iterator<Item = &'a Stroke>) -> usize {
     256 + strokes.map(|s| s.json.len() + 1).sum::<usize>()
@@ -1027,6 +1039,7 @@ fn may_broadcast(sheets: &mut Bucket, budget: &mut Budget, size: usize) -> bool 
     true
 }
 
+/// The shelf, oldest first: `[{k, n}]` with n the number of drawn items.
 fn shelf_json(st: &State) -> String {
     let mut out = String::from("[");
     for (i, s) in st.shelf.iter().enumerate() {
@@ -1088,6 +1101,22 @@ mod tests {
         assert!(clean_text(&"x".repeat(MAX_TEXT_CHARS + 1)).is_none());
         assert!(clean_text(&"x\n".repeat(MAX_TEXT_LINES + 1)).is_none());
         assert!(clean_text("naïve “quotes” \\ \" 日本語").is_some());
+        // Bidi controls and invisible characters go; joiners stay.
+        assert_eq!(clean_text("abc\u{202E}fed\u{2066}x\u{2069}\u{200B}\u{FEFF}").unwrap(), "abcfedx");
+        assert!(clean_text("\u{200B}\u{202E}").is_none(), "nothing visible is left");
+        assert_eq!(clean_text("👩\u{200D}🏫 می\u{200C}خواهم").unwrap(), "👩\u{200D}🏫 می\u{200C}خواهم");
+    }
+
+    #[test]
+    fn names_are_checked() {
+        assert_eq!(clean_name("  Amber   Otter ").unwrap(), "Amber Otter");
+        assert_eq!(clean_name("Tea\u{202E}rehc").unwrap(), "Tearehc", "an override cannot make it read as Teacher");
+        assert_eq!(clean_name("Ann\u{2067}\u{200F}e").unwrap(), "Anne");
+        assert!(clean_name("\u{200B}\u{2060}").is_none());
+        assert!(clean_name("tab\u{7}").is_none());
+        assert!(clean_name(&"x".repeat(25)).is_none());
+        assert!(clean_name(&format!("{}\u{200B}", "x".repeat(24))).is_some(), "invisibles do not count");
+        assert_eq!(clean_name("👨\u{200D}👩\u{200D}👧").unwrap(), "👨\u{200D}👩\u{200D}👧");
         let j = stroke_json("a", 1, 2, "#111111", "0.02", "[0.1,0.2,0.5]", Some("say \"hi\"\n</script>"));
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["txt"], "say \"hi\"\n</script>");
