@@ -10,3 +10,4 @@ pub mod geom;
 pub mod local;
 pub mod render;
 pub mod input;
+pub mod net;

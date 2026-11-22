@@ -207,23 +207,59 @@ impl Board {
         true
     }
 
-    /// `onLayerDeleted`: drops the layer's items except my unconfirmed ones. Whether any went.
-    pub fn layer_deleted(&mut self, l: Layer) -> bool {
-        let before = self.strokes.len();
+    /// `onLayerDeleted`: drops the layer's items except my unconfirmed ones. The ids that went
+    /// (when any did, the base needs a redraw).
+    pub fn layer_deleted(&mut self, l: Layer) -> Vec<String> {
+        let mut gone = Vec::new();
         let (pending, ids) = (&self.pending, &mut self.ids);
         self.strokes.retain(|s| {
             let keep = s.l != Some(l) || pending.contains_key(&s.id);
             if !keep {
                 ids.remove(&s.id);
+                gone.push(s.id.clone());
             }
             keep
         });
-        let gone = (before - self.strokes.len()) as i64;
-        if gone > 0 {
-            self.bump(Some(l), -gone);
+        if !gone.is_empty() {
+            self.bump(Some(l), -(gone.len() as i64));
         }
         self.layers.entry(l).or_insert_with(|| LayerInfo { l, c: "#888888".into(), del: true, n: None }).del = true;
-        gone > 0
+        gone
+    }
+
+    /// `clearSheet`: the sheet goes, except my unconfirmed items. The ids that went.
+    pub fn clear_sheet(&mut self) -> Vec<String> {
+        let (keep, gone): (Vec<Item>, Vec<Item>) =
+            std::mem::take(&mut self.strokes).into_iter().partition(|s| self.pending.contains_key(&s.id));
+        self.ids.clear();
+        self.counts.clear();
+        for s in keep {
+            self.ids.insert(s.id.clone());
+            self.bump(s.l, 1);
+            self.strokes.push(s);
+        }
+        gone.into_iter().map(|s| s.id).collect()
+    }
+
+    /// The board part of `onUncrumpled`, after [`Board::clear_sheet`]: the sheet's items in `q`
+    /// order, then what was left of mine on top, as they were. An item already here is skipped
+    /// (JavaScript kept `byId` while it took `mineLeft` out). `layers`, when the frame had them,
+    /// are set over the ones known.
+    pub fn uncrumpled(&mut self, a: Vec<Item>, layers: Option<Vec<LayerInfo>>) {
+        let mine_left = std::mem::take(&mut self.strokes);
+        for s in a {
+            if self.has(&s.id) {
+                continue;
+            }
+            self.ids.insert(s.id.clone());
+            self.bump(s.l, 1);
+            self.strokes.push(s);
+        }
+        self.strokes.sort_by(by_q);
+        self.strokes.extend(mine_left);
+        for info in layers.unwrap_or_default() {
+            self.layers.insert(info.l, info);
+        }
     }
 
     /// `onLayerRestored`. `a` is `None` when the frame carried no list. Whether the base needs a
@@ -399,10 +435,10 @@ mod tests {
         b.insert(it("c", 2, Some(3.0)));
         b.insert(it("m", 2, None));
         b.pending.insert("m".into(), b.get("m").unwrap().clone());
-        assert!(b.layer_deleted(2));
+        assert_eq!(b.layer_deleted(2), ["a", "c"]);
         assert_eq!((order(&b), b.count(2)), (vec!["b", "m"], 1));
         assert!(b.layers[&2].del);
-        assert!(!b.layer_deleted(9) && b.layers[&9].c == "#888888");
+        assert!(b.layer_deleted(9).is_empty() && b.layers[&9].c == "#888888");
         let mut back = vec![it("c", 2, Some(3.0)), it("a", 2, Some(1.0)), it("m", 2, None)];
         back[1].l = None; // a restored item without a layer is on the restored layer
         assert!(b.layer_restored(2, Some(back)));
@@ -476,5 +512,26 @@ mod tests {
         b.undo_queue.push("x".into());
         assert_eq!(b.ready(None), Ready::default());
         assert!(b.pending.is_empty() && b.undo_queue.is_empty());
+    }
+
+    #[test]
+    fn a_sheet_comes_back_under_what_is_left_of_mine() {
+        let mut b = Board::default();
+        b.insert(it("a", 1, Some(1.0)));
+        b.insert(it("m", 2, None));
+        b.insert(it("b", 1, Some(2.0)));
+        b.pending.insert("m".into(), b.get("m").unwrap().clone());
+        assert_eq!(b.clear_sheet(), ["a", "b"]);
+        assert_eq!((order(&b), b.count(1), b.count(2)), (vec!["m"], 0, 1));
+        assert!(!b.has("a") && b.has("m"));
+
+        let back = vec![it("y", 3, Some(9.0)), it("m", 2, Some(0.5)), it("x", 3, Some(4.0))];
+        let layers = vec![LayerInfo { l: 3, c: "#00aa00".into(), del: true, n: None }];
+        b.uncrumpled(back, Some(layers));
+        assert_eq!(order(&b), ["x", "y", "m"], "the sheet in q order, mine on top, not doubled");
+        assert_eq!((b.count(2), b.count(3)), (1, 2));
+        assert!(b.layers[&3].del);
+        b.uncrumpled(vec![], None);
+        assert_eq!(order(&b), ["x", "y", "m"]);
     }
 }
