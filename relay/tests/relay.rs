@@ -508,6 +508,12 @@ async fn resends_are_stored_once() {
 
     let (_c, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
     assert_eq!(strokes.len(), 2);
+
+    // Crumpled since: a resend is told to take it away, not that it is on this sheet.
+    a.send(json!({"t": "cr"})).await;
+    a.expect("cr").await;
+    a.send(json!({"t": "e", "id": "x1", "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+    assert_eq!(a.expect("u").await["id"], "x1");
     s.stop().await;
 }
 

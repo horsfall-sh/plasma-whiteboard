@@ -924,12 +924,12 @@ impl Room {
             return;
         }
         if st.ids.contains(&id) {
-            // A resend. Confirm it again if it is still this layer's stroke.
+            // A resend. Confirm it again only if it is still this layer's stroke on the sheet
+            // in use. Crumpled onto the shelf, deleted with its layer or undone, it is not on
+            // the author's sheet any more: `u` takes their copy away instead of leaving a ghost.
             drop_live(self);
-            // It may have been crumpled onto the shelf since; that still counts.
-            let held = st.strokes.iter().chain(st.shelf.iter().flat_map(|s| s.strokes.iter()));
-            match held.rev().find(|s| s.id == id) {
-                Some(s) if s.layer == peer.layer => {
+            match st.strokes.iter().rev().find(|s| s.id == id) {
+                Some(s) if s.layer == peer.layer && s.state == LIVE => {
                     // Not before the first copy is committed.
                     let ok = self.ok_once_stored(conn, &id, s.seq);
                     db.ack(&self.link, ok);
