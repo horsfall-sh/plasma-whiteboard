@@ -1561,6 +1561,12 @@ impl net::Host for Page {
         self.ls_remove(SHARING_KEY);
     }
 
+    fn writer_done(&mut self) {
+        if let Some(r) = self.lock_release.take() {
+            let _ = r.call0(&JsValue::NULL);
+        }
+    }
+
     fn share_lost(&mut self) {
         // LOCAL_KEY still holds the whole private board: nothing was forgotten yet
         self.ls_remove(SHARING_KEY);
@@ -2164,9 +2170,7 @@ fn share_now() {
             a.page.ls_set(SHARING_KEY, edit);
             replace_path(&format!("/b/{edit}"));
             reset();
-            if let Some(r) = a.page.lock_release.take() {
-                let _ = r.call0(&JsValue::NULL);
-            }
+            // the writer's lock is kept until the share has made its last write (G5)
             a.start(edit);
         });
     });

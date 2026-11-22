@@ -98,6 +98,10 @@ pub trait Host {
     /// `LOCAL_KEY` as it is, and go back to the private board at `/` (council H2).
     fn share_lost(&mut self);
 
+    /// The share is done with the private board (its last write is made, or it is lost):
+    /// let another tab take the writer's lock now and not before (council G5).
+    fn writer_done(&mut self);
+
     /// `onSheetView` after its checks: draw the preview of sheet `k`, if it is still on the shelf.
     fn sheet_view(&mut self, k: i64, a: Vec<Item>);
     /// `onPing` after its check: show it.
@@ -490,6 +494,7 @@ impl Conn {
             self.uploading = false;
             let kept = std::mem::take(&mut self.kept);
             h.forget_local(&kept);
+            h.writer_done();
             if !kept.is_empty() {
                 let n = kept.len();
                 let s = if n == 1 { "stroke was" } else { "strokes were" };
@@ -589,6 +594,7 @@ impl Conn {
             self.stopped = true;
             self.uploading = false;
             self.kept.clear();
+            h.writer_done();
             h.share_lost();
             return;
         }
@@ -834,6 +840,9 @@ mod tests {
         fn share_lost(&mut self) {
             self.log.push("share_lost".into());
         }
+        fn writer_done(&mut self) {
+            self.log.push("writer_done".into());
+        }
         fn forget_local(&mut self, kept: &[Item]) {
             self.log.push("forget_local".into());
             self.log.push(format!("kept {}", kept.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(",")));
@@ -1037,7 +1046,7 @@ mod tests {
         assert!(h.take().is_empty(), "nothing left: no more bites");
         c.frame(&mut h, &mut inp, 1, r#"{"t":"ok","id":"s249","q":249}"#);
         assert!(!c.uploading);
-        assert_eq!(h.take(), ["forget_local", "kept "]);
+        assert_eq!(h.take(), ["forget_local", "kept ", "writer_done"]);
 
         // a bite for a socket that has gone does nothing
         h.b.pending.insert("late".into(), it("late", 2, None));
@@ -1309,7 +1318,7 @@ mod tests {
             h.take();
             c.frame(&mut h, &mut inp, c.sock, &format!(r#"{{"t":"err","code":"{code}"}}"#));
             let log = h.take();
-            assert_eq!(log, ["share_lost"], "{code}");
+            assert_eq!(log, ["writer_done", "share_lost"], "{code}");
             assert!(!c.uploading && c.stopped, "{code}");
         }
         // a plain link to a gone board still says so
@@ -1386,6 +1395,30 @@ mod tests {
         c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
         assert!(!c.uploading);
         assert!(h.take().contains(&"forget_local".to_string()));
+    }
+
+    #[test]
+    fn the_writer_lock_is_held_until_the_share_is_done_with_the_private_board() {
+        // council pass 2 G5: let go at the start, a waiting tab writes the private board
+        // while the share still has its last write to make
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = online(&mut h, &mut inp, false);
+        c.uploading = true;
+        h.b.pending.insert("a".into(), it("a", 2, None));
+        h.b.insert(it("a", 2, None));
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        assert!(!h.take().contains(&"writer_done".to_string()), "held while a is still out");
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ok","id":"a","q":1}"#);
+        let log = h.take();
+        let at = |w: &str| log.iter().position(|l| l == w);
+        assert!(at("forget_local").is_some() && at("writer_done") > at("forget_local"), "{log:?}");
+
+        // a share whose board has gone lets it go too, on its way back to `/`
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = online(&mut h, &mut inp, false);
+        c.uploading = true;
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"err","code":"gone"}"#);
+        assert_eq!(h.take().iter().filter(|l| *l == "writer_done").count(), 1);
     }
 
     #[test]
