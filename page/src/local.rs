@@ -87,6 +87,54 @@ pub enum Save {
     /// Another tab wrote the private board since this one last read or wrote it: writing
     /// now would throw its work away. Load it again instead ([`Local::load`]).
     Elsewhere,
+    /// What is stored could not be read ([`Local::damaged`]). Writing would replace it with
+    /// this board, so nothing is written until the user keeps or discards it.
+    Damaged,
+}
+
+/// `text` with every unpaired surrogate escape (`\ud83d` with no low half after it, or a
+/// lone low half) replaced by `\ufffd`. `JSON.stringify` writes them and `JSON.parse` reads
+/// them, but they are not Unicode, so serde_json refuses the whole document.
+fn mend_surrogates(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("\\u") {
+        return text.into();
+    }
+    fn unit(b: &[u8], i: usize) -> Option<u16> {
+        if b.get(i) != Some(&b'\\') || b.get(i + 1) != Some(&b'u') {
+            return None;
+        }
+        u16::from_str_radix(std::str::from_utf8(b.get(i + 2..i + 6)?).ok()?, 16).ok()
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut from) = (0, 0);
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // in JSON a backslash only starts an escape, so pairs are consumed from the left
+        let Some(u) = unit(b, i) else {
+            i += 2;
+            continue;
+        };
+        let paired = (0xd800..0xdc00).contains(&u) && unit(b, i + 6).is_some_and(|l| (0xdc00..0xe000).contains(&l));
+        if paired {
+            i += 12;
+        } else if (0xd800..0xe000).contains(&u) {
+            out.push_str(&text[from..i]);
+            out.push_str("\\ufffd");
+            i += 6;
+            from = i;
+        } else {
+            i += 6;
+        }
+    }
+    if from == 0 {
+        return text.into();
+    }
+    out.push_str(&text[from..]);
+    out.into()
 }
 
 /// What a tab knows of the stored text: a hash of it, or `None` for nothing stored. FNV-1a,
@@ -104,11 +152,13 @@ pub struct Local {
     saved_sig: String,
     /// The stored text as this tab last read or wrote it ([`stamp`]).
     seen: Option<u64>,
+    /// Something was stored that could not be read; see [`Local::damaged`].
+    damaged: bool,
 }
 
 impl Default for Local {
     fn default() -> Local {
-        Local { shelf: vec![], next_k: 1, saved_sig: String::new(), seen: None }
+        Local { shelf: vec![], next_k: 1, saved_sig: String::new(), seen: None, damaged: false }
     }
 }
 
@@ -138,14 +188,20 @@ impl Local {
     /// A stored item without a string `id` or an array `pts`, or with an id already loaded, is
     /// skipped, as the JavaScript page skipped it. A field of the wrong type in a kept item
     /// becomes its default ([`Item::from_value`]); the JavaScript page never wrote one.
+    ///
+    /// Stored text that is not the page's `{ v: 1, a: [...] }` loads nothing and leaves the
+    /// state [`damaged`](Local::damaged), where the JavaScript page started a blank board and
+    /// wrote it over what was there.
     pub fn load(stored: Option<&str>, board: &mut Board) -> (Local, Vec<String>) {
         let mut st = Local { seen: stamp(stored), ..Local::default() };
         let mut mine = vec![];
-        let d: Value = match stored.and_then(|s| serde_json::from_str(s).ok()) {
-            Some(d) => d,
-            None => return (st, mine),
+        let Some(text) = stored.filter(|s| !s.is_empty()) else { return (st, mine) };
+        let d = serde_json::from_str::<Value>(&mend_surrogates(text)).ok();
+        let a = d.as_ref().filter(|d| d.get("v").and_then(Value::as_f64) == Some(1.0)).and_then(|d| d.get("a")?.as_array());
+        let (Some(d), Some(a)) = (d.as_ref(), a) else {
+            st.damaged = true;
+            return (st, mine);
         };
-        let Some(a) = d.get("a").and_then(Value::as_array) else { return (st, mine) };
         for raw in a {
             if !raw.get("pts").is_some_and(Value::is_array) || raw.get("id").and_then(Value::as_str).is_none() {
                 continue;
@@ -209,6 +265,9 @@ impl Local {
     /// holds now. Two tabs on `/` share it; one that wrote since this one last read it wins,
     /// and this one is told to load again rather than write over it.
     pub fn save(&self, board: &Board, stored: Option<&str>) -> Save {
+        if self.damaged {
+            return Save::Damaged;
+        }
         let sig = self.sig(board);
         if sig == self.saved_sig {
             return Save::Unchanged;
@@ -217,6 +276,18 @@ impl Local {
             return Save::Elsewhere;
         }
         Save::Write { text: self.text(board), sig }
+    }
+
+    /// Whether what is stored could not be read when this tab loaded it. Until
+    /// [`Local::discard_damaged`] nothing is saved, so the stored text stays as it was for the
+    /// user to keep (the caller offers it as a download) or discard.
+    pub fn damaged(&self) -> bool {
+        self.damaged
+    }
+
+    /// The user chose to start over: the next save writes this board over what was stored.
+    pub fn discard_damaged(&mut self) {
+        self.damaged = false;
     }
 
     /// Whether `stored` (what [`LOCAL_KEY`] holds now, say on a `storage` event) was written
@@ -371,17 +442,49 @@ mod tests {
     }
 
     #[test]
-    fn nothing_stored_or_garbage_is_a_blank_board() {
-        for s in [None, Some(""), Some("{"), Some("null"), Some(r#"{"a":{}}"#), Some("[1]")] {
+    fn nothing_stored_is_a_blank_board() {
+        for s in [None, Some("")] {
             let mut b = Board::default();
             let (st, mine) = Local::load(s, &mut b);
             let blank = Local { seen: stamp(s), ..Local::default() };
             assert_eq!((st, mine.len(), b.strokes.len()), (blank, 0, 0), "{s:?}");
         }
-        // with no `a`, the shelf is not read either, as the JavaScript page returned early
-        let no_a = r#"{"shelf":[{"k":4,"a":[]}],"k":9}"#;
-        let (st, _) = Local::load(Some(no_a), &mut Board::default());
-        assert_eq!(st, Local { seen: stamp(Some(no_a)), ..Local::default() });
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_kept_until_the_user_decides() {
+        let no_a = r#"{"v":1,"shelf":[{"k":4,"a":[]}],"k":9}"#;
+        let no_v = r#"{"a":[{"id":"t","pts":[0,0,0.5]}]}"#;
+        let v2 = r#"{"v":2,"a":[]}"#;
+        let bad_escape = r#"{"v":1,"a":[{"id":"t","pts":[0],"txt":"\x"}]}"#;
+        for s in ["{", "null", "[1]", r#"{"v":1,"a":{}}"#, no_a, no_v, v2, bad_escape] {
+            let mut b = Board::default();
+            let (mut st, mine) = Local::load(Some(s), &mut b);
+            assert!(st.damaged(), "{s}");
+            assert_eq!((mine.len(), b.strokes.len(), st.shelf.len()), (0, 0, 0), "{s}");
+            b.insert(Item { id: "new".into(), l: Some(1), q: None, c: String::new(), w: 1.0, pts: vec![], txt: None });
+            assert_eq!(st.save(&b, Some(s)), Save::Damaged, "{s}: never written over");
+            st.discard_damaged();
+            assert!(matches!(st.save(&b, Some(s)), Save::Write { .. }), "{s}: the user chose to start over");
+        }
+    }
+
+    #[test]
+    fn a_lone_surrogate_the_js_page_wrote_still_loads() {
+        // JSON.stringify("\ud83d") is "\ud83d", which JSON.parse reads back
+        let s = r#"{"v":1,"a":[{"id":"t","pts":[0,0,0.5],"txt":"\ud83d"}]}"#;
+        let mut b = Board::default();
+        let (st, mine) = Local::load(Some(s), &mut b);
+        assert!(!st.damaged());
+        assert_eq!(mine, ["t"]);
+        assert_eq!(b.strokes[0].txt.as_deref(), Some("\u{fffd}"));
+        // a lone low half, a pair split by text, an escaped backslash before a u, and a real pair
+        let s = r#"{"v":1,"a":[{"id":"t","pts":[0],"txt":"a\udc00b\ud83dx\ude00\\ud83d\ud83d\ude00"}]}"#;
+        let mut b = Board::default();
+        let (st, _) = Local::load(Some(s), &mut b);
+        assert!(!st.damaged());
+        assert_eq!(b.strokes[0].txt.as_deref(), Some("a\u{fffd}b\u{fffd}x\u{fffd}\\ud83d\u{1f600}"));
+        assert_eq!(mend_surrogates(JS_WROTE), JS_WROTE, "well-formed text is untouched");
     }
 
     #[test]
