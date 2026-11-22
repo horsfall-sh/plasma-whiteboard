@@ -91,8 +91,9 @@ pub trait Host {
     /// `showMessage`.
     fn message(&mut self, text: &str, then: Then);
     /// The private board is on the relay now: write [`crate::local::Local::after_share`] to
-    /// `LOCAL_KEY`, which keeps the shelf, and remove `SHARING_KEY`.
-    fn forget_local(&mut self);
+    /// `LOCAL_KEY`, which keeps the shelf, and remove `SHARING_KEY`. `kept` are the items the
+    /// relay refused (a full board or storage): they stay on the private board, never lost.
+    fn forget_local(&mut self, kept: &[Item]);
 
     /// `onSheetView` after its checks: draw the preview of sheet `k`, if it is still on the shelf.
     fn sheet_view(&mut self, k: i64, a: Vec<Item>);
@@ -144,6 +145,8 @@ pub struct Conn {
     asked: HashSet<i64>,
     /// Items still to upload, by id, and the socket the upload runs on.
     todo: VecDeque<String>,
+    /// Items of the board being shared that the relay refused: they stay private.
+    kept: Vec<Item>,
 }
 
 impl Default for Conn {
@@ -166,6 +169,7 @@ impl Default for Conn {
             uploading: false,
             asked: HashSet::new(),
             todo: VecDeque::new(),
+            kept: vec![],
         }
     }
 }
@@ -317,6 +321,11 @@ impl Conn {
                 self.upload_check(h);
             }
             In::No { id, m } => {
+                if self.uploading {
+                    if let Some(i) = h.board().pending.get(&id) {
+                        self.kept.push(i.clone());
+                    }
+                }
                 if h.board().refused(&id) {
                     self.removed(h, &[id]);
                 }
@@ -471,11 +480,18 @@ impl Conn {
     }
 
     /// The one place a share finishes: every item of the board that was private has been
-    /// answered (`ok`, `no` or `u`), so drop this browser's copy of them.
+    /// answered (`ok`, `no` or `u`), so drop this browser's copy of them, except the ones
+    /// the relay refused: those stay on the private board, and the user is told (council H1).
     fn upload_check(&mut self, h: &mut impl Host) {
         if self.uploading && self.ready && h.board().pending.is_empty() {
             self.uploading = false;
-            h.forget_local();
+            let kept = std::mem::take(&mut self.kept);
+            h.forget_local(&kept);
+            if !kept.is_empty() {
+                let n = kept.len();
+                let s = if n == 1 { "stroke was" } else { "strokes were" };
+                h.toast(&format!("{n} {s} not shared. They are kept on your private board."), None, 10000);
+            }
         }
     }
 
@@ -611,6 +627,7 @@ impl Conn {
             return false;
         }
         self.uploading = true;
+        self.kept.clear();
         true
     }
 
@@ -631,6 +648,7 @@ impl Conn {
     pub fn resume_share(&mut self) {
         self.local = false;
         self.uploading = true;
+        self.kept.clear();
     }
 }
 
@@ -799,8 +817,9 @@ mod tests {
         fn message(&mut self, text: &str, then: Then) {
             self.log.push(format!("message {text} {then:?}"));
         }
-        fn forget_local(&mut self) {
+        fn forget_local(&mut self, kept: &[Item]) {
             self.log.push("forget_local".into());
+            self.log.push(format!("kept {}", kept.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(",")));
         }
         fn sheet_view(&mut self, k: i64, a: Vec<Item>) {
             self.log.push(format!("sheet {k} {}", a.len()));
@@ -1001,7 +1020,7 @@ mod tests {
         assert!(h.take().is_empty(), "nothing left: no more bites");
         c.frame(&mut h, &mut inp, 1, r#"{"t":"ok","id":"s249","q":249}"#);
         assert!(!c.uploading);
-        assert_eq!(h.take(), ["forget_local"]);
+        assert_eq!(h.take(), ["forget_local", "kept "]);
 
         // a bite for a socket that has gone does nothing
         h.b.pending.insert("late".into(), it("late", 2, None));
@@ -1257,6 +1276,41 @@ mod tests {
         let mut r = Conn::default();
         r.resume_share();
         assert!(!r.local && r.uploading);
+    }
+
+    /// Council H1: a refused item of a share is kept on the private board, never dropped, and
+    /// the user is told. On 5884277 the share finished with an empty private board.
+    #[test]
+    fn a_share_keeps_refused_items_on_the_private_board() {
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = online(&mut h, &mut inp, false);
+        c.local = true;
+        assert!(c.share_begin());
+        c.shared();
+        for id in ["a", "b", "c"] {
+            h.b.pending.insert(id.into(), it(id, 2, None));
+            h.b.insert(it(id, 2, None));
+        }
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ok","id":"a","q":1}"#);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"no","id":"b","m":"board full"}"#);
+        h.take();
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"no","id":"c","m":"board full"}"#);
+        let log = h.take();
+        assert!(log.contains(&"forget_local".to_string()), "{log:?}");
+        assert!(log.contains(&"kept b,c".to_string()), "b and c stay private: {log:?}");
+        assert!(log.iter().any(|l| l.starts_with("toast 2 strokes were not shared")), "{log:?}");
+
+        // the next share starts with nothing kept
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        c = online(&mut h, &mut inp, false);
+        c.kept.push(it("old", 2, None));
+        c.local = true;
+        assert!(c.share_begin());
+        c.shared();
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        let log = h.take();
+        assert!(log.contains(&"kept ".to_string()) && !log.iter().any(|l| l.starts_with("toast")), "{log:?}");
     }
 
     #[test]

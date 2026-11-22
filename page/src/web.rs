@@ -1549,8 +1549,16 @@ impl net::Host for Page {
         self.show_message(text, then);
     }
 
-    fn forget_local(&mut self) {
-        let text = self.local.after_share();
+    fn forget_local(&mut self, kept: &[Item]) {
+        let text = if kept.is_empty() {
+            self.local.after_share()
+        } else {
+            let mut b = Board::default();
+            for i in kept {
+                b.insert(i.clone());
+            }
+            self.local.text(&b)
+        };
         self.ls_set(LOCAL_KEY, &text);
         self.ls_remove(SHARING_KEY);
     }
