@@ -621,7 +621,8 @@ impl Input {
             }
             let b = h.bbox(&s);
             if x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3] {
-                let (ax, ay) = (s.pts[0], s.pts[1]);
+                // a text item read from damaged storage may carry fewer than two numbers
+                let [ax, ay] = [s.pts.first(), s.pts.get(1)].map(|v| v.copied().unwrap_or(0.0));
                 return self.open_editor(h, ax, ay, Some(s));
             }
         }
@@ -1146,6 +1147,20 @@ mod tests {
         i.down(&mut h, &mouse(200.0, 200.0));
         i.end(&mut h, &mouse(200.0, 200.0), true);
         assert_eq!(i.editor.as_ref().unwrap().old.as_ref().unwrap().id, "mine");
+    }
+
+    #[test]
+    fn a_short_text_item_opens_without_a_panic() {
+        // council pass 2 G6: a text item with one number, as damaged storage can hold
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        h.pen.tool = Tool::Text;
+        let (x, _) = h.view.board_point(200.0, 200.0);
+        h.board.insert(Item { id: "short".into(), l: Some(1), q: Some(1.0), c: "#111111".into(), w: 10.0, pts: vec![x - 0.001], txt: Some("t".into()) });
+        i.down(&mut h, &mouse(200.0, 200.0));
+        i.end(&mut h, &mouse(200.0, 200.0), true);
+        let ed = i.editor.as_ref().unwrap();
+        assert_eq!(ed.old.as_ref().unwrap().id, "short");
+        assert_eq!((ed.x, ed.y), (x - 0.001, 0.0));
     }
 
     #[test]
