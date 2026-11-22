@@ -42,6 +42,17 @@ protocol is unchanged, so the relay serves old and new pages alike.
 - F28: a reconnect snapshot leaves my strokes alone (test).
 - F29: crumpling a blank private board does nothing.
 
+From the council's pass 2:
+
+- H1: a share keeps the strokes the relay refused on the private board.
+- H2: a share cut short to a board that has since gone returns to the private board at `/`.
+- H3: only the tab that writes the private board can share it, and a share's last write keeps
+  the guards for a damaged or newer board.
+- H4: every snapshot that a slow join keeps alive is charged to the memory budget; a join that
+  cannot be charged is told the relay is busy.
+- H5: one address may hold only a sixteenth of storage, refilled over the board lifetime.
+- The relay unit restarts on any exit (`Restart=always`).
+
 ### Waived
 
 - F7 (relay memory under load): waived by operator, 2026-11-22. The relay unit restarts
@@ -52,7 +63,7 @@ protocol is unchanged, so the relay serves old and new pages alike.
 
 ### Known limitations / deferred
 
-From the council's pass 1. Each is minor or a nit and stays open in this release.
+From the council's passes 1 and 2. Each is minor or a nit and stays open in this release.
 
 - F27a-c: rated negligible by the council; left as they are.
 - F27f: PROTOCOL.md has drifted from the code in places; a documentation pass is deferred.
@@ -64,6 +75,9 @@ From the council's pass 1. Each is minor or a nit and stays open in this release
 - F27l: the deploy has no SELinux step (partly refuted by the council); deferred.
 - F27m: rated plausible but generic by the council; no change made.
 - F27n: edit keys of boards a browser has opened build up in its localStorage; deferred.
+- H5: the per-address storage share is kept in memory, so a relay restart refills it.
+- The people panel can cover the people button on a narrow screen, as in v0.1.0; the panel's
+  Close button shuts it.
 - F30: a null in a number list on the wire reads as 0, as the JavaScript page did; this is
   documented in the code and kept.
 
