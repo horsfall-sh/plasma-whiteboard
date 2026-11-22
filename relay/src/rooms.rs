@@ -284,7 +284,7 @@ mod tests {
             let j = room.join(n as u64 + 1, Role::Edit, Some(who(n)), Some("vk"), &db, || true).unwrap();
             if n == 0 {
                 // Layer 1 holds a stroke; layer 2 stays on (its tab is open).
-                let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
+                let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))), Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
                 let s = r##"{"t":"s","id":"keep","c":"#112233","w":0.004,"pts":[0.1,0.1,0.5]}"##;
                 room.handle(j.peer, s, &db, &mut b);
             }
@@ -320,7 +320,7 @@ mod tests {
         let (room, mut ed) =
             rooms.join(&db, a, |r| r.join(1, Role::Edit, Some([1; 32]), Some("vk"), &db, || true)).await.unwrap();
         ed.hold = None; // its snapshot is sent, as catch_up does
-        let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
+        let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))), Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
         let pts: Vec<String> = (0..3000).map(|i| format!("0.{:05},0.25,0.5", i)).collect();
         let draw = |id: &str, b: &mut Budget| {
             let s = format!(r##"{{"t":"s","id":"{id}","c":"#112233","w":0.004,"pts":[{}]}}"##, pts.join(","));

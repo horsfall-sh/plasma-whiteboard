@@ -100,11 +100,26 @@ struct Inner {
     conns: HashMap<IpKey, u32>,
     /// Kept after the last connection closes, so reconnecting does not refill it.
     outs: HashMap<IpKey, Arc<Mutex<Bucket>>>,
+    /// Bytes of strokes the address may still store; kept like `outs`.
+    stores: HashMap<IpKey, Arc<Mutex<Bucket>>>,
 }
 
-#[derive(Default, Clone)]
+/// What one address may store, as a share of the storage quota: it can hold at most this
+/// much of it at a time, so no one address can fill storage for everyone (council H5).
+pub const STORE_SHARE: u64 = 16;
+
+#[derive(Clone)]
 pub struct IpLimits {
     inner: Arc<Mutex<Inner>>,
+    /// Each address's storage bucket: capacity in bytes and refill per second.
+    store: (f64, f64),
+}
+
+impl Default for IpLimits {
+    /// The default quota, refilled over the default 90 days.
+    fn default() -> IpLimits {
+        IpLimits::new(crate::db::MAX_DB, 90)
+    }
 }
 
 /// Holds one connection slot for an address; frees it when dropped.
@@ -112,12 +127,18 @@ pub struct IpGuard {
     inner: Arc<Mutex<Inner>>,
     key: IpKey,
     out: Arc<Mutex<Bucket>>,
+    store: Arc<Mutex<Bucket>>,
 }
 
 impl IpGuard {
     /// The address's budget for replies it asked for.
     pub fn out(&self) -> Arc<Mutex<Bucket>> {
         self.out.clone()
+    }
+
+    /// A new connection's budgets, sharing the address's reply and storage buckets.
+    pub fn budget(&self) -> Budget {
+        Budget::new(self.out.clone(), self.store.clone())
     }
 
     /// Whether the address may be given another new contributor layer.
@@ -133,11 +154,13 @@ pub struct Budget {
     pub heavy: Bucket,
     /// Bytes of requested replies, shared by the address's connections.
     pub out: Arc<Mutex<Bucket>>,
+    /// Bytes of strokes the address may still store, shared by its connections (H5).
+    pub store: Arc<Mutex<Bucket>>,
 }
 
 impl Budget {
-    pub fn new(out: Arc<Mutex<Bucket>>) -> Budget {
-        Budget { heavy: Bucket::new(12.0, 0.5), out }
+    pub fn new(out: Arc<Mutex<Bucket>>, store: Arc<Mutex<Bucket>>) -> Budget {
+        Budget { heavy: Bucket::new(12.0, 0.5), out, store }
     }
 
     /// Take `n` bytes from the reply budget.
@@ -159,6 +182,15 @@ impl Drop for IpGuard {
 }
 
 impl IpLimits {
+    /// Limits for storage of `max_db` bytes whose boards are kept `ttl_days` after they are
+    /// last opened. Each address may hold a [`STORE_SHARE`]th of it, refilled over the TTL
+    /// (90 days when boards are kept for ever).
+    pub fn new(max_db: u64, ttl_days: u32) -> IpLimits {
+        let cap = (max_db / STORE_SHARE) as f64;
+        let days = if ttl_days == 0 { 90 } else { ttl_days };
+        IpLimits { inner: Arc::default(), store: (cap, cap / (f64::from(days) * 86_400.0)) }
+    }
+
     pub fn may_create(&self, ip: IpAddr) -> bool {
         let mut g = self.inner.lock().unwrap();
         g.creates
@@ -179,7 +211,9 @@ impl IpLimits {
         }
         *g.conns.entry(k).or_insert(0) += 1;
         let out = g.outs.entry(k).or_insert_with(|| Arc::new(Mutex::new(Bucket::new(OUT_BURST, OUT_PER_SEC)))).clone();
-        Ok(IpGuard { inner: self.inner.clone(), key: k, out })
+        let (cap, per_sec) = self.store;
+        let store = g.stores.entry(k).or_insert_with(|| Arc::new(Mutex::new(Bucket::new(cap, per_sec)))).clone();
+        Ok(IpGuard { inner: self.inner.clone(), key: k, out, store })
     }
 
     /// Forget addresses whose bucket has refilled.
@@ -188,14 +222,32 @@ impl IpLimits {
         g.creates.retain(|_, b| !b.full());
         g.joins.retain(|_, b| !b.full());
         g.layers.retain(|_, b| !b.full());
-        let Inner { conns, outs, .. } = &mut *g;
+        let Inner { conns, outs, stores, .. } = &mut *g;
         outs.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
+        stores.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Council H5: one address holds at most its share of storage, across its connections,
+    /// a reconnect and a prune; another address has its own.
+    #[test]
+    fn an_address_stores_at_most_its_share() {
+        let l = IpLimits::new(16 * 1000, 90);
+        let a: IpAddr = "2001:db8:1::1".parse().unwrap();
+        let a2: IpAddr = "2001:db8:1:ff::2".parse().unwrap(); // the same /56
+        let b: IpAddr = "2001:db8:2::1".parse().unwrap();
+        let (g1, g2) = (l.connect(a).unwrap(), l.connect(a2).unwrap());
+        assert!(g1.budget().store.lock().unwrap().take_n(600.0));
+        assert!(!g2.budget().store.lock().unwrap().take_n(600.0), "shared by the address's connections");
+        drop((g1, g2));
+        l.prune();
+        assert!(!l.connect(a).unwrap().budget().store.lock().unwrap().take_n(600.0), "not refilled by reconnecting");
+        assert!(l.connect(b).unwrap().budget().store.lock().unwrap().take_n(1000.0), "another address has its own");
+    }
 
     #[test]
     fn create_limit_is_per_address() {
@@ -250,15 +302,15 @@ mod tests {
         let l = IpLimits::default();
         let ip = IpAddr::from([198, 51, 100, 2]);
         let (g1, g2) = (l.connect(ip).unwrap(), l.connect(ip).unwrap());
-        let (mut a, mut b) = (Budget::new(g1.out()), Budget::new(g2.out()));
+        let (mut a, mut b) = (g1.budget(), g2.budget());
         let half = (OUT_BURST / 2.0) as usize;
         assert!(a.send(half) && b.send(half));
         assert!(!a.send(64 * 1024) && !b.send(64 * 1024), "both connections drew on one budget");
         drop((a, b, g1, g2));
         l.prune();
-        let mut c = Budget::new(l.connect(ip).unwrap().out());
+        let mut c = l.connect(ip).unwrap().budget();
         assert!(!c.send(64 * 1024), "a new connection does not get a fresh budget");
         let other = IpAddr::from([198, 51, 100, 3]);
-        assert!(Budget::new(l.connect(other).unwrap().out()).send(half));
+        assert!(l.connect(other).unwrap().budget().send(half));
     }
 }

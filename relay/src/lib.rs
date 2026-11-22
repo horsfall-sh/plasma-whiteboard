@@ -278,7 +278,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
         Err(Refused::Busy) => return bye(sock, "busy", "the server is at capacity; try again later").await,
     };
 
-    let reason = relay(&app, &room, &mut sock, &mut joined, Budget::new(guard.out())).await;
+    let reason = relay(&app, &room, &mut sock, &mut joined, guard.budget()).await;
 
     room.leave(joined.peer);
     app.rooms.left(room);
@@ -453,11 +453,12 @@ pub async fn serve(
     let db = Db::open_with(&cfg.db_path, cfg.max_db).map_err(std::io::Error::other)?;
     let grace = cfg.unload_grace;
     let (max_loaded, max_rooms) = (cfg.max_loaded, cfg.max_rooms);
+    let ips = IpLimits::new(cfg.max_db, cfg.ttl_days);
     let app = Arc::new(App {
         cfg,
         db: db.clone(),
         rooms: Rooms::new(grace, memory::Memory::new(max_loaded, max_rooms)),
-        ips: IpLimits::default(),
+        ips,
         next_conn: AtomicU64::new(1),
         assets: assets(),
     });

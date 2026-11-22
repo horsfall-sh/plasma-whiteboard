@@ -1142,23 +1142,33 @@ async fn a_stroke_past_the_shared_memory_budget_is_refused_and_undo_gives_room_b
 
 #[tokio::test]
 async fn storage_near_its_quota_refuses_new_strokes_and_boards_without_losing_any() {
-    // A quota a few dozen pages past what the empty schema takes.
-    let s = start_with(Config { max_db: 160 * 1024, ..config(&temp_db("quota")) }).await;
+    // A quota a few dozen pages past what the empty schema takes. Council H5: one address
+    // may hold only a share of it, so it takes several to reach the quota.
+    let s = start_with(Config { max_db: 160 * 1024, trust_proxy: true, ..config(&temp_db("quota")) }).await;
     let (edit, view) = new_board(&s.addr).await;
-    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
     let pts: Vec<f64> = (0..201).map(|i| f64::from(i % 50) / 100.0).collect();
-    let mut stored = 0;
-    let refused = loop {
-        a.send(json!({"t": "s", "id": format!("a{stored}"), "c": "#112233", "w": 0.004, "pts": pts})).await;
-        let m = a.next().await;
-        if m["t"] == "no" {
-            break m;
+    let (mut stored, mut addresses, mut own_limit) = (0, 0, 0);
+    let refused = 'all: loop {
+        addresses += 1;
+        assert!(addresses < 100, "the quota never said no");
+        // documentation addresses, one /56 each
+        let mut a = join_from(&s.addr, &edit, WHO_A, &format!("2001:db8:{addresses:x}::1")).await;
+        loop {
+            a.send(json!({"t": "s", "id": format!("a{stored}"), "c": "#112233", "w": 0.004, "pts": pts})).await;
+            let m = a.next().await;
+            if m["t"] == "no" {
+                if m["m"].as_str().unwrap().contains("your network") {
+                    own_limit += 1;
+                    continue 'all;
+                }
+                break 'all m;
+            }
+            assert_eq!(m["t"], "ok", "a stroke is stored or refused, never lost: {m}");
+            stored += 1;
         }
-        assert_eq!(m["t"], "ok", "a stroke is stored or refused, never lost: {m}");
-        stored += 1;
-        assert!(stored < 2000, "the quota never said no");
     };
     assert!(stored > 0, "{refused}");
+    assert!(own_limit >= 2, "one address cannot fill storage for everyone: {own_limit} of {addresses}");
     assert!(refused["m"].as_str().unwrap().contains("storage"), "{refused}");
     assert_eq!(http(&s.addr, "POST", "/api/boards").await.0, 503, "no new boards either");
     // Every stroke told ok is there.

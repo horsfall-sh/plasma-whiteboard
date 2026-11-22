@@ -775,7 +775,7 @@ impl Room {
                         }
                     },
                 };
-                self.commit(&mut st, peer, id, c, w, pts, None, was_live, db);
+                self.commit(&mut st, peer, id, c, w, pts, None, was_live, db, &budget.store);
             }
             In::Stroke { id, c, w, pts, txt } => {
                 if !valid_id(&id) {
@@ -800,7 +800,7 @@ impl Room {
                 };
                 match (pts, txt) {
                     (Some(pts), Ok(txt)) if valid_color(&c) && valid_width(w) => {
-                        self.commit(&mut st, peer, id, c, w, pts, txt, was_live, db);
+                        self.commit(&mut st, peer, id, c, w, pts, txt, was_live, db, &budget.store);
                     }
                     _ => {
                         if was_live {
@@ -965,6 +965,7 @@ impl Room {
         txt: Option<String>,
         was_live: bool,
         db: &Db,
+        store: &Mutex<Bucket>,
     ) {
         let conn = peer.conn;
         let drop_live = |room: &Room| {
@@ -1008,11 +1009,18 @@ impl Room {
             self.only(conn, refusal(&id, "this board is full"));
             return;
         }
+        // The address's share of storage (H5), taken before anything is kept or sent on.
+        if !store.lock().unwrap().take_n(size as f64) {
+            drop_live(self);
+            self.only(conn, refusal(&id, "too much has been stored from your network lately; try again later"));
+            return;
+        }
         let seq = st.next_seq;
         st.next_seq += 1;
         let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
         let more = st.bytes + json.len();
         if !self.resize(st, more) {
+            store.lock().unwrap().give(size as f64);
             drop_live(self);
             self.only(conn, refusal(&id, "the server is out of memory for strokes; try again later"));
             return;
