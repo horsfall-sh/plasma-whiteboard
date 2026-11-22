@@ -84,6 +84,15 @@ pub enum Save {
     Unchanged,
     /// Write this to [`LOCAL_KEY`], then call [`Local::saved`] with whether it was written.
     Write { sig: String, text: String },
+    /// Another tab wrote the private board since this one last read or wrote it: writing
+    /// now would throw its work away. Load it again instead ([`Local::load`]).
+    Elsewhere,
+}
+
+/// What a tab knows of the stored text: a hash of it, or `None` for nothing stored. FNV-1a,
+/// so it is the same on every build.
+fn stamp(stored: Option<&str>) -> Option<u64> {
+    stored.map(|t| t.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)))
 }
 
 /// The private board's own state: the shelf and the next sheet number. The items are on the
@@ -93,11 +102,13 @@ pub struct Local {
     pub shelf: Vec<Sheet>,
     pub next_k: i64,
     saved_sig: String,
+    /// The stored text as this tab last read or wrote it ([`stamp`]).
+    seen: Option<u64>,
 }
 
 impl Default for Local {
     fn default() -> Local {
-        Local { shelf: vec![], next_k: 1, saved_sig: String::new() }
+        Local { shelf: vec![], next_k: 1, saved_sig: String::new(), seen: None }
     }
 }
 
@@ -128,7 +139,7 @@ impl Local {
     /// skipped, as the JavaScript page skipped it. A field of the wrong type in a kept item
     /// becomes its default ([`Item::from_value`]); the JavaScript page never wrote one.
     pub fn load(stored: Option<&str>, board: &mut Board) -> (Local, Vec<String>) {
-        let mut st = Local::default();
+        let mut st = Local { seen: stamp(stored), ..Local::default() };
         let mut mine = vec![];
         let d: Value = match stored.and_then(|s| serde_json::from_str(s).ok()) {
             Some(d) => d,
@@ -194,20 +205,32 @@ impl Local {
         .stringify()
     }
 
-    /// `saveLocal`, first half: what to write, if anything.
-    pub fn save(&self, board: &Board) -> Save {
+    /// `saveLocal`, first half: what to write, if anything. `stored` is what [`LOCAL_KEY`]
+    /// holds now. Two tabs on `/` share it; one that wrote since this one last read it wins,
+    /// and this one is told to load again rather than write over it.
+    pub fn save(&self, board: &Board, stored: Option<&str>) -> Save {
         let sig = self.sig(board);
         if sig == self.saved_sig {
             return Save::Unchanged;
         }
+        if self.elsewhere(stored) {
+            return Save::Elsewhere;
+        }
         Save::Write { text: self.text(board), sig }
     }
 
-    /// `saveLocal`, second half: the write was done (`ok`) or refused (the store is full).
+    /// Whether `stored` (what [`LOCAL_KEY`] holds now, say on a `storage` event) was written
+    /// by another tab since this one last read or wrote it.
+    pub fn elsewhere(&self, stored: Option<&str>) -> bool {
+        stamp(stored) != self.seen
+    }
+
+    /// `saveLocal`, second half: `text` was written (`ok`) or refused (the store is full).
     /// `true` when the "too big to keep" toast should show, which is once until a save works.
-    pub fn saved(&mut self, sig: String, ok: bool) -> bool {
+    pub fn saved(&mut self, sig: String, text: &str, ok: bool) -> bool {
         if ok {
             self.saved_sig = sig;
+            self.seen = stamp(Some(text));
             return false;
         }
         let first = self.saved_sig != "full";
@@ -352,11 +375,13 @@ mod tests {
         for s in [None, Some(""), Some("{"), Some("null"), Some(r#"{"a":{}}"#), Some("[1]")] {
             let mut b = Board::default();
             let (st, mine) = Local::load(s, &mut b);
-            assert_eq!((st, mine.len(), b.strokes.len()), (Local::default(), 0, 0), "{s:?}");
+            let blank = Local { seen: stamp(s), ..Local::default() };
+            assert_eq!((st, mine.len(), b.strokes.len()), (blank, 0, 0), "{s:?}");
         }
         // with no `a`, the shelf is not read either, as the JavaScript page returned early
-        let (st, _) = Local::load(Some(r#"{"shelf":[{"k":4,"a":[]}],"k":9}"#), &mut Board::default());
-        assert_eq!(st, Local::default());
+        let no_a = r#"{"shelf":[{"k":4,"a":[]}],"k":9}"#;
+        let (st, _) = Local::load(Some(no_a), &mut Board::default());
+        assert_eq!(st, Local { seen: stamp(Some(no_a)), ..Local::default() });
     }
 
     #[test]
@@ -375,17 +400,46 @@ mod tests {
     fn saving_writes_once_per_change_and_toasts_once_when_full() {
         let mut b = board(&["a"]);
         let mut st = Local::default();
-        let Save::Write { sig, text } = st.save(&b) else { panic!() };
+        let Save::Write { sig, text } = st.save(&b, None) else { panic!() };
         assert_eq!(sig, "1:a:");
         assert_eq!(text, r##"{"v":1,"a":[{"id":"a","l":1,"c":"#111111","w":3,"pts":[0.1,0.2,0.5]}],"shelf":[],"k":1}"##);
-        assert!(!st.saved(sig, true));
-        assert_eq!(st.save(&b), Save::Unchanged);
+        assert!(!st.saved(sig, &text, true));
+        let stored = text;
+        assert_eq!(st.save(&b, Some(&stored)), Save::Unchanged);
         b.insert(it("b"));
-        let Save::Write { sig, .. } = st.save(&b) else { panic!() };
-        assert!(st.saved(sig.clone(), false), "the first refusal toasts");
-        assert!(!st.saved(sig.clone(), false), "the second does not");
-        assert!(matches!(st.save(&b), Save::Write { .. }), "a full store keeps trying");
-        assert!(!st.saved(sig, true));
+        let Save::Write { sig, text } = st.save(&b, Some(&stored)) else { panic!() };
+        assert!(st.saved(sig.clone(), &text, false), "the first refusal toasts");
+        assert!(!st.saved(sig.clone(), &text, false), "the second does not");
+        assert!(matches!(st.save(&b, Some(&stored)), Save::Write { .. }), "a full store keeps trying");
+        assert!(!st.saved(sig, &text, true));
+    }
+
+    #[test]
+    fn a_second_tab_never_writes_over_the_first() {
+        // Two tabs open the same private board.
+        let stored = r##"{"v":1,"a":[{"id":"a","l":1,"c":"#111111","w":3,"pts":[0.1,0.2,0.5]}],"shelf":[],"k":1}"##;
+        let (mut ba, mut bb) = (Board::default(), Board::default());
+        let (mut ta, _) = Local::load(Some(stored), &mut ba);
+        let (tb, _) = Local::load(Some(stored), &mut bb);
+        assert!(!ta.elsewhere(Some(stored)) && !tb.elsewhere(Some(stored)));
+        // Tab A draws and saves.
+        ba.insert(it("from-a"));
+        let Save::Write { sig, text } = ta.save(&ba, Some(stored)) else { panic!() };
+        assert!(!ta.saved(sig, &text, true));
+        let now = text;
+        assert!(!ta.elsewhere(Some(&now)), "its own write is not someone else's");
+        // Tab B draws: its save must not drop A's stroke; it is told to load again.
+        bb.insert(it("from-b"));
+        assert!(tb.elsewhere(Some(&now)), "a storage event tells B");
+        assert_eq!(tb.save(&bb, Some(&now)), Save::Elsewhere);
+        // Loaded again, B sees A's stroke and then saves over the new text.
+        let mut bb = Board::default();
+        let (tb2, _) = Local::load(Some(&now), &mut bb);
+        assert!(bb.has("from-a"));
+        bb.insert(it("from-b"));
+        assert!(matches!(tb2.save(&bb, Some(&now)), Save::Write { .. }));
+        // A private board removed (shared away) by another tab is a change too.
+        assert!(tb2.elsewhere(None));
     }
 
     #[test]
