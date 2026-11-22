@@ -59,6 +59,7 @@ const liveStrokes = new Map(); // id -> stroke in progress (local or remote)
 const layers = new Map();      // l -> { l, c, del }
 const pending = new Map();     // id -> my finished stroke the relay has not confirmed
 const mine = [];               // ids of my finished strokes, for undo
+let local = false;             // a private board: only in this browser, nothing sent
 let undoQueue = [];            // undos made while offline
 let hidden = new Set();        // layers hidden in this browser only
 
@@ -547,11 +548,12 @@ let ready = false;   // snapshot complete on the current socket
 
 function showStatus(text) {
   if (text) net = text;
+  if (local) { statusText.textContent = 'private · only on this device'; return; }
   const parts = [net, role, engine];
   if (people > 0) parts.push(`${people} online`);
   statusText.textContent = parts.join(' · ');
 }
-function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+function send(m) { if (local) return localSend(m); if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
 
 function connect() {
   if (stopped) return;
@@ -597,6 +599,8 @@ function onMessage(m) {
     case 'ok': {
       const s = pending.get(m.id); if (!s) break;
       pending.delete(m.id); s.q = m.q;
+      // Everything from a board that was private is on the server now: drop this browser's copy.
+      if (uploading && !pending.size) { uploading = false; try { localStorage.removeItem(LOCAL_KEY); } catch { /* nothing kept */ } }
       const i = strokes.lastIndexOf(s);
       if (i >= 0 && ((i > 0 && qOf(strokes[i - 1]) > s.q) ||
           (i < strokes.length - 1 && qOf(strokes[i + 1]) < s.q))) strokes.sort(byQ);
@@ -668,14 +672,31 @@ function onReady() {
   ready = true;
   if (role !== 'edit' || me == null) { pending.clear(); undoQueue = []; return; }
   // Strokes the relay never confirmed: put them back and send them whole.
+  const todo = [];
   for (const [id, s] of pending) {
     const have = byId.get(id);
     if (have) pending.set(id, have); // the relay stored it; only the `ok` was lost
-    else { s.l = me; delete s.q; insertStroke(s); }
-    send({ t: 's', id, c: s.c, w: s.w, pts: s.pts, txt: s.txt });
+    else { s.l = me; delete s.q; insertStroke(s, true); }
+    todo.push(pending.get(id));
   }
+  redrawBase(true);
   for (const id of undoQueue) { removeStroke(id); send({ t: 'u', id }); }
   undoQueue = [];
+  // A board that was private until now can be large: send it in bites the
+  // relay's rate limits allow (about 100 items or 120 KB every half second).
+  const sock = ws;
+  const bite = () => {
+    if (ws !== sock || !online) return; // the socket changed; the next `ready` starts again
+    let n = 0, bytes = 0;
+    while (todo.length && n < 100 && bytes < 120000) {
+      const s = todo.shift();
+      if (!pending.has(s.id)) continue;
+      const text = JSON.stringify({ t: 's', id: s.id, c: s.c, w: s.w, pts: s.pts, txt: s.txt });
+      sock.send(text); n++; bytes += text.length;
+    }
+    if (todo.length) setTimeout(bite, 500);
+  };
+  bite();
 }
 
 function onLayerDeleted(l) {
@@ -1084,7 +1105,8 @@ function undo() {
     if (!byId.has(id)) continue; // already gone (layer deleted, refused)
     removeStroke(id);
     pending.delete(id);
-    if (online && ready) send({ t: 'u', id }); else undoQueue.push(id);
+    if (online && ready) send({ t: 'u', id }); else if (!local) undoQueue.push(id);
+    saveLocal();
     return;
   }
 }
@@ -1186,6 +1208,7 @@ function hueHex(h) { // hsl(h, 70%, 42%) as #rrggbb
 function sendLabel() {
   if (role !== 'edit' || me == null) return;
   const c = myHue != null ? hueHex(myHue) : (layers.get(me) || {}).c;
+  if (local) { if (c) onName({ l: me, n: myName, c }); return; }
   if (c) send({ t: 'nm', n: myName, c });
 }
 
@@ -1286,7 +1309,7 @@ function renderWho() {
     text.textContent = `${nudge.k} · ${nameOf(nudge.l)} is pointing`;
   } else {
     dot.style.background = myColor || '#888';
-    text.textContent = `${role === 'edit' && me != null ? myName : 'Watching'} · ${Math.max(1, people)} here`;
+    text.textContent = local ? `${myName} · private` : `${role === 'edit' && me != null ? myName : 'Watching'} · ${Math.max(1, people)} here`;
   }
   if (whoPanel.hidden) return;
   const nameIn = $('#nameIn');
@@ -1410,6 +1433,9 @@ layerList.addEventListener('click', (e) => {
 function fillShare() {
   const at = (k) => `${location.origin}/b/${k}`;
   const edit = role === 'edit';
+  $('#privRow').hidden = !local;
+  $('#viewRow').hidden = local; $('#newBoard').parentElement.hidden = local;
+  if (local) { $('#editRow').hidden = true; return; }
   $('#editRow').hidden = !edit;
   $('#editLink').value = edit ? at(key) : '';
   $('#viewLink').value = edit ? (viewKey ? at(viewKey) : '') : at(key);
@@ -1582,7 +1608,7 @@ function clearSheet() {
 
 function crumple() {
   if (role !== 'edit') return;
-  if (!(online && ready)) return toast('Not connected. Try again in a moment.');
+  if (!local && !(online && ready)) return toast('Not connected. Try again in a moment.');
   if (!strokes.length) return toast('Nothing to crumple: the board is blank.');
   if (editor) closeEditor(true);
   send({ t: 'cr' });
@@ -1644,7 +1670,7 @@ function renderShelf() {
     let pv = previews.get(k);
     if (!pv) {
       pv = document.createElement('canvas'); pv.width = 256; pv.height = 144;
-      if (!asked.has(k) && online && ready) { asked.add(k); send({ t: 'sv', k }); }
+      if (!asked.has(k) && (local || (online && ready))) { asked.add(k); send({ t: 'sv', k }); }
     }
     const who = el('span', 'who', i === shelf.length - 1 ? 'Latest' : `${shelf.length - 1 - i} before`);
     who.append(el('small', null, `${n} item${n === 1 ? '' : 's'}`));
@@ -1669,7 +1695,7 @@ function onSheetView(m) {
 
 shelfList.addEventListener('click', (e) => {
   const b = e.target.closest('button[data-k]'); if (!b) return;
-  if (!(online && ready)) return toast('Not connected. Try again in a moment.');
+  if (!local && !(online && ready)) return toast('Not connected. Try again in a moment.');
   if (editor) closeEditor(true);
   send({ t: 'un', k: Number(b.dataset.k) });
   openPanel(null);
@@ -1702,6 +1728,102 @@ function showMessage(text, opts) {
   }
   msgEl.hidden = false;
 }
+
+// ---- private boards ---------------------------------------------------------
+// Opening the site gives a board that exists only in this browser. Nothing is
+// sent anywhere: no board is made on the server and no socket is opened until
+// Share is pressed. The board is kept in this browser's storage so a reload
+// does not lose it. Crumpled sheets are kept here too and are never uploaded.
+
+const LOCAL_KEY = 'wb.local';
+let localShelf = [];   // [{ k, a: [items] }], oldest first
+let localNextK = 1, savedSig = '', uploading = false;
+const itemOf = (s) => ({ id: s.id, l: 1, c: s.c, w: s.w, pts: s.pts, ...(s.txt != null ? { txt: s.txt } : {}) });
+const localShelfList = () => localShelf.map((h) => ({ k: h.k, n: h.a.length }));
+
+function saveLocal() {
+  if (!local) return;
+  const sig = `${strokes.length}:${strokes.length ? strokes[strokes.length - 1].id : ''}:${localShelf.map((h) => h.k).join(',')}`;
+  if (sig === savedSig) return;
+  try {
+    localStorage.setItem(LOCAL_KEY, JSON.stringify({ v: 1, a: strokes.map(itemOf), shelf: localShelf, k: localNextK }));
+    savedSig = sig;
+  } catch {
+    if (savedSig !== 'full') toast('This board is too big to keep in this browser. Share it or it will be lost on reload.', null, null, 8000);
+    savedSig = 'full';
+  }
+}
+
+function loadLocal() {
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null'); } catch { /* unreadable: start blank */ }
+  if (!d || !Array.isArray(d.a)) return;
+  for (const raw of d.a) {
+    if (!raw || typeof raw.id !== 'string' || !Array.isArray(raw.pts) || byId.has(raw.id)) continue;
+    const s = { id: raw.id, l: 1, c: raw.c, w: raw.w, pts: raw.pts };
+    if (typeof raw.txt === 'string') s.txt = raw.txt;
+    strokes.push(s); byId.set(s.id, s); bump(1, 1); pending.set(s.id, s); mine.push(s.id);
+  }
+  if (Array.isArray(d.shelf)) localShelf = d.shelf.filter((h) => h && Array.isArray(h.a)).slice(-5);
+  localNextK = Math.max(1, d.k | 0, ...localShelf.map((h) => h.k + 1));
+}
+
+// What the relay would have done with a message, done here instead.
+function localSend(m) {
+  if (m.t === 'cr') {
+    const k = localNextK++;
+    localShelf.push({ k, a: strokes.map(itemOf) });
+    const drop = localShelf.length > 5 ? localShelf.shift().k : null;
+    pending.clear(); mine.length = 0;
+    onCrumpled({ k, by: 1, drop, shelf: localShelfList() });
+  } else if (m.t === 'un') {
+    const i = localShelf.findIndex((h) => h.k === m.k); if (i < 0) return;
+    const [sheet] = localShelf.splice(i, 1);
+    if (strokes.length) { localShelf.push({ k: localNextK++, a: strokes.map(itemOf) }); if (localShelf.length > 5) localShelf.shift(); }
+    pending.clear(); mine.length = 0;
+    onUncrumpled({ k: m.k, by: 1, shelf: localShelfList(), a: sheet.a });
+    for (const s of strokes) { delete s.q; pending.set(s.id, s); }
+  } else if (m.t === 'sv') {
+    const sheet = localShelf.find((h) => h.k === m.k);
+    if (sheet) onSheetView({ k: m.k, a: sheet.a });
+  }
+  saveLocal();
+}
+
+function startLocal() {
+  local = true; role = 'edit'; me = 1; online = false; ready = false;
+  const c = myHue != null ? hueHex(myHue) : '#111111';
+  layers.set(1, { l: 1, c, del: false, n: myName });
+  myColor = c; color = c;
+  document.body.classList.add('edit', 'local');
+  statusEl.classList.add('priv');
+  loadLocal(); shelf = localShelfList();
+  buildSwatches(); redrawBase(true); redrawLive();
+  showStatus(); fillShare(); layersChanged(); shelfChanged(); renderWho();
+  setInterval(saveLocal, 1500);
+  addEventListener('pagehide', saveLocal);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) saveLocal(); });
+}
+
+// Share: make the board on the server, connect, and send what is here.
+async function shareNow() {
+  if (!local || uploading) return;
+  const b = $('#shareNow');
+  uploading = true; b.disabled = true; b.textContent = 'Sharing…';
+  const fail = (text) => { uploading = false; b.disabled = false; b.textContent = 'Share this board'; toast(text, null, null, 6000); };
+  let res, body = null;
+  try { res = await fetch('/api/boards', { method: 'POST' }); } catch { return fail("Couldn't reach the server. The board is still private."); }
+  if (res.status === 429) return fail('Too many new boards from this address. Wait a few seconds and try again.');
+  try { body = await res.json(); } catch { /* handled below */ }
+  if (!res.ok || !body || typeof body.edit !== 'string') return fail("The server couldn't make a board. It is still private.");
+  saveLocal();
+  local = false;
+  document.body.classList.remove('local'); statusEl.classList.remove('priv');
+  history.replaceState(null, '', '/b/' + body.edit);
+  b.disabled = false; b.textContent = 'Share this board';
+  start(body.edit);
+}
+$('#shareNow').addEventListener('click', shareNow);
 
 // ---- start -----------------------------------------------------------------
 
@@ -1738,7 +1860,7 @@ function boot() {
   const path = location.pathname;
   const m = /^\/b\/([A-Za-z0-9_-]{1,64})\/?$/.exec(path);
   if (m) start(m[1]);
-  else if (path === '/' || path === '/index.html') createBoard();
+  else if (path === '/' || path === '/index.html') startLocal();
   else showMessage("This board doesn't exist or has expired.", { href: '/', label: 'New board' });
 }
 boot();

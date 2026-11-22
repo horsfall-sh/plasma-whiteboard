@@ -26,6 +26,18 @@ board in a browser window on a laptop, and share that window in a video call.
   The **Move** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom
   left shows where you are; tap or drag on it to go there. On a view link one finger or the mouse pans.
 
+## Private until shared
+
+Opening the site gives a **private board**: it exists only in that browser, on that device. No board is made
+on the server and no connection is opened; the page loads its own files and nothing else. The status line
+says "private · only on this device". The board is kept in the browser's storage, so a reload keeps it.
+Drawing, text, undo, erase, crumple and the shelf all work.
+
+**Share** (in the share panel) is the only way out: it creates the board on the server, uploads what is on
+the sheet, and shows the edit and view links. Crumpled sheets on the private shelf are not uploaded. Once
+everything is confirmed the browser's private copy is removed, and opening the site again gives a new blank
+private board. One private board per browser for now.
+
 ## People, names and pings
 
 - Everyone who can draw gets a two-word name and a colour. The chip at the bottom right opens the list of

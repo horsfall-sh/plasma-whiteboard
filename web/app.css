@@ -213,3 +213,8 @@ body:not(.edit) #meRow { display: none; }
 #whoList .who { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 #whoList .who small { color: #9aa3ad; margin-left: 6px; }
 #whoList button { font-size: 13px; }
+
+/* ---- private (local only) boards ---- */
+#status.priv b { background: #f2c66d; }
+#privRow button { margin-top: 10px; padding: 8px 14px; font-size: 14px; background: #1f5f3f; color: #fff; }
+body.local #bar #pingBtn { display: none; }
