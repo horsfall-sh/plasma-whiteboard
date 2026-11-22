@@ -14,3 +14,5 @@ pub mod local;
 pub mod render;
 pub mod input;
 pub mod net;
+#[cfg(target_arch = "wasm32")]
+pub mod fx;
