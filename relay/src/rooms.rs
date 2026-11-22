@@ -218,6 +218,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_edit_key_holder_turned_viewer_still_gets_the_view_key() {
+        use crate::room::MAX_LAYERS;
+        let db = temp_db();
+        let a = db.create_board([7; 32], [8; 32]).await.unwrap();
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
+        let (room, _) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db)).await.unwrap();
+        for n in 0..MAX_LAYERS {
+            let mut who = [0u8; 32];
+            who[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            let j = room.join(n as u64 + 1, Role::Edit, Some(who), Some("vk"), &db).unwrap();
+            room.leave(j.peer);
+        }
+        let j = room.join(9999, Role::Edit, Some([0xee; 32]), Some("vk"), &db).unwrap();
+        assert_eq!(j.peer.role, Role::View, "the layers are full");
+        let hello: serde_json::Value = serde_json::from_str(j.snapshot[0].as_str()).unwrap();
+        assert_eq!(hello["role"], "view");
+        assert_eq!(hello["view"], "vk", "the view link must not fall back to the edit key");
+    }
+
+    #[tokio::test]
     async fn a_join_that_waited_on_an_unloaded_cell_starts_again() {
         let db = temp_db();
         let a = db.create_board([5; 32], [6; 32]).await.unwrap();

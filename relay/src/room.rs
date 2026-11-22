@@ -489,9 +489,12 @@ impl Room {
             Role::Edit => hello.push_str(&layer.to_string()),
             Role::View => hello.push_str("null"),
         }
-        match (role, view) {
-            (Role::Edit, Some(v)) => hello.push_str(&format!(r#","view":"{v}","layers":["#)),
-            _ => hello.push_str(r#","view":null,"layers":["#),
+        // Every edit-key holder learns the view key, even one turned into a
+        // viewer because the layers are full: the page shows the current key
+        // as the view link only when no view key came (a view-key holder).
+        match view {
+            Some(v) => hello.push_str(&format!(r#","view":"{v}","layers":["#)),
+            None => hello.push_str(r#","view":null,"layers":["#),
         }
         hello.push_str(&layers_json(&st));
         hello.push_str(r#"],"shelf":"#);

@@ -164,6 +164,24 @@ impl Default for Conn {
 }
 
 impl Conn {
+    /// The keys for the share panel's edit and view links (`fillShare`). The
+    /// relay sends the view key to every edit-key holder, even one made a
+    /// viewer because the layers are full; only a view-key holder gets none,
+    /// and then the current key is the view key. Never the edit key as a view
+    /// link.
+    pub fn share_keys(&self) -> (Option<&str>, Option<&str>) {
+        if self.local {
+            return (None, None);
+        }
+        let edit = self.edit.then_some(self.key.as_str());
+        let view = match (&self.view_key, self.edit) {
+            (Some(v), _) => Some(v.as_str()),
+            (None, false) => Some(self.key.as_str()),
+            (None, true) => None,
+        };
+        (edit, view)
+    }
+
     /// The status line (`showStatus`).
     pub fn status_text(&self) -> String {
         if self.local {
@@ -631,6 +649,25 @@ impl Made {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_view_link_is_never_the_edit_key() {
+        let mut c = Conn { key: "ek".into(), ..Conn::default() };
+        // An edit-key holder made a viewer (layers full) still gets the view key.
+        c.edit = false;
+        c.view_key = Some("vk".into());
+        assert_eq!(c.share_keys(), (None, Some("vk")));
+        c.edit = true;
+        assert_eq!(c.share_keys(), (Some("ek"), Some("vk")));
+        // An editor without a view key shows no view link, not its own key.
+        c.view_key = None;
+        assert_eq!(c.share_keys(), (Some("ek"), None));
+        // A view-key holder: the current key is the view key.
+        c.edit = false;
+        assert_eq!(c.share_keys(), (None, Some("ek")));
+        c.local = true;
+        assert_eq!(c.share_keys(), (None, None));
+    }
     use super::*;
     use crate::input::Editor;
 

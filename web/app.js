@@ -1438,7 +1438,9 @@ function fillShare() {
   if (local) { $('#editRow').hidden = true; return; }
   $('#editRow').hidden = !edit;
   $('#editLink').value = edit ? at(key) : '';
-  $('#viewLink').value = edit ? (viewKey ? at(viewKey) : '') : at(key);
+  // The relay sends the view key to every edit-key holder, even one made a
+  // viewer; only a view-key holder gets none, and then the current key is it.
+  $('#viewLink').value = viewKey ? at(viewKey) : (edit ? '' : at(key));
 }
 sharePanel.addEventListener('click', (e) => {
   const b = e.target.closest('button[data-copy]'); if (!b) return;
