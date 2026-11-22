@@ -15,6 +15,10 @@ pub const OUT_PER_SEC: f64 = 1024.0 * 1024.0;
 /// the page at once, then two a second.
 const JOIN_BURST: f64 = 60.0;
 const JOIN_PER_SEC: f64 = 2.0;
+/// New contributor layers one address may be given, across all boards: a
+/// class opening a fresh board at once, then one every half minute.
+const LAYER_BURST: f64 = 60.0;
+const LAYER_PER_SEC: f64 = 1.0 / 30.0;
 const CREATE_BURST: f64 = 10.0;
 const CREATE_PER_SEC: f64 = 0.1;
 
@@ -79,6 +83,7 @@ fn key(ip: IpAddr) -> IpKey {
 struct Inner {
     creates: HashMap<IpKey, Bucket>,
     joins: HashMap<IpKey, Bucket>,
+    layers: HashMap<IpKey, Bucket>,
     conns: HashMap<IpKey, u32>,
     /// Kept after the last connection closes, so reconnecting does not refill it.
     outs: HashMap<IpKey, Arc<Mutex<Bucket>>>,
@@ -100,6 +105,12 @@ impl IpGuard {
     /// The address's budget for replies it asked for.
     pub fn out(&self) -> Arc<Mutex<Bucket>> {
         self.out.clone()
+    }
+
+    /// Whether the address may be given another new contributor layer.
+    pub fn may_add_layer(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        g.layers.entry(self.key).or_insert_with(|| Bucket::new(LAYER_BURST, LAYER_PER_SEC)).take()
     }
 }
 
@@ -163,6 +174,7 @@ impl IpLimits {
         let mut g = self.inner.lock().unwrap();
         g.creates.retain(|_, b| !b.full());
         g.joins.retain(|_, b| !b.full());
+        g.layers.retain(|_, b| !b.full());
         let Inner { conns, outs, .. } = &mut *g;
         outs.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
     }

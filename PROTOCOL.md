@@ -64,7 +64,7 @@ Messages from a viewer other than `join` are ignored.
 
 | `t` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. Each layer is `{l, c, del, n}` (`n`: name or null). `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
+| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. Each layer is `{l, c, del, n}` (`n`: name or null). `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key: sent to every edit-key holder, including one joined as a viewer because the board had no room for another contributor; null for view-key holders. `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
 | `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`. |
 | `ready` | | Snapshot complete. The client now resends unconfirmed strokes with `s`. |
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
@@ -80,9 +80,9 @@ Messages from a viewer other than `join` are ignored.
 | `un` | `k`, `by`, `shelf`, `layers`, `a` | Sheet `k` was brought back: `a` holds its items, `layers` the layer list as in `hello`. Replace the board with them. Sent to everyone. |
 | `sv` | `k`, `a` | To the one who asked: the items of crumpled sheet `k`. |
 | `n` | `n`, `on` | Number of connections on the board now, and the layers that have one open. |
-| `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. |
+| `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. Also sent (`n` null, the layer's first colour) when an empty layer no one is on is handed to a new contributor. |
 | `pg` | `l`, `k`, `pts` | A ping from layer `l` with letter `k` (A to Z, then round again). Sent to everyone, including the sender. |
-| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, the server at capacity, or the board could not be read or written (retry later). `rate`: sending too fast. `bad`: malformed join. |
+| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, the server at capacity, or the board could not be read or written (retry later). `rate`: sending too fast. `bad`: malformed join. Not fatal: `full`, sent right after `hello` when an edit link joins as a viewer because the board has no room for another contributor (or the address was given too many new layers lately); the page says so and stays connected. |
 
 `q` is a per-board sequence number. Strokes are drawn in `q` order. A stroke is never changed after it is
 stored; undo, layer delete and restore only flip its state.
@@ -105,7 +105,8 @@ same sequence. A client that falls too far behind is disconnected and gets a fre
 | Bytes per connection | burst of 2 MB, then 256 KB a second |
 | Whole-sheet operations per connection (`cr`, `un`, `sv`, `lr`) | burst of 12, then one every 2 s; over the limit they are ignored |
 | Live strokes per board / per connection | 64 / 4 |
-| Contributors per board | 200 (later browsers join as viewers) |
-| Connections per board / per address | 100 / 40 |
+| Contributors per board | 200; when all are taken, an empty layer no one is on is handed to the next one, else it joins as a viewer and is told (`full`) |
+| New contributor layers per address | burst 60, then one per 30 s (over it, the browser joins as a viewer) |
+| Connections per board / per address | 100 / 40; viewers may hold at most 80 of a board's 100 |
 | Messages per connection | 300 per second sustained, burst 600 |
 | New boards per address | burst 10, then one per 10 s |

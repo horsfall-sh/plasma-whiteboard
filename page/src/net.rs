@@ -557,6 +557,12 @@ impl Conn {
                 self.show_status(h, "board is busy, retrying");
             }
             "rate" => self.retry = self.retry.max(2000),
+            // An edit link opened view-only: say so rather than leave it silent.
+            "full" => h.toast(
+                m.as_deref().unwrap_or("This board has no room for another contributor, so it opened view-only."),
+                None,
+                8000,
+            ),
             _ => {}
         }
     }
@@ -1071,6 +1077,9 @@ mod tests {
         let mut c = online(&mut h, &mut inp, true);
         c.frame(&mut h, &mut inp, 1, r#"{"t":"err","code":"rate"}"#);
         assert_eq!(c.retry, 2000);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"err","code":"full","m":"no room"}"#);
+        assert_eq!((c.retry, c.stopped), (2000, false), "a full board is not a reason to reconnect");
+        assert!(h.take().iter().any(|e| e.contains("no room")), "the page says why it is view-only");
         c.frame(&mut h, &mut inp, 1, r#"{"t":"err","code":"busy"}"#);
         assert_eq!((c.retry, h.take()), (8000, vec!["status board is busy, retrying · edit · js".to_string()]));
         c.frame(&mut h, &mut inp, 1, r#"{"t":"err","code":"rate"}"#);

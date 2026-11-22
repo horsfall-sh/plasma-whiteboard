@@ -454,6 +454,8 @@ impl Room {
 
     /// Add a connection. `who` is the hash of the contributor secret (edit
     /// links only). `view` is the view key to hand to an editor.
+    /// `may_add` is asked, once, before a new contributor is given a layer:
+    /// false (the address made too many lately) makes them a viewer.
     /// Err: the board has no room for another connection.
     pub fn join(
         &self,
@@ -462,6 +464,7 @@ impl Room {
         who: Option<[u8; 32]>,
         view: Option<&str>,
         db: &Db,
+        may_add: impl FnOnce() -> bool,
     ) -> Result<Joined, ()> {
         let mut st = self.st.lock().unwrap();
         if st.conns >= MAX_ROOM_CONNS {
@@ -470,31 +473,54 @@ impl Room {
         // Settle the role before counting it: whoever will be a viewer
         // (including an edit-key holder when the layers are full) takes a
         // viewer's seat.
-        let seat = match role {
-            Role::Edit => {
-                let who = who.ok_or(())?;
-                st.layers.iter().any(|l| l.who == who) || st.layers.len() < MAX_LAYERS
-            }
-            Role::View => false,
+        enum Seat {
+            Mine(usize),
+            New,
+            Reclaim(usize),
+            Full,
+        }
+        let seat = match (role, who) {
+            (Role::Edit, None) => return Err(()),
+            (Role::Edit, Some(who)) => match st.layers.iter().position(|l| l.who == who) {
+                Some(i) => Seat::Mine(i),
+                None => {
+                    let free = if st.layers.len() < MAX_LAYERS { Some(Seat::New) } else { reclaimable(&st).map(Seat::Reclaim) };
+                    match free {
+                        Some(f) if may_add() => f,
+                        _ => Seat::Full,
+                    }
+                }
+            },
+            (Role::View, _) => Seat::Full,
         };
-        if !seat && st.viewers >= MAX_ROOM_VIEWERS {
+        let full = role == Role::Edit && matches!(seat, Seat::Full);
+        if matches!(seat, Seat::Full) && st.viewers >= MAX_ROOM_VIEWERS {
             return Err(());
         }
+        let who = who.unwrap_or_default();
         let mut layer = 0;
-        if role == Role::Edit {
-            let who = who.ok_or(())?;
-            if let Some(l) = st.layers.iter_mut().find(|l| l.who == who) {
-                layer = l.n;
-                l.on += 1;
-            } else if st.layers.len() < MAX_LAYERS {
+        match seat {
+            Seat::Mine(i) => {
+                layer = st.layers[i].n;
+                st.layers[i].on += 1;
+            }
+            Seat::New => {
                 layer = st.layers.len() as u32 + 1;
                 let color = layer_color(layer);
                 db.add_layer(&self.link, layer, who, color.clone());
                 self.all(format!(r#"{{"t":"l","l":{layer},"c":"{color}"}}"#));
                 st.layers.push(Layer { n: layer, who, color, name: None, on: 1, pinged: None });
-            } else {
-                role = Role::View;
             }
+            Seat::Reclaim(i) => {
+                // An empty layer no one is on: hand it to the newcomer, with
+                // its first colour and no name.
+                layer = st.layers[i].n;
+                let color = layer_color(layer);
+                db.add_layer(&self.link, layer, who, color.clone());
+                self.all(format!(r#"{{"t":"nm","l":{layer},"n":null,"c":"{color}"}}"#));
+                st.layers[i] = Layer { n: layer, who, color, name: None, on: 1, pinged: None };
+            }
+            Seat::Full => role = Role::View,
         }
         st.conns += 1;
         if role == Role::View {
@@ -524,6 +550,11 @@ impl Room {
         hello.push_str(&shelf_json(&st));
         hello.push('}');
         snapshot.push(hello.into());
+        if full {
+            snapshot.push(Utf8Bytes::from_static(
+                r#"{"t":"err","code":"full","m":"This board has no room for another contributor right now, so it opened view-only."}"#,
+            ));
+        }
 
         if st.snap.is_none() {
             let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
@@ -922,6 +953,22 @@ impl Room {
 }
 
 /// The head count, with the layers that have a connection open: `{t:"n", n, on:[l..]}`.
+/// A layer that can be handed to a new contributor: no one is on it and it
+/// holds nothing, on the sheet in use, on the shelf or being drawn.
+fn reclaimable(st: &State) -> Option<usize> {
+    if !st.layers.iter().any(|l| l.on == 0) {
+        return None;
+    }
+    let used: HashSet<u32> = st
+        .strokes
+        .iter()
+        .chain(st.shelf.iter().flat_map(|s| s.strokes.iter()))
+        .map(|s| s.layer)
+        .chain(st.live.values().map(|s| s.layer))
+        .collect();
+    st.layers.iter().position(|l| l.on == 0 && !used.contains(&l.n))
+}
+
 fn count_msg(st: &State) -> String {
     let on: Vec<String> = st.layers.iter().filter(|l| l.on > 0).map(|l| l.n.to_string()).collect();
     format!(r#"{{"t":"n","n":{},"on":[{}]}}"#, st.conns, on.join(","))

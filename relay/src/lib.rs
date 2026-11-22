@@ -267,7 +267,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
     let view = (role == Role::Edit).then(|| keys::view_key(&key));
     let conn = app.next_conn.fetch_add(1, Ordering::Relaxed);
 
-    let joined = app.rooms.join(&app.db, board, |r| r.join(conn, role, who_hash, view.as_deref(), &app.db)).await;
+    let joined = app.rooms.join(&app.db, board, |r| r.join(conn, role, who_hash, view.as_deref(), &app.db, || guard.may_add_layer())).await;
     let (room, mut joined) = match joined {
         Ok(j) => j,
         Err(Refused::Unreadable) => {

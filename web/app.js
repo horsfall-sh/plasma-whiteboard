@@ -742,6 +742,9 @@ function onError(m) {
     retry = 8000; showStatus('board is busy, retrying');
   } else if (m.code === 'rate') {
     retry = Math.max(retry, 2000);
+  } else if (m.code === 'full') {
+    // An edit link opened view-only: say so rather than leave it silent.
+    toast(typeof m.m === 'string' && m.m ? m.m : 'This board has no room for another contributor, so it opened view-only.', null, null, 8000);
   }
 }
 

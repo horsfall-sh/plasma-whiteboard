@@ -208,12 +208,12 @@ mod tests {
         let held = cell.room.lock().await;
         let joined = tokio::time::timeout(
             Duration::from_secs(2),
-            rooms.join(&db, b, |r| r.join(1, Role::View, None, None, &db)),
+            rooms.join(&db, b, |r| r.join(1, Role::View, None, None, &db, || true)),
         )
         .await;
         assert!(matches!(joined, Ok(Ok(_))), "board b joined while board a was loading");
         drop(held);
-        assert!(rooms.join(&db, a, |r| r.join(2, Role::View, None, None, &db)).await.is_ok());
+        assert!(rooms.join(&db, a, |r| r.join(2, Role::View, None, None, &db, || true)).await.is_ok());
         assert_eq!(rooms.loaded(), 2);
     }
 
@@ -223,18 +223,21 @@ mod tests {
         let db = temp_db();
         let a = db.create_board([7; 32], [8; 32]).await.unwrap();
         let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
-        let (room, _) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db)).await.unwrap();
+        let (room, _) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db, || true)).await.unwrap();
         for n in 0..MAX_LAYERS {
             let mut who = [0u8; 32];
             who[..8].copy_from_slice(&(n as u64).to_le_bytes());
-            let j = room.join(n as u64 + 1, Role::Edit, Some(who), Some("vk"), &db).unwrap();
+            let j = room.join(n as u64 + 1, Role::Edit, Some(who), Some("vk"), &db, || true).unwrap();
             room.leave(j.peer);
         }
-        let j = room.join(9999, Role::Edit, Some([0xee; 32]), Some("vk"), &db).unwrap();
-        assert_eq!(j.peer.role, Role::View, "the layers are full");
+        // No layer for it (the address may not be given one): it is made a viewer.
+        let j = room.join(9999, Role::Edit, Some([0xee; 32]), Some("vk"), &db, || false).unwrap();
+        assert_eq!(j.peer.role, Role::View, "no layer for it");
         let hello: serde_json::Value = serde_json::from_str(j.snapshot[0].as_str()).unwrap();
         assert_eq!(hello["role"], "view");
         assert_eq!(hello["view"], "vk", "the view link must not fall back to the edit key");
+        let note: serde_json::Value = serde_json::from_str(j.snapshot[1].as_str()).unwrap();
+        assert_eq!((note["t"].as_str(), note["code"].as_str()), (Some("err"), Some("full")), "told, not silent");
     }
 
     #[tokio::test]
@@ -243,22 +246,60 @@ mod tests {
         let db = temp_db();
         let a = db.create_board([9; 32], [10; 32]).await.unwrap();
         let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
-        let (room, first) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db)).await.unwrap();
+        let (room, first) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db, || true)).await.unwrap();
         let mut held = vec![first.peer];
         for n in 1..MAX_ROOM_VIEWERS {
-            held.push(room.join(n as u64, Role::View, None, None, &db).unwrap().peer);
+            held.push(room.join(n as u64, Role::View, None, None, &db, || true).unwrap().peer);
         }
-        assert!(room.join(500, Role::View, None, None, &db).is_err(), "the viewer seats are full");
+        assert!(room.join(500, Role::View, None, None, &db, || true).is_err(), "the viewer seats are full");
         for n in 0..MAX_ROOM_CONNS - MAX_ROOM_VIEWERS {
             let who = [n as u8 + 1; 32];
-            let j = room.join(600 + n as u64, Role::Edit, Some(who), Some("vk"), &db).unwrap();
+            let j = room.join(600 + n as u64, Role::Edit, Some(who), Some("vk"), &db, || true).unwrap();
             assert_eq!(j.peer.role, Role::Edit, "a contributor still gets in");
             held.push(j.peer);
         }
-        assert!(room.join(700, Role::Edit, Some([0xaa; 32]), Some("vk"), &db).is_err(), "the room is full");
+        assert!(room.join(700, Role::Edit, Some([0xaa; 32]), Some("vk"), &db, || true).is_err(), "the room is full");
         // A viewer leaving frees a viewer seat.
         room.leave(held.remove(0));
-        assert!(room.join(800, Role::View, None, None, &db).is_ok());
+        assert!(room.join(800, Role::View, None, None, &db, || true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_empty_layer_no_one_is_on_is_handed_to_a_new_contributor() {
+        use crate::limits::{Budget, Bucket};
+        use crate::room::MAX_LAYERS;
+        let db = temp_db();
+        let a = db.create_board([11; 32], [12; 32]).await.unwrap();
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
+        let (room, _) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db, || true)).await.unwrap();
+        let who = |n: usize| {
+            let mut w = [0u8; 32];
+            w[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            w
+        };
+        for n in 0..MAX_LAYERS {
+            let j = room.join(n as u64 + 1, Role::Edit, Some(who(n)), Some("vk"), &db, || true).unwrap();
+            if n == 0 {
+                // Layer 1 holds a stroke; layer 2 stays on (its tab is open).
+                let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
+                let s = r##"{"t":"s","id":"keep","c":"#112233","w":0.004,"pts":[0.1,0.1,0.5]}"##;
+                room.handle(j.peer, s, &db, &mut b);
+            }
+            if n != 1 {
+                room.leave(j.peer);
+            }
+        }
+        let j = room.join(5000, Role::Edit, Some([0xee; 32]), Some("vk"), &db, || true).unwrap();
+        assert_eq!(j.peer.role, Role::Edit, "a full board still takes a new contributor");
+        assert_eq!(j.peer.layer, 3, "not the layer with a stroke, nor the one in use");
+        // The returning owner of layer 1 keeps it.
+        assert_eq!(room.join(5001, Role::Edit, Some(who(0)), Some("vk"), &db, || true).unwrap().peer.layer, 1);
+        // The reclaimed layer is stored for its new owner.
+        db.flush().await;
+        assert!(!room.is_dead(), "the layer write did not fail");
+        let loaded = db.load(a).await.unwrap();
+        assert_eq!(loaded.layers.len(), MAX_LAYERS);
+        assert!(loaded.layers.iter().any(|(n, w, _)| *n == 3 && *w == [0xee; 32]));
     }
 
     #[tokio::test]
@@ -266,7 +307,7 @@ mod tests {
         let db = temp_db();
         let a = db.create_board([5; 32], [6; 32]).await.unwrap();
         let rooms = Rooms::new(Duration::ZERO, Memory::new(usize::MAX / 2, 100));
-        let (room, j) = rooms.join(&db, a, |r| r.join(1, Role::View, None, None, &db)).await.unwrap();
+        let (room, j) = rooms.join(&db, a, |r| r.join(1, Role::View, None, None, &db, || true)).await.unwrap();
         let old = rooms.map.lock().unwrap().get(&a).cloned().unwrap();
         let mut held = old.room.lock().await;
         // A joiner queues on the cell while the last connection leaves and
@@ -274,7 +315,7 @@ mod tests {
         let r2 = rooms.clone();
         let db2 = db.clone();
         let waiter = tokio::spawn(async move {
-            r2.join(&db2, a, |r| r.join(2, Role::View, None, None, &db2)).await.map(|(r, _)| r)
+            r2.join(&db2, a, |r| r.join(2, Role::View, None, None, &db2, || true)).await.map(|(r, _)| r)
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         room.leave(j.peer);

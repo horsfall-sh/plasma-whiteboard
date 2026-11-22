@@ -511,7 +511,11 @@ fn apply(
             let _ = reply.send(r.map_err(|_| ()));
         }
         Cmd::AddLayer { board, n, who, color } => {
-            conn.prepare_cached("INSERT INTO layers(board, n, who_hash, color) VALUES(?,?,?,?)")?
+            // A layer number is reused when an empty layer is reclaimed.
+            conn.prepare_cached(
+                "INSERT INTO layers(board, n, who_hash, color) VALUES(?,?,?,?) \
+                 ON CONFLICT(board, n) DO UPDATE SET who_hash = excluded.who_hash, color = excluded.color",
+            )?
                 .execute(params![board, n, who, color])?;
         }
         Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt } => {
