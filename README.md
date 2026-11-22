@@ -156,7 +156,7 @@ copy it to `deploy/HOST.local.md`, which is gitignored.
 
 ## How it works
 
-A Rust relay (axum, tokio, SQLite) serves the page and relays strokes over WebSocket. The page is Rust compiled to WebAssembly, using the `smooth` (stroke smoothing) and `crumple` (the crumple animation) crates; a small `boot.js` loads it from the HTML and CSS in `web/`. The wire contract is in [`PROTOCOL.md`](PROTOCOL.md); design history and plans are in [`DESIGN-NOTES.pdf`](DESIGN-NOTES.pdf).
+A Rust relay (axum, tokio, SQLite) serves the page and relays strokes over WebSocket. The page is Rust compiled to WebAssembly, using the `smooth` (stroke smoothing) and `crumple` (the crumple animation) crates; a small `boot.js` loads it from the HTML and CSS in `web/`. The wire contract is in [`PROTOCOL.md`](PROTOCOL.md); design history is in [`DESIGN-NOTES.pdf`](DESIGN-NOTES.pdf) and what comes next is in [`ROADMAP.md`](ROADMAP.md).
 
 
 - **Keys.** The edit key is 144 random bits. The view key is derived from it with HMAC-SHA256, so an edit
@@ -185,6 +185,12 @@ stroke, 200 contributors per board, 100 connections per board.
   iPad the on-screen keyboard may cover a text box placed low on the board.
 - **A slow tablet.** Redraws are time-sliced at 6 ms per frame and the device pixel ratio is capped at 2,
   but this has not been measured on real hardware.
+
+## Roadmap
+
+Next, in order: end-to-end encryption with boards kept only in the browsers, TLS in the relay itself, and saved
+boards as an opt-in build feature. The whole client in Rust is done in v0.2.0. By default the server becomes a single binary with no
+database. See [`ROADMAP.md`](ROADMAP.md).
 
 ## Licence
 
