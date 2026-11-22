@@ -26,12 +26,15 @@ run: wasm
 
 # Static Linux x86-64 binary for the server, built in a container (needs Docker).
 # The source goes in and the binary comes out through pipes, so Docker needs no
-# access to this folder.
+# access to this folder. The image is pinned by digest and the build by
+# Cargo.lock, so the same commit builds the same way; to move to a newer Rust,
+# change the tag and the digest together.
+RUST_IMAGE = rust:1.96.0-alpine@sha256:f87aa870663e2b57ec8c69de82c7eedf7383bee987eef7612c0359635eaadb41
 linux: wasm
 	mkdir -p relay/target-linux/release
 	tar -c --exclude target --exclude target-linux relay web | \
-	  docker run --rm -i --platform linux/amd64 -v wb-cargo-cache:/usr/local/cargo/registry rust:1-alpine \
-	  sh -c "apk add --no-cache musl-dev >/dev/null && mkdir /src && tar -x -C /src && cd /src/relay && cargo build --release >&2 && cat target/release/wb-relay" \
+	  docker run --rm -i --platform linux/amd64 -v wb-cargo-cache:/usr/local/cargo/registry $(RUST_IMAGE) \
+	  sh -c "apk add --no-cache musl-dev >/dev/null && mkdir /src && tar -x -C /src && cd /src/relay && cargo build --release --locked >&2 && cat target/release/wb-relay" \
 	  > relay/target-linux/release/wb-relay.tmp
 	mv relay/target-linux/release/wb-relay.tmp relay/target-linux/release/wb-relay
 	chmod 755 relay/target-linux/release/wb-relay
@@ -46,7 +49,11 @@ clean:
 #   make ship HOST=root@server DOMAIN=whiteboard.example.org
 HOST ?=
 DOMAIN ?= whiteboard.example.com
-ship: test linux
+# Only a committed tree ships, so what is live is always a commit.
+clean-tree:
+	@test -z "$$(git status --porcelain)" || { echo "uncommitted changes: commit or stash them before shipping" >&2; git status --short >&2; exit 1; }
+
+ship: clean-tree test linux
 	@test -n "$(HOST)" || { echo "HOST is not set: run make ship HOST=user@server DOMAIN=your.domain" >&2; exit 1; }
 	sh deploy/deploy.sh $(HOST)
 	@curl -fsS -o /dev/null -w "live: %{http_code}\n" https://$(DOMAIN)/healthz
