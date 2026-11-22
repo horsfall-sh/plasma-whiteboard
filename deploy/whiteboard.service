@@ -11,7 +11,9 @@ Environment=WB_ADDR=127.0.0.1:8787
 Environment=WB_DB=/var/lib/whiteboard/whiteboard.db
 Environment=WB_TRUST_PROXY=1
 Environment=WB_TTL_DAYS=90
-Restart=on-failure
+# Restart whatever the exit: a clean exit (an unexpected return, a stop signal not sent by
+# systemd) must not leave the relay down either (council pass 2).
+Restart=always
 RestartSec=2
 
 # Runs as its own throwaway user; may write only its state directory.
