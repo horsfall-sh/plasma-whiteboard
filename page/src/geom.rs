@@ -68,11 +68,17 @@ pub enum Op {
 
 /// `dot`: a one-point stroke.
 pub fn dot(pts: &[f64], w: f64, bw: f64) -> Op {
+    if pts.len() < 3 {
+        return Op::Disc(0.0, 0.0, 0.0);
+    }
     Op::Disc(pts[0] * bw, pts[1] * bw, line_w(w, bw, pts[2]) / 2.0)
 }
 
 /// `seg`: the live-canvas piece that ends at the midpoint between points i-1 and i.
 pub fn seg(pts: &[f64], w: f64, bw: f64, i: usize) -> Vec<Op> {
+    if i == 0 || pts.len() < i * 3 + 3 {
+        return vec![];
+    }
     let (j, k) = ((i - 1) * 3, i * 3);
     let (x1, y1, x2, y2) = (pts[j] * bw, pts[j + 1] * bw, pts[k] * bw, pts[k + 1] * bw);
     let mut ops = vec![Op::LineWidth(line_w(w, bw, (pts[j + 2] + pts[k + 2]) / 2.0)), Op::Begin];
@@ -192,10 +198,11 @@ pub fn text_lines(txt: &str) -> std::str::Split<'_, char> {
 pub fn text_layout(txt: &str, pts: &[f64], w: f64, bw: f64) -> (String, Vec<(String, f64, f64)>) {
     let px = w * bw;
     let lh = px * LINE_HEIGHT;
+    let (x, y) = (pts.first().copied().unwrap_or(0.0), pts.get(1).copied().unwrap_or(0.0));
     let font = format!("{}px {}", crate::json::num_to_string(px), FONT);
     let lines = text_lines(txt)
         .enumerate()
-        .map(|(i, line)| (line.to_string(), pts[0] * bw, pts[1] * bw + (i as f64 + 0.5) * lh))
+        .map(|(i, line)| (line.to_string(), x * bw, y * bw + (i as f64 + 0.5) * lh))
         .collect();
     (font, lines)
 }
@@ -208,7 +215,8 @@ pub fn measure_font() -> String {
 /// `bbox`, in board units [x0, y0, x1, y1]. A text item's width comes from `measure`, the
 /// width in px of a line drawn in [`measure_font`].
 pub fn bbox(pts: &[f64], w: f64, txt: Option<&str>, mut measure: impl FnMut(&str) -> f64) -> [f64; 4] {
-    let (mut x0, mut x1, mut y0, mut y1) = (pts[0], pts[0], pts[1], pts[1]);
+    let [x, y] = [pts.first(), pts.get(1)].map(|v| v.copied().unwrap_or(0.0));
+    let (mut x0, mut x1, mut y0, mut y1) = (x, x, y, y);
     if let Some(t) = txt {
         let px = 100.0;
         let mut wmax = 0.0f64;
@@ -432,6 +440,22 @@ pub fn ping_points(pts: &[f64], touch: bool, px: f64) -> Option<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_points_draw_nothing_rather_than_panic() {
+        for pts in [&[][..], &[0.5], &[0.5, 0.5], &[0.1, 0.2, 0.5, 0.3]] {
+            let _ = dot(pts, 0.004, 1000.0);
+            let _ = full(pts, 0.004, 1000.0);
+            let _ = text_layout("a\nb", pts, 0.02, 1000.0);
+            let _ = bbox(pts, 0.004, None, |_| 10.0);
+            let _ = bbox(pts, 0.004, Some("ab"), |_| 10.0);
+            for i in 0..4 {
+                let _ = seg(pts, 0.004, 1000.0, i);
+            }
+        }
+        assert!(seg(&[0.1, 0.2, 0.5], 0.004, 1000.0, 1).is_empty(), "no point 1 to end at");
+        assert!(!seg(&[0.1, 0.2, 0.5, 0.3, 0.4, 0.5], 0.004, 1000.0, 1).is_empty());
+    }
 
     #[test]
     fn r5_rounds_as_the_page_did() {
