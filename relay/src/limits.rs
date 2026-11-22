@@ -11,6 +11,12 @@ pub const MAX_CONNS_PER_IP: u32 = 40;
 /// full boards, then 1 MB a second, across all its connections.
 pub const OUT_BURST: f64 = 32.0 * 1024.0 * 1024.0;
 pub const OUT_PER_SEC: f64 = 1024.0 * 1024.0;
+/// What one board may broadcast of whole sheets (bring back, layer restore),
+/// whoever asks: three full boards at once, then 1 MB a second. Each is sent
+/// to everyone on the board, so this, not a per-connection count, is what
+/// bounds the traffic one board can be made to send.
+pub const SHEETS_BURST: f64 = 48.0 * 1024.0 * 1024.0;
+pub const SHEETS_PER_SEC: f64 = 1024.0 * 1024.0;
 /// Connection attempts (each one a join) per address: a class of 40 opening
 /// the page at once, then two a second.
 const JOIN_BURST: f64 = 60.0;
@@ -53,6 +59,11 @@ impl Bucket {
         } else {
             false
         }
+    }
+
+    /// Put back `n` tokens taken for something that did not happen after all.
+    pub fn give(&mut self, n: f64) {
+        self.tokens = (self.tokens + n).min(self.cap);
     }
 
     pub fn full(&mut self) -> bool {

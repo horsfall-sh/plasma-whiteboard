@@ -104,6 +104,8 @@ same sequence. What is broadcast while a joining client's snapshot is still bein
 | Stroke data kept per board (sheet in use plus shelf) | 16 MB |
 | Bytes per connection | burst of 2 MB, then 256 KB a second |
 | Whole-sheet operations per connection (`cr`, `un`, `sv`, `lr`) | burst of 12, then one every 2 s; over the limit they are ignored |
+| Whole sheets sent to everyone (`un`, `lr`), in bytes | per board: burst 48 MB, then 1 MB a second; also drawn from the address's reply budget; over either, the request is ignored |
+| Reply budget per address (sheet previews, and the whole sheets above), in bytes | burst 32 MB, then 1 MB a second, shared by all its connections |
 | Live strokes per board / per connection | 64 / 4 |
 | Contributors per board | 200; when all are taken, an empty layer no one is on is handed to the next one, else it joins as a viewer and is told (`full`) |
 | New contributor layers per address | burst 60, then one per 30 s (over it, the browser joins as a viewer) |

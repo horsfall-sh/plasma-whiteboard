@@ -4,7 +4,7 @@
 
 use crate::db::{Db, Link, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
-use crate::limits::Budget;
+use crate::limits::{Bucket, Budget, SHEETS_BURST, SHEETS_PER_SEC};
 use crate::memory::{weight, Memory};
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
@@ -159,6 +159,8 @@ struct State {
     conns: usize,
     /// The connections that joined as viewers (counted in `conns` too).
     viewers: usize,
+    /// Bytes of whole sheets this board may still broadcast (`un`, `lr`).
+    sheets: Bucket,
     /// The next ping's letter, 0 for A, wrapping after Z.
     next_ping: u8,
 }
@@ -427,6 +429,7 @@ impl Room {
                 live: HashMap::new(),
                 conns: 0,
                 viewers: 0,
+                sheets: Bucket::new(SHEETS_BURST, SHEETS_PER_SEC),
                 next_ping: 0,
             }),
         }
@@ -805,7 +808,8 @@ impl Room {
             }
             In::Uncrumple { k } => {
                 let Some(i) = st.shelf.iter().position(|s| s.k == k) else { return };
-                if !heavy.take() {
+                let size = sheet_size(st.shelf[i].strokes.iter().filter(|s| s.state == LIVE));
+                if !heavy.take() || !may_broadcast(&mut st.sheets, budget, size) {
                     return;
                 }
                 st.snap = None;
@@ -849,7 +853,11 @@ impl Room {
                 let _ = self.tx.send(Out { skip: 0, only: conn, text, end: false });
             }
             In::LayerRestore { l } => {
-                if !st.strokes.iter().any(|s| s.layer == l && s.state == DELETED) || !heavy.take() {
+                if !st.strokes.iter().any(|s| s.layer == l && s.state == DELETED) {
+                    return;
+                }
+                let size = sheet_size(st.strokes.iter().filter(|s| s.layer == l && s.state == DELETED));
+                if !heavy.take() || !may_broadcast(&mut st.sheets, budget, size) {
                     return;
                 }
                 st.snap = None;
@@ -999,6 +1007,26 @@ fn layers_json(st: &State) -> String {
 }
 
 /// The shelf, oldest first: `[{k, n}]` with n the number of drawn items.
+/// About the bytes of a frame holding `strokes`.
+fn sheet_size<'a>(strokes: impl Iterator<Item = &'a Stroke>) -> usize {
+    256 + strokes.map(|s| s.json.len() + 1).sum::<usize>()
+}
+
+/// Whether a whole-sheet frame of `size` bytes may go to everyone: it is
+/// charged to the board, so many addresses cannot add up, and to the asking
+/// address, so its many connections cannot either. One copy is charged,
+/// however many receive it.
+fn may_broadcast(sheets: &mut Bucket, budget: &mut Budget, size: usize) -> bool {
+    if !sheets.take_n(size as f64) {
+        return false;
+    }
+    if !budget.send(size) {
+        sheets.give(size as f64);
+        return false;
+    }
+    true
+}
+
 fn shelf_json(st: &State) -> String {
     let mut out = String::from("[");
     for (i, s) in st.shelf.iter().enumerate() {

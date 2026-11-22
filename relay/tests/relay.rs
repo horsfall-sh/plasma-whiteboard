@@ -875,6 +875,84 @@ async fn a_slow_link_gets_its_snapshot_and_everything_said_meanwhile() {
     s.stop().await;
 }
 
+/// A client that the relay, trusting its proxy, takes to be at `ip`.
+async fn join_from(addr: &str, key: &str, who: &str, ip: &str) -> Client {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+    let (ws, _) = connect_async(req).await.unwrap();
+    let mut c = Client { ws };
+    c.send(json!({"t": "join", "key": key, "who": who})).await;
+    c.expect("hello").await;
+    while c.next().await["t"] != "ready" {}
+    c
+}
+
+#[tokio::test]
+async fn whole_sheets_sent_to_everyone_are_charged_to_the_board_and_the_address() {
+    use wb_relay::keys;
+    let db = temp_db("sheets");
+    let s = start_with(Config { trust_proxy: true, ..config(&db) }).await;
+    new_board(&s.addr).await; // the schema is in place
+    // A shelved sheet of about 10 MB, and nothing on the sheet in use.
+    let edit = keys::random_key();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&keys::view_key(&edit)), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]])
+            .unwrap();
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        let pts = format!("[{}]", v.join(","));
+        for seq in 1..=25 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts, sheet) VALUES(?,?,?,1,'#112233',0.004,?,1)",
+                rusqlite::params![id, seq, format!("s{seq}"), pts],
+            )
+            .unwrap();
+        }
+    }
+    // Bring the sheet back, then crumple it again, until refused. A refused
+    // bring-back is ignored, so the next thing heard is the `ok` for a stroke.
+    async fn cycles(c: &mut Client, k: &mut u64, tag: &str) -> u32 {
+        let mut n = 0;
+        loop {
+            c.send(json!({"t": "un", "k": *k})).await;
+            c.send(json!({"t": "s", "id": format!("{tag}{n}"), "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+            let m = c.next().await;
+            if m["t"] == "ok" {
+                return n;
+            }
+            assert_eq!(m["t"], "un", "{m}");
+            c.expect("ok").await;
+            n += 1;
+            c.send(json!({"t": "cr"})).await;
+            *k = c.expect("cr").await["k"].as_u64().unwrap();
+        }
+    }
+    let mut k = 1;
+    // One address, over two connections: its budget is shared, so the second
+    // connection gets nothing the first did not leave.
+    let mut a1 = join_from(&s.addr, &edit, WHO_A, "2001:db8:a::1").await;
+    let mut a2 = join_from(&s.addr, &edit, WHO_A, "2001:db8:a::2").await;
+    assert_eq!(cycles(&mut a1, &mut k, "a").await, 3, "32 MB of reply budget holds three 10 MB sheets");
+    // a2 hears a1's frames; drain them.
+    while tokio::time::timeout(Duration::from_millis(300), a2.ws.next()).await.is_ok() {}
+    assert_eq!(cycles(&mut a2, &mut k, "b").await, 0, "the address's budget is spent");
+    drop((a1, a2));
+    // Another address has its own budget, but the board has 48 MB in all.
+    let mut b = join_from(&s.addr, &edit, WHO_B, "2001:db8:b::1").await;
+    // Its own budget alone would allow three, as it did the first address;
+    // the board's, part spent, allows fewer (it refills as the test runs).
+    let n = cycles(&mut b, &mut k, "c").await;
+    assert!((1..3).contains(&n), "{n} sheets for the second address");
+    s.stop().await;
+}
+
 #[tokio::test]
 async fn other_sites_cannot_use_the_relay() {
     let s = start(&temp_db("origin")).await;
