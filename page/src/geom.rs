@@ -363,8 +363,10 @@ pub fn steady(pts: &[f64], px: f64) -> Vec<f64> {
     out
 }
 
-/// `hueHex`: hsl(h, 70%, 42%) as #rrggbb.
+/// `hueHex`: hsl(h, 70%, 42%) as #rrggbb. `h` is in [0, 360): app.js clamps the stored hue to 0..359;
+/// outside that, `%` keeps JavaScript's sign and the result is not a colour app.js would make.
 pub fn hue_hex(h: f64) -> String {
+    debug_assert!((0.0..360.0).contains(&h), "hue {h}");
     let (s, l) = (0.7, 0.42);
     let c = (1.0 - (2.0 * l - 1.0f64).abs()) * s;
     let x = c * (1.0 - (((h / 60.0) % 2.0) - 1.0).abs());
