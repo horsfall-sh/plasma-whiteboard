@@ -94,6 +94,10 @@ enum Cmd {
         board: i64,
         reply: oneshot::Sender<Result<Loaded, ()>>,
     },
+    Size {
+        board: i64,
+        reply: oneshot::Sender<Option<usize>>,
+    },
     AddLayer {
         board: i64,
         n: u32,
@@ -299,6 +303,14 @@ impl Db {
         rx.await.unwrap_or(Err(()))
     }
 
+    /// About how many bytes of stroke JSON the board holds once loaded,
+    /// read without loading it. None if storage can't say.
+    pub async fn size(&self, board: i64) -> Option<usize> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Size { board, reply });
+        rx.await.ok().flatten()
+    }
+
     pub fn add_layer(&self, link: &Arc<Link>, n: u32, who: [u8; 32], color: String) {
         self.write(link, Cmd::AddLayer { board: link.board, n, who, color }, None);
     }
@@ -480,6 +492,16 @@ fn apply(
             after.push(Box::new(move |_| {
                 let _ = reply.send(out);
             }));
+        }
+        Cmd::Size { board, reply } => {
+            // An undone stroke is held as its id alone.
+            let r = conn
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(length(pts) + 2 * COALESCE(length(txt), 0) + 96), 0) \
+                     FROM strokes WHERE board = ? AND state != ?",
+                )?
+                .query_row(params![board, UNDONE], |r| r.get::<_, i64>(0));
+            let _ = reply.send(r.ok().map(|n| n.max(0) as usize));
         }
         Cmd::Load { board, reply } => {
             let r = load(conn, board);

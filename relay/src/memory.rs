@@ -11,8 +11,9 @@ pub const MAX_ROOMS: usize = 2000;
 /// A loaded board's fixed cost: its maps, layers and broadcast queue.
 pub const ROOM_COST: usize = 64 * 1024;
 /// Each byte of stroke JSON is held about this many times: the stroke
-/// itself, the snapshot cache built from it and a sheet preview.
-pub const COPIES: usize = 3;
+/// itself, the snapshot cache built from it, a sheet preview and allocator
+/// slack. Measured with the ignored `memory_harness` test.
+pub const COPIES: usize = 4;
 
 /// The weight of a board holding `bytes` of stroke JSON.
 pub fn weight(bytes: usize) -> usize {
@@ -45,6 +46,12 @@ impl Memory {
         u.rooms += 1;
         u.bytes += weight;
         true
+    }
+
+    /// Whether a board of `weight` would be admitted now.
+    pub fn fits(&self, weight: usize) -> bool {
+        let u = self.used.lock().unwrap();
+        u.rooms < self.max_rooms && u.bytes + weight <= self.max_bytes
     }
 
     /// A loaded board grows by `n`, if it fits.

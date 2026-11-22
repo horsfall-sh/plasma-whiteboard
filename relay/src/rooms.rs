@@ -3,7 +3,7 @@
 //! from storage or joined: one slow board does not stall the others.
 
 use crate::db::Db;
-use crate::memory::Memory;
+use crate::memory::{weight, Memory};
 use crate::room::{Joined, Room};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ pub const UNLOAD_GRACE: Duration = Duration::from_secs(15);
 
 /// Boards read from storage at once: each read holds a whole board in
 /// memory before the budget can weigh it.
-const MAX_LOADING: usize = 4;
+const MAX_LOADING: usize = 2;
 
 #[derive(Default)]
 struct Cell {
@@ -51,13 +51,13 @@ impl Rooms {
     }
 
     /// Unload boards no one is connected to (ones in their grace period),
-    /// until `room` fits in the budget. Cells being joined or loaded are
-    /// skipped, never waited on.
-    fn make_room(&self, room: &Room) -> bool {
+    /// other than `keep`, until `fits` says yes. Cells being joined or
+    /// loaded are skipped, never waited on.
+    fn make_room(&self, keep: i64, fits: impl Fn() -> bool) -> bool {
         let cells: Vec<(i64, Arc<Cell>)> =
-            self.map.lock().unwrap().iter().filter(|(b, _)| **b != room.board).map(|(b, c)| (*b, c.clone())).collect();
+            self.map.lock().unwrap().iter().filter(|(b, _)| **b != keep).map(|(b, c)| (*b, c.clone())).collect();
         for (board, cell) in cells {
-            if room.admit() {
+            if fits() {
                 return true;
             }
             let Ok(mut slot) = cell.room.try_lock() else { continue };
@@ -67,7 +67,7 @@ impl Rooms {
                 self.remove(board, &cell);
             }
         }
-        room.admit()
+        fits()
     }
 
     /// The boards loaded or being loaded.
@@ -106,6 +106,17 @@ impl Rooms {
                 Some(r) => r.clone(),
                 None => {
                     // A board that can't be read is refused, never loaded empty.
+                    // Weigh it before reading it: a board that can't fit is
+                    // refused without the cost of loading it.
+                    let est = db.size(board).await.map(weight);
+                    let fits = est.is_some_and(|w| self.mem.fits(w) || self.make_room(board, || self.mem.fits(w)));
+                    if !fits {
+                        if slot.as_ref().is_none_or(|r| r.conns() == 0) {
+                            *slot = None;
+                            self.remove(board, &cell);
+                        }
+                        return Err(if est.is_none() { Refused::Unreadable } else { Refused::Busy });
+                    }
                     let Ok(_turn) = self.loading.acquire().await else { return Err(Refused::Busy) };
                     let Ok(loaded) = db.load(board).await else {
                         if slot.as_ref().is_none_or(|r| r.conns() == 0) {
@@ -115,7 +126,7 @@ impl Rooms {
                         return Err(Refused::Unreadable);
                     };
                     let r = Arc::new(Room::new(board, loaded, self.mem.clone()));
-                    if !r.admit() && !self.make_room(&r) {
+                    if !r.admit() && !self.make_room(board, || r.admit()) {
                         if slot.as_ref().is_none_or(|r| r.conns() == 0) {
                             *slot = None;
                             self.remove(board, &cell);

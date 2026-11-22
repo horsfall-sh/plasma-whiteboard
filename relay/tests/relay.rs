@@ -936,6 +936,15 @@ async fn boards_past_the_shared_memory_budget_are_refused_and_idle_ones_make_way
     let (a, _) = new_board(&s.addr).await;
     let (b, _) = new_board(&s.addr).await;
     let (c, _) = new_board(&s.addr).await;
+    let (d, _) = new_board(&s.addr).await;
+    {
+        let (mut dc, _, _) = Client::join(&s.addr, &d, Some(WHO_A)).await;
+        dc.draw("d1").await;
+    }
+    tokio::time::sleep(GRACE * 3).await;
+    // Spoil board d's row: reading it now would fail.
+    let db = rusqlite::Connection::open(&s.db).unwrap();
+    db.execute("UPDATE strokes SET width = 'x' WHERE id = 'd1'", []).unwrap();
     let (_a, _, _) = Client::join(&s.addr, &a, Some(WHO_A)).await;
     let (bc, _, _) = Client::join(&s.addr, &b, Some(WHO_A)).await;
     let mut x = Client::open(&s.addr).await;
@@ -949,6 +958,10 @@ async fn boards_past_the_shared_memory_budget_are_refused_and_idle_ones_make_way
     let mut y = Client::open(&s.addr).await;
     y.send(json!({"t": "join", "key": b, "who": WHO_A})).await;
     assert_eq!(y.next().await["code"], "busy", "a and c are in use; b can't come back");
+    let mut z = Client::open(&s.addr).await;
+    z.send(json!({"t": "join", "key": d, "who": WHO_A})).await;
+    let m = z.next().await;
+    assert!(m["m"].as_str().unwrap().contains("capacity"), "weighed and refused before it is read: {m}");
     s.stop().await;
 }
 
@@ -1002,5 +1015,69 @@ async fn storage_near_its_quota_refuses_new_strokes_and_boards_without_losing_an
     // Every stroke told ok is there.
     let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
     assert_eq!(strokes.len(), stored);
+    s.stop().await;
+}
+
+/// Resident memory of this process, from /proc (Linux only).
+fn rss_mb() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kb: f64 = s.lines().find(|l| l.starts_with("VmRSS:")).unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+    kb / 1024.0
+}
+
+/// Not a check, a measurement: fill boards close to the per-board cap and
+/// load them until the shared budget says no, then report resident memory.
+/// `cargo test --release --test relay memory_harness -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn memory_harness() {
+    use wb_relay::keys;
+    let db = temp_db("harness");
+    let s = start_with(Config { max_loaded: wb_relay::memory::MAX_LOADED, max_rooms: wb_relay::memory::MAX_ROOMS, ..config(&db) }).await;
+    new_board(&s.addr).await; // the schema is in place
+    let base = rss_mb();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    // About 400 KB of JSON a stroke, 38 a board: just under the 16 MB cap.
+    let pts: String = {
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        format!("[{}]", v.join(","))
+    };
+    let mut views = Vec::new();
+    for b in 0..12 {
+        let edit = keys::random_key();
+        let view = keys::view_key(&edit);
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&view), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]]).unwrap();
+        for seq in 1..=38 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,1,'#112233',0.004,?)",
+                rusqlite::params![id, seq, format!("s{b}x{seq}"), pts],
+            )
+            .unwrap();
+        }
+        views.push(view);
+    }
+    drop(conn);
+    let mut held = Vec::new();
+    let mut peak = base;
+    for (i, view) in views.iter().enumerate() {
+        let mut c = Client::open(&s.addr).await;
+        c.send(json!({"t": "join", "key": view})).await;
+        let hello = c.next().await;
+        if hello["t"] != "hello" {
+            eprintln!("board {i}: refused ({})", hello["m"]);
+            continue;
+        }
+        while c.next().await["t"] != "ready" {}
+        held.push(c);
+        peak = peak.max(rss_mb());
+        eprintln!("board {i}: loaded; rss {:.0} MB", rss_mb());
+    }
+    eprintln!("baseline {base:.0} MB, peak {peak:.0} MB with {} full boards loaded", held.len());
     s.stop().await;
 }
