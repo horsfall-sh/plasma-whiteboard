@@ -3,3 +3,4 @@
 //! modules drive the DOM, the canvases and the socket through web-sys.
 
 pub mod json;
+pub mod proto;

@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wb-smooth = { path = "../smooth" }
 wb-crumple = { path = "../crumple" }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
 opt-level = "s"
