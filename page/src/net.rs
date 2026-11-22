@@ -1029,6 +1029,30 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnect_snapshot_does_not_replay_over_my_strokes() {
+        // the old socket carried half of "drawing" and all of "sent" (pending, not yet ok'd);
+        // the new socket's snapshot replays both as b+p, as the relay last saw them
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = online(&mut h, &mut inp, true);
+        inp.cur = Some(cur("drawing"));
+        h.b.begin("drawing", Some(2), "#111111", 0.004);
+        h.b.extend("drawing", &[0.1, 0.2, 0.5, 0.3, 0.4, 0.5]);
+        h.b.pending.insert("sent".into(), it("sent", 2, None));
+        h.b.insert(it("sent", 2, None));
+        c.closed(&mut h, &mut inp, 1);
+        assert_eq!(c.connect(), Some(2));
+        c.frame(&mut h, &mut inp, 2, HELLO_EDIT);
+        h.take();
+        for id in ["drawing", "sent"] {
+            c.frame(&mut h, &mut inp, 2, &format!(r##"{{"t":"b","id":"{id}","l":2,"c":"#111111","w":0.004}}"##));
+            c.frame(&mut h, &mut inp, 2, &format!(r#"{{"t":"p","id":"{id}","pts":[0.1,0.2,0.5]}}"#));
+        }
+        assert_eq!(h.b.live["drawing"].pts.len(), 6, "my stroke is not cut back to what the relay had");
+        assert!(!h.b.live.contains_key("sent"), "no ghost live stroke over my pending item");
+        assert!(h.take().iter().all(|l| !l.starts_with("draw_new")), "nothing of mine is redrawn from the relay");
+    }
+
+    #[test]
     fn refused_and_undone_items_leave_the_board_and_their_boxes() {
         let (mut h, mut inp) = (Rec::default(), Input::default());
         let mut c = online(&mut h, &mut inp, true);
