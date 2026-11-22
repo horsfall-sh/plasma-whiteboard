@@ -1,9 +1,15 @@
 //! SQLite storage. One thread owns the connection and takes commands in order,
 //! so the relay's async tasks never block on disk and every read sees every
 //! write queued before it. Commands that arrive together share a transaction.
+//!
+//! A write a room makes carries the room's [`Link`]. Its acknowledgement runs
+//! only once the transaction holding it has committed. If the write or the
+//! commit fails, the room is told it is lost: what it holds in memory is no
+//! longer what is stored, so it must be dropped and read again.
 
 use rusqlite::{params, Connection};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
@@ -37,7 +43,44 @@ pub struct Loaded {
     pub strokes: Vec<StrokeRow>,
 }
 
+/// A room's end of the storage queue.
+pub struct Link {
+    pub board: i64,
+    dead: AtomicBool,
+    on_lost: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Link {
+    /// `on_lost` runs once, on the storage thread, when a write is lost.
+    pub fn new(board: i64, on_lost: impl Fn() + Send + Sync + 'static) -> Arc<Link> {
+        Arc::new(Link { board, dead: AtomicBool::new(false), on_lost: Box::new(on_lost) })
+    }
+
+    /// A write of this room's failed: it must not be used any more.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
+    fn lose(&self) {
+        if !self.dead.swap(true, Ordering::SeqCst) {
+            (self.on_lost)();
+        }
+    }
+}
+
+/// Runs on the storage thread once the write it came with is committed.
+pub type Ack = Box<dyn FnOnce() + Send>;
+
+struct Job {
+    cmd: Cmd,
+    /// Set for a room's write.
+    link: Option<Arc<Link>>,
+    ack: Option<Ack>,
+}
+
 enum Cmd {
+    /// Nothing to write: its ack waits for everything queued before it.
+    Nop,
     CreateBoard {
         edit: [u8; 32],
         view: [u8; 32],
@@ -49,7 +92,11 @@ enum Cmd {
     },
     Load {
         board: i64,
-        reply: oneshot::Sender<Loaded>,
+        reply: oneshot::Sender<Result<Loaded, ()>>,
+    },
+    Size {
+        board: i64,
+        reply: oneshot::Sender<Option<usize>>,
     },
     AddLayer {
         board: i64,
@@ -97,9 +144,31 @@ enum Cmd {
     },
 }
 
+/// The default storage quota, in bytes.
+pub const MAX_DB: u64 = 1024 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Db {
-    tx: mpsc::Sender<Cmd>,
+    tx: mpsc::Sender<Job>,
+    full: Arc<AtomicBool>,
+}
+
+/// Storage is near its quota once fewer pages than this are left: a
+/// twentieth of the quota, at least a few pages. Writes already queued
+/// can still be stored; new strokes and boards are refused.
+fn reserve(max_pages: u64) -> u64 {
+    (max_pages / 20).max(4)
+}
+
+/// Whether storage is near its quota. Pages on the free list are reused
+/// before the file grows, so they count as room.
+fn near_quota(conn: &Connection) -> bool {
+    let get = |p: &str| conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, i64>(0)).map(|v| v.max(0) as u64);
+    match (get("max_page_count"), get("page_count"), get("freelist_count")) {
+        (Ok(max), Ok(pages), Ok(free)) => pages.saturating_sub(free) + reserve(max) >= max,
+        // Can't tell: fail closed.
+        _ => true,
+    }
 }
 
 pub fn now() -> i64 {
@@ -138,10 +207,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS strokes_id ON strokes(board, id);
 ";
 
 impl Db {
+    /// Open the database with the default quota.
     pub fn open(path: &str) -> rusqlite::Result<Db> {
+        Db::open_with(path, MAX_DB)
+    }
+
+    /// Open the database, letting it grow to at most `max_bytes`. Past that
+    /// a write fails rather than fill the disk; well before it, new strokes
+    /// and boards are refused (see [`Db::is_full`]).
+    pub fn open_with(path: &str, max_bytes: u64) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL: a commit is on disk before anything is acknowledged. NORMAL
+        // can lose the last commits to a power cut, after their ok was sent.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         // Databases made before text annotations lack the column.
@@ -157,18 +236,48 @@ impl Db {
         if !has_sheet {
             conn.execute_batch("ALTER TABLE strokes ADD COLUMN sheet INTEGER NOT NULL DEFAULT 0")?;
         }
+        let page = conn.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))?.max(512) as u64;
+        let max_pages = (max_bytes / page).max(1);
+        let set = conn.query_row(&format!("PRAGMA max_page_count = {max_pages}"), [], |r| r.get::<_, i64>(0))?;
+        if set as u64 != max_pages {
+            // The file is already larger than the quota: SQLite keeps it.
+            eprintln!("wb-relay: storage is past its quota already; new strokes will be refused");
+        }
+        let full = Arc::new(AtomicBool::new(near_quota(&conn)));
         let (tx, rx) = mpsc::channel();
+        let flag = full.clone();
         std::thread::Builder::new()
             .name("wb-db".into())
-            .spawn(move || run(conn, rx))
+            .spawn(move || run(conn, rx, flag))
             .expect("could not start the storage thread");
-        Ok(Db { tx })
+        Ok(Db { tx, full })
+    }
+
+    /// Storage is near its quota: refuse anything that would add to it.
+    pub fn is_full(&self) -> bool {
+        self.full.load(Ordering::Acquire)
     }
 
     fn send(&self, c: Cmd) {
-        if self.tx.send(c).is_err() {
+        self.job(Job { cmd: c, link: None, ack: None });
+    }
+
+    fn write(&self, link: &Arc<Link>, cmd: Cmd, ack: Option<Ack>) {
+        self.job(Job { cmd, link: Some(link.clone()), ack });
+    }
+
+    fn job(&self, j: Job) {
+        if let Err(mpsc::SendError(j)) = self.tx.send(j) {
             eprintln!("wb-relay: storage thread is gone; a write was dropped");
+            if let Some(link) = j.link {
+                link.lose();
+            }
         }
+    }
+
+    /// Run `ack` once everything this room queued before it is committed.
+    pub fn ack(&self, link: &Arc<Link>, ack: Ack) {
+        self.write(link, Cmd::Nop, Some(ack));
     }
 
     pub async fn create_board(&self, edit: [u8; 32], view: [u8; 32]) -> Option<i64> {
@@ -184,20 +293,33 @@ impl Db {
         rx.await.ok().flatten()
     }
 
-    pub async fn load(&self, board: i64) -> Loaded {
+    /// Read a board's layers and strokes. Err: they could not all be read
+    /// (a storage error or a row that does not parse). The caller must not
+    /// stand in an empty board for it: anything done on an empty stand-in
+    /// (a crumple, a layer drop) would be written over the real rows.
+    pub async fn load(&self, board: i64) -> Result<Loaded, ()> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Load { board, reply });
-        rx.await.unwrap_or_default()
+        rx.await.unwrap_or(Err(()))
     }
 
-    pub fn add_layer(&self, board: i64, n: u32, who: [u8; 32], color: String) {
-        self.send(Cmd::AddLayer { board, n, who, color });
+    /// About how many bytes of stroke JSON the board holds once loaded,
+    /// read without loading it. None if storage can't say.
+    pub async fn size(&self, board: i64) -> Option<usize> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Size { board, reply });
+        rx.await.ok().flatten()
     }
 
+    pub fn add_layer(&self, link: &Arc<Link>, n: u32, who: [u8; 32], color: String) {
+        self.write(link, Cmd::AddLayer { board: link.board, n, who, color }, None);
+    }
+
+    /// Store a stroke; `ack` runs once it is committed.
     #[allow(clippy::too_many_arguments)]
     pub fn add_stroke(
         &self,
-        board: i64,
+        link: &Arc<Link>,
         seq: u64,
         id: String,
         layer: u32,
@@ -205,26 +327,28 @@ impl Db {
         width: f64,
         pts: String,
         txt: Option<String>,
+        ack: Ack,
     ) {
-        self.send(Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt });
+        let board = link.board;
+        self.write(link, Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt }, Some(ack));
     }
 
-    pub fn stroke_state(&self, board: i64, id: String, state: u8) {
-        self.send(Cmd::StrokeState { board, id, state });
+    pub fn stroke_state(&self, link: &Arc<Link>, id: String, state: u8) {
+        self.write(link, Cmd::StrokeState { board: link.board, id, state }, None);
     }
 
-    pub fn layer_state(&self, board: i64, layer: u32, from: u8, to: u8) {
-        self.send(Cmd::LayerState { board, layer, from, to });
+    pub fn layer_state(&self, link: &Arc<Link>, layer: u32, from: u8, to: u8) {
+        self.write(link, Cmd::LayerState { board: link.board, layer, from, to }, None);
     }
 
     /// Move every stroke of one sheet to another sheet number (0 is the one in use).
-    pub fn sheet_move(&self, board: i64, from: u32, to: u32) {
-        self.send(Cmd::SheetMove { board, from, to });
+    pub fn sheet_move(&self, link: &Arc<Link>, from: u32, to: u32) {
+        self.write(link, Cmd::SheetMove { board: link.board, from, to }, None);
     }
 
     /// Throw a crumpled sheet away for good.
-    pub fn sheet_drop(&self, board: i64, sheet: u32) {
-        self.send(Cmd::SheetDrop { board, sheet });
+    pub fn sheet_drop(&self, link: &Arc<Link>, sheet: u32) {
+        self.write(link, Cmd::SheetDrop { board: link.board, sheet }, None);
     }
 
     /// Delete boards not opened since `cutoff`, except those in `skip`.
@@ -242,39 +366,105 @@ impl Db {
     }
 }
 
-fn run(conn: Connection, rx: mpsc::Receiver<Cmd>) {
+/// Runs after the transaction ends; true if it committed.
+type After = Box<dyn FnOnce(bool)>;
+
+fn run(conn: Connection, rx: mpsc::Receiver<Job>, full: Arc<AtomicBool>) {
     while let Ok(first) = rx.recv() {
-        let mut after: Vec<Box<dyn FnOnce()>> = Vec::new();
+        let mut after: Vec<After> = Vec::new();
+        let mut writes: Vec<(Arc<Link>, Option<Ack>, bool)> = Vec::new();
+        let mut committed = true;
         if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
             eprintln!("wb-relay: storage: begin failed: {e}");
+            committed = false;
         }
         let mut next = Some(first);
         let mut n = 0;
-        while let Some(cmd) = next.take() {
-            if let Err(e) = apply(&conn, cmd, &mut after) {
-                eprintln!("wb-relay: storage: {e}");
+        while let Some(job) = next.take() {
+            let ok = match apply(&conn, job.cmd, &mut after) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("wb-relay: storage: {e}");
+                    false
+                }
+            };
+            if let Some(link) = job.link {
+                writes.push((link, job.ack, ok));
             }
             n += 1;
             if n < 512 {
                 next = rx.try_recv().ok();
             }
         }
-        if let Err(e) = conn.execute_batch("COMMIT") {
-            eprintln!("wb-relay: storage: commit failed: {e}");
+        if committed {
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                eprintln!("wb-relay: storage: commit failed: {e}");
+                committed = false;
+            }
+        }
+        if !committed {
             let _ = conn.execute_batch("ROLLBACK");
         }
+        // Before the acks and replies: a client told ok and drawing again
+        // must see the quota its own stroke reached.
+        full.store(near_quota(&conn), Ordering::Release);
+        // Every lost room first, so no ack goes out for a room that lost an
+        // earlier write in the same batch.
+        for (link, _, ok) in &writes {
+            if !(committed && *ok) {
+                link.lose();
+            }
+        }
+        for (link, ack, _) in writes {
+            if let Some(ack) = ack {
+                if !link.is_dead() {
+                    ack();
+                }
+            }
+        }
         for f in after {
-            f();
+            f(committed);
         }
     }
+}
+
+fn load(conn: &Connection, board: i64) -> rusqlite::Result<Loaded> {
+    let mut out = Loaded::default();
+    let mut q = conn
+        .prepare_cached("SELECT n, who_hash, color FROM layers WHERE board = ? ORDER BY n")?;
+    let rows = q.query_map(params![board], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    for row in rows {
+        out.layers.push(row?);
+    }
+    let mut q = conn.prepare_cached(
+        "SELECT seq, id, layer, color, width, pts, state, txt, sheet FROM strokes WHERE board = ? ORDER BY seq",
+    )?;
+    let rows = q.query_map(params![board], |r| {
+        Ok(StrokeRow {
+            seq: r.get::<_, i64>(0)? as u64,
+            id: r.get(1)?,
+            layer: r.get(2)?,
+            color: r.get(3)?,
+            width: r.get(4)?,
+            pts: r.get(5)?,
+            state: r.get(6)?,
+            txt: r.get(7)?,
+            sheet: r.get(8)?,
+        })
+    })?;
+    for row in rows {
+        out.strokes.push(row?);
+    }
+    Ok(out)
 }
 
 fn apply(
     conn: &Connection,
     cmd: Cmd,
-    after: &mut Vec<Box<dyn FnOnce()>>,
+    after: &mut Vec<After>,
 ) -> rusqlite::Result<()> {
     match cmd {
+        Cmd::Nop => {}
         Cmd::CreateBoard { edit, view, reply } => {
             let t = now();
             let r = conn
@@ -283,8 +473,8 @@ fn apply(
                 )?
                 .execute(params![edit, view, t, t]);
             let id = r.ok().map(|_| conn.last_insert_rowid());
-            after.push(Box::new(move || {
-                let _ = reply.send(id);
+            after.push(Box::new(move |committed| {
+                let _ = reply.send(id.filter(|_| committed));
             }));
         }
         Cmd::Lookup { hash, reply } => {
@@ -299,43 +489,33 @@ fn apply(
                     .execute(params![now(), id])?;
             }
             let out = found.map(|(id, edit)| (id, if edit { Role::Edit } else { Role::View }));
-            after.push(Box::new(move || {
+            after.push(Box::new(move |_| {
                 let _ = reply.send(out);
             }));
         }
+        Cmd::Size { board, reply } => {
+            // An undone stroke is held as its id alone.
+            let r = conn
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(length(pts) + 2 * COALESCE(length(txt), 0) + 96), 0) \
+                     FROM strokes WHERE board = ? AND state != ?",
+                )?
+                .query_row(params![board, UNDONE], |r| r.get::<_, i64>(0));
+            let _ = reply.send(r.ok().map(|n| n.max(0) as usize));
+        }
         Cmd::Load { board, reply } => {
-            let mut out = Loaded::default();
-            {
-                let mut q = conn
-                    .prepare_cached("SELECT n, who_hash, color FROM layers WHERE board = ? ORDER BY n")?;
-                let rows = q.query_map(params![board], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-                for row in rows {
-                    out.layers.push(row?);
-                }
-                let mut q = conn.prepare_cached(
-                    "SELECT seq, id, layer, color, width, pts, state, txt, sheet FROM strokes WHERE board = ? ORDER BY seq",
-                )?;
-                let rows = q.query_map(params![board], |r| {
-                    Ok(StrokeRow {
-                        seq: r.get::<_, i64>(0)? as u64,
-                        id: r.get(1)?,
-                        layer: r.get(2)?,
-                        color: r.get(3)?,
-                        width: r.get(4)?,
-                        pts: r.get(5)?,
-                        state: r.get(6)?,
-                        txt: r.get(7)?,
-                        sheet: r.get(8)?,
-                    })
-                })?;
-                for row in rows {
-                    out.strokes.push(row?);
-                }
+            let r = load(conn, board);
+            if let Err(e) = &r {
+                eprintln!("wb-relay: storage: board {board} could not be loaded: {e}");
             }
-            let _ = reply.send(out);
+            let _ = reply.send(r.map_err(|_| ()));
         }
         Cmd::AddLayer { board, n, who, color } => {
-            conn.prepare_cached("INSERT INTO layers(board, n, who_hash, color) VALUES(?,?,?,?)")?
+            // A layer number is reused when an empty layer is reclaimed.
+            conn.prepare_cached(
+                "INSERT INTO layers(board, n, who_hash, color) VALUES(?,?,?,?) \
+                 ON CONFLICT(board, n) DO UPDATE SET who_hash = excluded.who_hash, color = excluded.color",
+            )?
                 .execute(params![board, n, who, color])?;
         }
         Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt } => {
@@ -389,12 +569,12 @@ fn apply(
                 conn.prepare_cached("DELETE FROM boards WHERE id = ?")?.execute(params![id])?;
             }
             let n = ids.len();
-            after.push(Box::new(move || {
-                let _ = reply.send(n);
+            after.push(Box::new(move |committed| {
+                let _ = reply.send(if committed { n } else { 0 });
             }));
         }
         Cmd::Flush { reply } => {
-            after.push(Box::new(move || {
+            after.push(Box::new(move |_| {
                 let _ = reply.send(());
             }));
         }

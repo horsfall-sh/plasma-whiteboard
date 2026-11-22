@@ -2,13 +2,15 @@
 //! message. All changes happen under one lock and are broadcast in that order,
 //! so every client sees the same sequence.
 
-use crate::db::{Db, Loaded, Role, DELETED, LIVE, UNDONE};
+use crate::db::{Db, Link, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
-use crate::limits::Bucket;
+use crate::limits::{Bucket, Budget, SHEETS_BURST, SHEETS_PER_SEC};
+use crate::memory::{weight, Held, Memory};
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -25,6 +27,10 @@ pub const MAX_LIVE_ROOM: usize = 64;
 pub const MAX_LIVE_CONN: usize = 4;
 pub const MAX_LAYERS: usize = 200;
 pub const MAX_ROOM_CONNS: usize = 100;
+/// Viewers may fill this many of a board's connections; the rest are kept
+/// for contributors, so a few addresses holding view sockets can't lock the
+/// editors out.
+pub const MAX_ROOM_VIEWERS: usize = 80;
 pub const MAX_WIDTH: f32 = 0.2;
 pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_TEXT_LINES: usize = 20;
@@ -43,6 +49,8 @@ pub struct Out {
     /// The one connection that receives it (0: everyone).
     pub only: u64,
     pub text: Utf8Bytes,
+    /// The room is lost (a write failed): every connection ends with busy.
+    pub end: bool,
 }
 
 #[derive(Deserialize)]
@@ -141,21 +149,96 @@ struct State {
     next_sheet: u32,
     /// Bytes of stroke JSON held, sheet in use plus shelf.
     bytes: usize,
+    /// What the shared memory budget holds for this board; 0 until admitted.
+    charged: usize,
     /// The snapshot's `ss` chunks, shared by every join until the sheet changes.
-    snap: Option<Vec<Utf8Bytes>>,
+    snap: Option<Arc<Snap>>,
     /// Every stroke id the board has ever stored, undone ones included.
     ids: HashSet<String>,
     layers: Vec<Layer>,
     live: HashMap<String, Live>,
     conns: usize,
+    /// The connections that joined as viewers (counted in `conns` too).
+    viewers: usize,
+    /// Bytes of whole sheets this board may still broadcast (`un`, `lr`).
+    sheets: Bucket,
     /// The next ping's letter, 0 for A, wrapping after Z.
     next_ping: u8,
+}
+
+/// One build of the sheet's `ss` chunks, shared by the cache and by every join still
+/// sending it (council H4). A change to the sheet drops the cache, but a slow join keeps
+/// its build alive, and the next join makes a new one. The room's weight counts one build
+/// ([`crate::memory::COPIES`]); every other build alive at the same time is charged to the
+/// shared memory budget until its last holder lets go, so slow joins cannot pin
+/// uncounted copies of a big sheet.
+pub struct Snap {
+    chunks: Vec<Utf8Bytes>,
+    /// This build is the one the room's weight counts (`spare` was free when it was made).
+    counted: bool,
+    /// Bytes charged to the budget for this build; 0 when `counted`.
+    extra: usize,
+    spare: Arc<AtomicBool>,
+    mem: Arc<Memory>,
+}
+
+impl Drop for Snap {
+    fn drop(&mut self) {
+        if self.counted {
+            self.spare.store(false, Ordering::SeqCst);
+        } else {
+            self.mem.shrink(self.extra);
+        }
+    }
+}
+
+/// The bytes of one join's copy of the live strokes, charged to the shared memory budget
+/// until the join has sent them (council H4: 64 live strokes of 20k points are some 33MB
+/// a join, and a slow join keeps its copy for minutes).
+///
+/// The address that joined is charged too, for these bytes and for an extra build of the
+/// snapshot it holds, so one address cannot hold the whole budget with slow joins (P3-B).
+pub struct Charge {
+    bytes: usize,
+    mem: Arc<Memory>,
+    addr: Option<(Held, usize)>,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.mem.shrink(self.bytes);
+        if let Some((h, n)) = &self.addr {
+            h.give(*n);
+        }
+    }
+}
+
+/// Why a join was refused.
+#[derive(Debug, PartialEq)]
+pub enum NoJoin {
+    /// No seat for it.
+    Full,
+    /// The memory budget has no room for another build of the snapshot.
+    Busy,
 }
 
 pub struct Room {
     pub board: i64,
     tx: broadcast::Sender<Out>,
+    link: Arc<Link>,
+    mem: Arc<Memory>,
+    /// Set while a build of the snapshot is alive that the room's weight counts.
+    spare: Arc<AtomicBool>,
     st: Mutex<State>,
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
+        if st.charged > 0 {
+            self.mem.release(st.charged);
+        }
+    }
 }
 
 /// What a connection is allowed to be on this board.
@@ -171,6 +254,11 @@ pub struct Joined {
     pub rx: broadcast::Receiver<Out>,
     /// hello, the snapshot chunks, live strokes and ready, in order.
     pub snapshot: Vec<Utf8Bytes>,
+    /// The build of the chunks in `snapshot`, held until they are sent so its charge lasts
+    /// as long as the copy does.
+    pub hold: Option<Arc<Snap>>,
+    /// The charge for the live strokes in `snapshot`, held until they are sent.
+    pub live: Option<Charge>,
 }
 
 // ---- numbers on the wire ----------------------------------------------------
@@ -266,7 +354,19 @@ fn stroke_json(
 
 /// Check the text of an annotation. Returns it with line endings normalised
 /// and trailing space removed, or None to refuse it.
+/// Characters taken out of names and text: bidi controls, which can make a
+/// name read as something else or flip the text beside it, and invisible
+/// format characters. The zero-width joiner and non-joiner stay: emoji
+/// sequences and scripts such as Persian need them.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
 fn clean_text(t: &str) -> Option<String> {
+    let t: String = t.chars().filter(|&c| !invisible(c)).collect();
     let t = t.replace("\r\n", "\n").replace('\r', "\n");
     let t = t.trim_end();
     if t.trim().is_empty()
@@ -310,7 +410,39 @@ pub fn layer_color(n: u32) -> String {
 // ---- the room ---------------------------------------------------------------
 
 impl Room {
-    pub fn new(board: i64, loaded: Loaded) -> Room {
+    /// Take this board into the shared memory budget. False if it does not fit.
+    pub fn admit(&self) -> bool {
+        let mut st = self.st.lock().unwrap();
+        if st.charged > 0 {
+            return true;
+        }
+        let w = weight(st.bytes);
+        if !self.mem.admit(w) {
+            return false;
+        }
+        st.charged = w;
+        true
+    }
+
+    /// Set the bytes held to `bytes`, charging or crediting the shared
+    /// budget. False, and nothing changed, if growth does not fit.
+    fn resize(&self, st: &mut State, bytes: usize) -> bool {
+        if st.charged > 0 {
+            let w = weight(bytes);
+            if w > st.charged {
+                if !self.mem.grow(w - st.charged) {
+                    return false;
+                }
+            } else {
+                self.mem.shrink(st.charged - w);
+            }
+            st.charged = w;
+        }
+        st.bytes = bytes;
+        true
+    }
+
+    pub fn new(board: i64, loaded: Loaded, mem: Arc<Memory>) -> Room {
         let mut ids = HashSet::new();
         let mut strokes = Vec::new();
         let mut shelf: Vec<Sheet> = Vec::new();
@@ -351,71 +483,191 @@ impl Room {
             .map(|(n, who, color)| Layer { n, who, color, name: None, on: 0, pinged: None })
             .collect();
         let (tx, _) = broadcast::channel(256);
+        let end = tx.clone();
+        let link = Link::new(board, move || {
+            let _ = end.send(Out { skip: 0, only: 0, text: Utf8Bytes::from_static(""), end: true });
+        });
         Room {
             board,
             tx,
+            link,
+            mem,
+            spare: Arc::new(AtomicBool::new(false)),
             st: Mutex::new(State {
                 next_seq,
                 strokes,
                 shelf,
                 next_sheet,
                 bytes,
+                charged: 0,
                 snap: None,
                 ids,
                 layers,
                 live: HashMap::new(),
                 conns: 0,
+                viewers: 0,
+                sheets: Bucket::new(SHEETS_BURST, SHEETS_PER_SEC),
                 next_ping: 0,
             }),
         }
     }
 
     fn all(&self, text: String) {
-        let _ = self.tx.send(Out { skip: 0, only: 0, text: text.into() });
+        let _ = self.tx.send(Out { skip: 0, only: 0, text: text.into(), end: false });
     }
     fn others(&self, conn: u64, text: String) {
-        let _ = self.tx.send(Out { skip: conn, only: 0, text: text.into() });
+        let _ = self.tx.send(Out { skip: conn, only: 0, text: text.into(), end: false });
     }
     fn only(&self, conn: u64, text: String) {
-        let _ = self.tx.send(Out { skip: 0, only: conn, text: text.into() });
+        let _ = self.tx.send(Out { skip: 0, only: conn, text: text.into(), end: false });
+    }
+
+    /// A write failed: what this room holds is not what is stored. It takes
+    /// no one new, and is read again from storage on the next join.
+    pub fn is_dead(&self) -> bool {
+        self.link.is_dead()
     }
 
     pub fn conns(&self) -> usize {
         self.st.lock().unwrap().conns
     }
 
-    /// Add a connection. `who` is the hash of the contributor secret (edit
-    /// links only). `view` is the view key to hand to an editor.
-    /// Err: the board has no room for another connection.
+    /// [`Room::join_from`] for no address in particular (tests).
     pub fn join(
+        &self,
+        conn: u64,
+        role: Role,
+        who: Option<[u8; 32]>,
+        view: Option<&str>,
+        db: &Db,
+        may_add: impl FnOnce() -> bool,
+    ) -> Result<Joined, NoJoin> {
+        self.join_from(conn, role, who, view, db, None, may_add)
+    }
+
+    /// Add a connection. `who` is the hash of the contributor secret (edit
+    /// links only). `view` is the view key to hand to an editor. `held` is what
+    /// the joining address holds of the memory budget (P3-B).
+    /// `may_add` is asked, once, before a new contributor is given a layer, and
+    /// only once the join's copies are charged (P3-B2): false (the address made
+    /// too many lately) makes them a viewer.
+    /// Err: the board has no room for another connection, or the budget for its copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_from(
         &self,
         conn: u64,
         mut role: Role,
         who: Option<[u8; 32]>,
         view: Option<&str>,
         db: &Db,
-    ) -> Result<Joined, ()> {
+        held: Option<&Held>,
+        may_add: impl FnOnce() -> bool,
+    ) -> Result<Joined, NoJoin> {
         let mut st = self.st.lock().unwrap();
         if st.conns >= MAX_ROOM_CONNS {
-            return Err(());
+            return Err(NoJoin::Full);
         }
-        let mut layer = 0;
-        if role == Role::Edit {
-            let who = who.ok_or(())?;
-            if let Some(l) = st.layers.iter_mut().find(|l| l.who == who) {
-                layer = l.n;
-                l.on += 1;
-            } else if st.layers.len() < MAX_LAYERS {
-                layer = st.layers.len() as u32 + 1;
-                let color = layer_color(layer);
-                db.add_layer(self.board, layer, who, color.clone());
-                self.all(format!(r#"{{"t":"l","l":{layer},"c":"{color}"}}"#));
-                st.layers.push(Layer { n: layer, who, color, name: None, on: 1, pinged: None });
-            } else {
-                role = Role::View;
+        // Settle the role before counting it: whoever will be a viewer
+        // (including an edit-key holder when the layers are full) takes a
+        // viewer's seat.
+        enum Seat {
+            Mine(usize),
+            New,
+            Reclaim(usize),
+            Full,
+        }
+        let mut seat = match (role, who) {
+            (Role::Edit, None) => return Err(NoJoin::Full),
+            (Role::Edit, Some(who)) => match st.layers.iter().position(|l| l.who == who) {
+                Some(i) => Seat::Mine(i),
+                None if st.layers.len() < MAX_LAYERS => Seat::New,
+                None => reclaimable(&st).map_or(Seat::Full, Seat::Reclaim),
+            },
+            (Role::View, _) => Seat::Full,
+        };
+        if matches!(seat, Seat::Full) && st.viewers >= MAX_ROOM_VIEWERS {
+            return Err(NoJoin::Full);
+        }
+        // Before anything changes: a build of the snapshot that must be charged may not fit.
+        let snap = match &st.snap {
+            Some(s) => s.clone(),
+            None => {
+                let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
+                let chunks: Vec<Utf8Bytes> = drawn
+                    .chunks(SNAPSHOT_CHUNK)
+                    .map(|c| strokes_msg(r#"{"t":"ss","a":["#, c.iter().map(|s| s.json.as_str())).into())
+                    .collect();
+                let bytes: usize = chunks.iter().map(|c| c.len()).sum();
+                let counted = self.spare.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+                if !counted && !self.mem.grow(bytes) {
+                    return Err(NoJoin::Busy);
+                }
+                let extra = if counted { 0 } else { bytes };
+                let s = Arc::new(Snap { chunks, counted, extra, spare: self.spare.clone(), mem: self.mem.clone() });
+                st.snap = Some(s.clone());
+                s
+            }
+        };
+        // Each join's copy of the live strokes is its own: charge it too, before anything changes.
+        let mut live = Vec::new();
+        for (id, s) in &st.live {
+            let w = width_json(s.w);
+            live.push(Utf8Bytes::from(format!(r#"{{"t":"b","id":"{id}","l":{},"c":"{}","w":{w}}}"#, s.layer, s.c)));
+            if !s.pts.is_empty() {
+                live.push(format!(r#"{{"t":"p","id":"{id}","pts":{}}}"#, pts_json(&s.pts)).into());
             }
         }
+        let bytes: usize = live.iter().map(|t| t.len()).sum();
+        // The address holds this copy and any extra build of the snapshot it keeps alive.
+        let addr_bytes = bytes + snap.extra;
+        if held.is_some_and(|h| !h.take(addr_bytes, self.mem.addr_cap())) {
+            return Err(NoJoin::Busy);
+        }
+        let addr = held.map(|h| (h.clone(), addr_bytes));
+        if !self.mem.grow(bytes) {
+            if let Some((h, n)) = &addr {
+                h.give(*n);
+            }
+            return Err(NoJoin::Busy);
+        }
+        let charge = Charge { bytes, mem: self.mem.clone(), addr };
+        // Only now, with the copies charged, may a new contributor spend a layer token (P3-B2).
+        if matches!(seat, Seat::New | Seat::Reclaim(_)) && !may_add() {
+            seat = Seat::Full;
+            if st.viewers >= MAX_ROOM_VIEWERS {
+                return Err(NoJoin::Full);
+            }
+        }
+        let full = role == Role::Edit && matches!(seat, Seat::Full);
+        let who = who.unwrap_or_default();
+        let mut layer = 0;
+        match seat {
+            Seat::Mine(i) => {
+                layer = st.layers[i].n;
+                st.layers[i].on += 1;
+            }
+            Seat::New => {
+                layer = st.layers.len() as u32 + 1;
+                let color = layer_color(layer);
+                db.add_layer(&self.link, layer, who, color.clone());
+                self.all(format!(r#"{{"t":"l","l":{layer},"c":"{color}"}}"#));
+                st.layers.push(Layer { n: layer, who, color, name: None, on: 1, pinged: None });
+            }
+            Seat::Reclaim(i) => {
+                // An empty layer no one is on: hand it to the newcomer, with
+                // its first colour and no name.
+                layer = st.layers[i].n;
+                let color = layer_color(layer);
+                db.add_layer(&self.link, layer, who, color.clone());
+                self.all(format!(r#"{{"t":"nm","l":{layer},"n":null,"c":"{color}"}}"#));
+                st.layers[i] = Layer { n: layer, who, color, name: None, on: 1, pinged: None };
+            }
+            Seat::Full => role = Role::View,
+        }
         st.conns += 1;
+        if role == Role::View {
+            st.viewers += 1;
+        }
         // Subscribe after the layer notice (the newcomer reads its layer from
         // hello) and before anything else can be broadcast.
         let rx = self.tx.subscribe();
@@ -428,34 +680,28 @@ impl Room {
             Role::Edit => hello.push_str(&layer.to_string()),
             Role::View => hello.push_str("null"),
         }
-        match (role, view) {
-            (Role::Edit, Some(v)) => hello.push_str(&format!(r#","view":"{v}","layers":["#)),
-            _ => hello.push_str(r#","view":null,"layers":["#),
+        // Every edit-key holder learns the view key, even one turned into a
+        // viewer because the layers are full: the page shows the current key
+        // as the view link only when no view key came (a view-key holder).
+        match view {
+            Some(v) => hello.push_str(&format!(r#","view":"{v}","layers":["#)),
+            None => hello.push_str(r#","view":null,"layers":["#),
         }
         hello.push_str(&layers_json(&st));
         hello.push_str(r#"],"shelf":"#);
         hello.push_str(&shelf_json(&st));
         hello.push('}');
         snapshot.push(hello.into());
+        if full {
+            snapshot.push(Utf8Bytes::from_static(
+                r#"{"t":"err","code":"full","m":"This board has no room for another contributor right now, so it opened view-only."}"#,
+            ));
+        }
 
-        if st.snap.is_none() {
-            let drawn: Vec<&Stroke> = st.strokes.iter().filter(|s| s.state == LIVE).collect();
-            let chunks = drawn
-                .chunks(SNAPSHOT_CHUNK)
-                .map(|c| strokes_msg(r#"{"t":"ss","a":["#, c.iter().map(|s| s.json.as_str())).into())
-                .collect();
-            st.snap = Some(chunks);
-        }
-        snapshot.extend(st.snap.iter().flatten().cloned());
-        for (id, s) in &st.live {
-            let w = width_json(s.w);
-            snapshot.push(format!(r#"{{"t":"b","id":"{id}","l":{},"c":"{}","w":{w}}}"#, s.layer, s.c).into());
-            if !s.pts.is_empty() {
-                snapshot.push(format!(r#"{{"t":"p","id":"{id}","pts":{}}}"#, pts_json(&s.pts)).into());
-            }
-        }
+        snapshot.extend(snap.chunks.iter().cloned());
+        snapshot.extend(live);
         snapshot.push(Utf8Bytes::from_static(r#"{"t":"ready"}"#));
-        Ok(Joined { peer: Peer { conn, role, layer }, rx, snapshot })
+        Ok(Joined { peer: Peer { conn, role, layer }, rx, snapshot, hold: Some(snap), live: Some(charge) })
     }
 
     /// Remove a connection and abandon the strokes it left unfinished.
@@ -463,6 +709,9 @@ impl Room {
         let conn = peer.conn;
         let mut st = self.st.lock().unwrap();
         st.conns = st.conns.saturating_sub(1);
+        if peer.role == Role::View {
+            st.viewers = st.viewers.saturating_sub(1);
+        }
         if peer.role == Role::Edit {
             if let Some(l) = st.layers.iter_mut().find(|l| l.n == peer.layer) {
                 l.on = l.on.saturating_sub(1);
@@ -480,7 +729,8 @@ impl Room {
     /// Apply one message from a connection that has joined.
     /// `heavy` is the connection's budget for the operations that send a whole
     /// sheet or layer (crumple, bring back, preview, layer restore).
-    pub fn handle(&self, peer: Peer, text: &str, db: &Db, heavy: &mut Bucket) {
+    pub fn handle(&self, peer: Peer, text: &str, db: &Db, budget: &mut Budget) {
+        let heavy = &mut budget.heavy;
         if peer.role != Role::Edit {
             return; // viewers can't change the board
         }
@@ -584,7 +834,7 @@ impl Room {
                         }
                     },
                 };
-                self.commit(&mut st, peer, id, c, w, pts, None, was_live, db);
+                self.commit(&mut st, peer, id, c, w, pts, None, was_live, db, &budget.store);
             }
             In::Stroke { id, c, w, pts, txt } => {
                 if !valid_id(&id) {
@@ -609,7 +859,7 @@ impl Room {
                 };
                 match (pts, txt) {
                     (Some(pts), Ok(txt)) if valid_color(&c) && valid_width(w) => {
-                        self.commit(&mut st, peer, id, c, w, pts, txt, was_live, db);
+                        self.commit(&mut st, peer, id, c, w, pts, txt, was_live, db, &budget.store);
                     }
                     _ => {
                         if was_live {
@@ -636,9 +886,10 @@ impl Room {
                     return;
                 };
                 let gone = st.strokes.remove(i);
-                st.bytes = st.bytes.saturating_sub(gone.json.len());
+                let left = st.bytes.saturating_sub(gone.json.len());
+                self.resize(&mut st, left);
                 st.snap = None;
-                db.stroke_state(self.board, id.clone(), UNDONE);
+                db.stroke_state(&self.link, id.clone(), UNDONE);
                 self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
             }
             In::LayerDelete { l } => {
@@ -649,7 +900,7 @@ impl Room {
                 }
                 if any {
                     st.snap = None;
-                    db.layer_state(self.board, l, LIVE, DELETED);
+                    db.layer_state(&self.link, l, LIVE, DELETED);
                     self.all(format!(r#"{{"t":"ld","l":{l}}}"#));
                 }
             }
@@ -661,16 +912,17 @@ impl Room {
                 let k = st.next_sheet;
                 st.next_sheet += 1;
                 let sheet = std::mem::take(&mut st.strokes);
-                db.sheet_move(self.board, 0, k);
+                db.sheet_move(&self.link, 0, k);
                 st.shelf.push(Sheet { k, strokes: sheet, view: None });
                 let mut dropped = String::from("null");
                 if st.shelf.len() > MAX_SHELF {
                     let old = st.shelf.remove(0);
                     for s in &old.strokes {
                         st.ids.remove(&s.id);
-                        st.bytes = st.bytes.saturating_sub(s.json.len());
+                        let left = st.bytes.saturating_sub(s.json.len());
+                        self.resize(&mut st, left);
                     }
-                    db.sheet_drop(self.board, old.k);
+                    db.sheet_drop(&self.link, old.k);
                     dropped = old.k.to_string();
                 }
                 self.all(format!(
@@ -681,7 +933,8 @@ impl Room {
             }
             In::Uncrumple { k } => {
                 let Some(i) = st.shelf.iter().position(|s| s.k == k) else { return };
-                if !heavy.take() {
+                let size = sheet_size(st.shelf[i].strokes.iter().filter(|s| s.state == LIVE));
+                if !heavy.take() || !may_broadcast(&mut st.sheets, budget, size) {
                     return;
                 }
                 st.snap = None;
@@ -692,12 +945,12 @@ impl Room {
                 st.next_sheet += 1;
                 if cur.is_empty() {
                     // Only undone rows can be left on sheet 0; they go for good.
-                    db.sheet_drop(self.board, 0);
+                    db.sheet_drop(&self.link, 0);
                 } else {
-                    db.sheet_move(self.board, 0, nk);
+                    db.sheet_move(&self.link, 0, nk);
                     st.shelf.push(Sheet { k: nk, strokes: cur, view: None });
                 }
-                db.sheet_move(self.board, k, 0);
+                db.sheet_move(&self.link, k, 0);
                 let head = format!(
                     r#"{{"t":"un","k":{k},"by":{},"shelf":{},"layers":[{}],"a":["#,
                     peer.layer,
@@ -709,19 +962,27 @@ impl Room {
             }
             In::SheetView { k } => {
                 let Some(sheet) = st.shelf.iter_mut().find(|s| s.k == k) else { return };
+                // A cached preview costs as much to send as a new one.
+                if !heavy.take() {
+                    return;
+                }
                 if sheet.view.is_none() {
-                    if !heavy.take() {
-                        return;
-                    }
                     let head = format!(r#"{{"t":"sv","k":{k},"a":["#);
                     let drawn = sheet.strokes.iter().filter(|s| s.state == LIVE).map(|s| s.json.as_str());
                     sheet.view = Some(strokes_msg(&head, drawn).into());
                 }
                 let text = sheet.view.clone().expect("just built");
-                let _ = self.tx.send(Out { skip: 0, only: conn, text });
+                if !budget.send(text.len()) {
+                    return;
+                }
+                let _ = self.tx.send(Out { skip: 0, only: conn, text, end: false });
             }
             In::LayerRestore { l } => {
-                if !st.strokes.iter().any(|s| s.layer == l && s.state == DELETED) || !heavy.take() {
+                if !st.strokes.iter().any(|s| s.layer == l && s.state == DELETED) {
+                    return;
+                }
+                let size = sheet_size(st.strokes.iter().filter(|s| s.layer == l && s.state == DELETED));
+                if !heavy.take() || !may_broadcast(&mut st.sheets, budget, size) {
                     return;
                 }
                 st.snap = None;
@@ -731,12 +992,23 @@ impl Room {
                     back.push(&s.json);
                 }
                 if !back.is_empty() {
-                    db.layer_state(self.board, l, DELETED, LIVE);
+                    db.layer_state(&self.link, l, DELETED, LIVE);
                     let head = format!(r#"{{"t":"lr","l":{l},"a":["#);
                     self.all(strokes_msg(&head, back.into_iter()));
                 }
             }
         }
+    }
+
+    /// The author's `ok`, to send from the storage thread once the stroke is
+    /// committed. An ok is a promise that the stroke is on disk: the page
+    /// forgets its own copy on it.
+    fn ok_once_stored(&self, conn: u64, id: &str, seq: u64) -> crate::db::Ack {
+        let tx = self.tx.clone();
+        let text = format!(r#"{{"t":"ok","id":"{id}","q":{seq}}}"#);
+        Box::new(move || {
+            let _ = tx.send(Out { skip: 0, only: conn, text: text.into(), end: false });
+        })
     }
 
     /// Store a finished stroke and tell everyone.
@@ -752,6 +1024,7 @@ impl Room {
         txt: Option<String>,
         was_live: bool,
         db: &Db,
+        store: &Mutex<Bucket>,
     ) {
         let conn = peer.conn;
         let drop_live = |room: &Room| {
@@ -765,16 +1038,24 @@ impl Room {
             return;
         }
         if st.ids.contains(&id) {
-            // A resend. Confirm it again if it is still this layer's stroke.
+            // A resend. Confirm it again only if it is still this layer's stroke on the sheet
+            // in use. Crumpled onto the shelf, deleted with its layer or undone, it is not on
+            // the author's sheet any more: `u` takes their copy away instead of leaving a ghost.
             drop_live(self);
-            // It may have been crumpled onto the shelf since; that still counts.
-            let held = st.strokes.iter().chain(st.shelf.iter().flat_map(|s| s.strokes.iter()));
-            match held.rev().find(|s| s.id == id) {
-                Some(s) if s.layer == peer.layer => {
-                    self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{}}}"#, s.seq));
+            match st.strokes.iter().rev().find(|s| s.id == id) {
+                Some(s) if s.layer == peer.layer && s.state == LIVE => {
+                    // Not before the first copy is committed.
+                    let ok = self.ok_once_stored(conn, &id, s.seq);
+                    db.ack(&self.link, ok);
                 }
                 _ => self.only(conn, format!(r#"{{"t":"u","id":"{id}"}}"#)),
             }
+            return;
+        }
+        if db.is_full() {
+            // Refused before it is sent on: a stroke the others see must be stored.
+            drop_live(self);
+            self.only(conn, refusal(&id, "storage is full; try again later"));
             return;
         }
         let (wj, pj) = (width_json(w), pts_json(&pts));
@@ -787,20 +1068,48 @@ impl Room {
             self.only(conn, refusal(&id, "this board is full"));
             return;
         }
+        // The address's share of storage (H5), taken before anything is kept or sent on.
+        if !store.lock().unwrap().take_n(size as f64) {
+            drop_live(self);
+            self.only(conn, refusal(&id, "too much has been stored from your network lately; try again later"));
+            return;
+        }
         let seq = st.next_seq;
         st.next_seq += 1;
         let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
+        let more = st.bytes + json.len();
+        if !self.resize(st, more) {
+            store.lock().unwrap().give(size as f64);
+            drop_live(self);
+            self.only(conn, refusal(&id, "the server is out of memory for strokes; try again later"));
+            return;
+        }
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
-        self.only(conn, format!(r#"{{"t":"ok","id":"{id}","q":{seq}}}"#));
-        db.add_stroke(self.board, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt);
+        let ok = self.ok_once_stored(conn, &id, seq);
+        db.add_stroke(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, ok);
         st.ids.insert(id.clone());
-        st.bytes += json.len();
         st.snap = None;
         st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
     }
 }
 
 /// The head count, with the layers that have a connection open: `{t:"n", n, on:[l..]}`.
+/// A layer that can be handed to a new contributor: no one is on it and it
+/// holds nothing, on the sheet in use, on the shelf or being drawn.
+fn reclaimable(st: &State) -> Option<usize> {
+    if !st.layers.iter().any(|l| l.on == 0) {
+        return None;
+    }
+    let used: HashSet<u32> = st
+        .strokes
+        .iter()
+        .chain(st.shelf.iter().flat_map(|s| s.strokes.iter()))
+        .map(|s| s.layer)
+        .chain(st.live.values().map(|s| s.layer))
+        .collect();
+    st.layers.iter().position(|l| l.on == 0 && !used.contains(&l.n))
+}
+
 fn count_msg(st: &State) -> String {
     let on: Vec<String> = st.layers.iter().filter(|l| l.on > 0).map(|l| l.n.to_string()).collect();
     format!(r#"{{"t":"n","n":{},"on":[{}]}}"#, st.conns, on.join(","))
@@ -808,6 +1117,7 @@ fn count_msg(st: &State) -> String {
 
 /// A display name: 1 to 24 characters, single spaces, nothing unprintable.
 fn clean_name(n: &str) -> Option<String> {
+    let n: String = n.chars().filter(|&c| !invisible(c)).collect();
     let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
     let len = n.chars().count();
     if len == 0 || len > 24 || n.chars().any(char::is_control) {
@@ -828,6 +1138,26 @@ fn layers_json(st: &State) -> String {
         out.push_str(&format!(r#"{{"l":{},"c":"{}","del":{del},"n":{name}}}"#, l.n, l.color));
     }
     out
+}
+
+/// About the bytes of a frame holding `strokes`.
+fn sheet_size<'a>(strokes: impl Iterator<Item = &'a Stroke>) -> usize {
+    256 + strokes.map(|s| s.json.len() + 1).sum::<usize>()
+}
+
+/// Whether a whole-sheet frame of `size` bytes may go to everyone: it is
+/// charged to the board, so many addresses cannot add up, and to the asking
+/// address, so its many connections cannot either. One copy is charged,
+/// however many receive it.
+fn may_broadcast(sheets: &mut Bucket, budget: &mut Budget, size: usize) -> bool {
+    if !sheets.take_n(size as f64) {
+        return false;
+    }
+    if !budget.send(size) {
+        sheets.give(size as f64);
+        return false;
+    }
+    true
 }
 
 /// The shelf, oldest first: `[{k, n}]` with n the number of drawn items.
@@ -892,6 +1222,22 @@ mod tests {
         assert!(clean_text(&"x".repeat(MAX_TEXT_CHARS + 1)).is_none());
         assert!(clean_text(&"x\n".repeat(MAX_TEXT_LINES + 1)).is_none());
         assert!(clean_text("naïve “quotes” \\ \" 日本語").is_some());
+        // Bidi controls and invisible characters go; joiners stay.
+        assert_eq!(clean_text("abc\u{202E}fed\u{2066}x\u{2069}\u{200B}\u{FEFF}").unwrap(), "abcfedx");
+        assert!(clean_text("\u{200B}\u{202E}").is_none(), "nothing visible is left");
+        assert_eq!(clean_text("👩\u{200D}🏫 می\u{200C}خواهم").unwrap(), "👩\u{200D}🏫 می\u{200C}خواهم");
+    }
+
+    #[test]
+    fn names_are_checked() {
+        assert_eq!(clean_name("  Amber   Otter ").unwrap(), "Amber Otter");
+        assert_eq!(clean_name("Tea\u{202E}rehc").unwrap(), "Tearehc", "an override cannot make it read as Teacher");
+        assert_eq!(clean_name("Ann\u{2067}\u{200F}e").unwrap(), "Anne");
+        assert!(clean_name("\u{200B}\u{2060}").is_none());
+        assert!(clean_name("tab\u{7}").is_none());
+        assert!(clean_name(&"x".repeat(25)).is_none());
+        assert!(clean_name(&format!("{}\u{200B}", "x".repeat(24))).is_some(), "invisibles do not count");
+        assert_eq!(clean_name("👨\u{200D}👩\u{200D}👧").unwrap(), "👨\u{200D}👩\u{200D}👧");
         let j = stroke_json("a", 1, 2, "#111111", "0.02", "[0.1,0.2,0.5]", Some("say \"hi\"\n</script>"));
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["txt"], "say \"hi\"\n</script>");

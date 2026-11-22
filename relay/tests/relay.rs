@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use wb_relay::memory::{COPIES, ROOM_COST};
 use wb_relay::{serve, Config};
 
 struct Srv {
@@ -23,10 +24,32 @@ fn temp_db(name: &str) -> String {
 }
 
 async fn start(db: &str) -> Srv {
+    start_with(config(db)).await
+}
+
+fn config(db: &str) -> Config {
+    Config {
+        db_path: db.to_string(),
+        ttl_days: 0,
+        trust_proxy: false,
+        web_dir: None,
+        unload_grace: GRACE,
+        max_loaded: usize::MAX / 2,
+        max_rooms: 1000,
+        max_db: 1 << 30,
+        catch_up_min: wb_relay::CATCH_UP_MIN,
+        catch_up_rate: wb_relay::CATCH_UP_RATE,
+    }
+}
+
+/// Short, so tests can watch a board unload.
+const GRACE: Duration = Duration::from_millis(300);
+
+async fn start_with(cfg: Config) -> Srv {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let cfg = Config { db_path: db.to_string(), ttl_days: 0, trust_proxy: false, web_dir: None };
+    let db = cfg.db_path.clone();
     let task = tokio::spawn(async move {
         serve(listener, cfg, async {
             let _ = stopped.await;
@@ -34,7 +57,7 @@ async fn start(db: &str) -> Srv {
         .await
         .unwrap();
     });
-    Srv { addr, db: db.to_string(), stop: Some(stop), task }
+    Srv { addr, db, stop: Some(stop), task }
 }
 
 impl Srv {
@@ -155,10 +178,12 @@ async fn page_and_headers() {
     assert!(head.contains("content-security-policy: default-src 'self'"));
     assert!(head.contains("referrer-policy: no-referrer"));
     assert_eq!(http(&s.addr, "GET", "/b/anything").await.0, 200);
-    let (status, head, _) = http(&s.addr, "GET", "/smooth.wasm").await;
+    let (status, head, _) = http(&s.addr, "GET", "/page_bg.wasm").await;
     assert_eq!(status, 200);
     assert!(head.contains("content-type: application/wasm"));
-    assert_eq!(http(&s.addr, "GET", "/app.js").await.0, 200);
+    assert_eq!(http(&s.addr, "GET", "/boot.js").await.0, 200);
+    assert_eq!(http(&s.addr, "GET", "/page.js").await.0, 200);
+    assert_eq!(http(&s.addr, "GET", "/app.js").await.0, 404);
     assert_eq!(http(&s.addr, "GET", "/app.css").await.0, 200);
     assert_eq!(http(&s.addr, "GET", "/nope").await.0, 404);
     assert_eq!(http(&s.addr, "GET", "/api/boards").await.0, 405);
@@ -229,6 +254,126 @@ async fn draw_view_and_late_join() {
     assert_eq!(strokes.len(), 1);
     assert_eq!(strokes[0]["id"], "s1");
     assert_eq!(strokes[0]["pts"], json!([0.1, 0.1, 0.5, 0.2, 0.2, 0.6]));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_board_stays_loaded_for_a_grace_period_then_unloads() {
+    let s = start(&temp_db("grace")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    {
+        let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+        a.draw("a1").await;
+    }
+    // Spoil the stored row: only a fresh read of the board can notice.
+    let conn = rusqlite::Connection::open(&s.db).unwrap();
+    conn.execute("UPDATE strokes SET width = 'x' WHERE id = 'a1'", []).unwrap();
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    assert_eq!(strokes.len(), 1, "rejoined within the grace: still loaded, not read again");
+    drop(_v);
+    tokio::time::sleep(GRACE * 3).await;
+    let mut c = Client::open(&s.addr).await;
+    c.send(json!({"t": "join", "key": view})).await;
+    assert_eq!(c.next().await["code"], "busy", "after the grace it was unloaded and read again");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn joins_that_race_to_load_a_board_share_one_room() {
+    let s = start(&temp_db("race")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let viewers = futures_util::future::join_all((0..8).map(|_| Client::join(&s.addr, &view, None))).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    a.draw("a1").await;
+    for (mut v, _, _) in viewers {
+        loop {
+            let m = v.next().await;
+            if m["t"] == "e" {
+                assert_eq!(m["id"], "a1");
+                break;
+            }
+        }
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn ok_means_stored_and_a_lost_write_drops_the_room() {
+    let s = start(&temp_db("lostwrite")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    a.draw("a1").await;
+
+    // Every stroke insert fails from here on.
+    let conn = rusqlite::Connection::open(&s.db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER no_more BEFORE INSERT ON strokes BEGIN SELECT RAISE(ABORT, 'test'); END;",
+    )
+    .unwrap();
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+    a.send(json!({"t": "s", "id": "a2", "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+    // No ok for a stroke that was not stored: the room is dropped instead.
+    let m = a.next().await;
+    assert_eq!((&m["t"], &m["code"]), (&json!("err"), &json!("busy")), "{m}");
+    assert!(a.raw().await.is_none(), "the connection ends");
+    loop {
+        let m = v.next().await;
+        if m["t"] == "err" {
+            assert_eq!(m["code"], "busy", "{m}");
+            break;
+        }
+        assert_eq!(m["t"], "e", "{m}");
+    }
+
+    // The next join reads the board from storage: a2 was never kept.
+    conn.execute_batch("DROP TRIGGER no_more;").unwrap();
+    let (mut a, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1"]);
+    // The page resends it, and now it is stored.
+    a.draw("a2").await;
+    let db = s.stop().await;
+    let s = start(&db).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1", "a2"]);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_board_that_cannot_be_read_is_refused_not_loaded_empty() {
+    let s = start(&temp_db("unreadable")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    {
+        let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+        a.draw("a1").await;
+        a.draw("a2").await;
+    }
+    let db = s.stop().await;
+
+    // A row that does not parse: the width is text.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE strokes SET width = 'x' WHERE id = 'a2'", []).unwrap();
+
+    let s = start(&db).await;
+    for _ in 0..2 {
+        let mut c = Client::open(&s.addr).await;
+        c.send(json!({"t": "join", "key": edit, "who": WHO_A})).await;
+        let m = c.next().await;
+        assert_eq!(m["t"], "err", "{m}");
+        assert_eq!(m["code"], "busy", "{m}");
+    }
+    let db = s.stop().await;
+
+    // Nothing was written over the stored board while it was refused.
+    let n: i64 = conn.query_row("SELECT count(*) FROM strokes", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
+    conn.execute("UPDATE strokes SET width = 0.004 WHERE id = 'a2'", []).unwrap();
+    drop(conn);
+    let s = start(&db).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1", "a2"], "once readable, the board opens with every stroke");
     s.stop().await;
 }
 
@@ -367,6 +512,12 @@ async fn resends_are_stored_once() {
 
     let (_c, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
     assert_eq!(strokes.len(), 2);
+
+    // Crumpled since: a resend is told to take it away, not that it is on this sheet.
+    a.send(json!({"t": "cr"})).await;
+    a.expect("cr").await;
+    a.send(json!({"t": "e", "id": "x1", "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+    assert_eq!(a.expect("u").await["id"], "x1");
     s.stop().await;
 }
 
@@ -528,8 +679,12 @@ async fn text_annotations() {
     assert_eq!(a.expect("lr").await["a"][0]["txt"], text);
     // The author can undo it like a stroke.
     a.send(json!({"t": "u", "id": "t1"})).await;
+    // The relay answers the undo to nobody but the others, so a stroke after it is the round
+    // trip that proves it was applied: one connection's frames are handled in order.
+    a.draw("after").await;
     let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
-    assert!(strokes.is_empty());
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["after"]);
     s.stop().await;
 }
 
@@ -668,6 +823,147 @@ async fn a_board_has_a_size_budget_and_undo_frees_it() {
 }
 
 #[tokio::test]
+async fn a_slow_link_gets_its_snapshot_and_everything_said_meanwhile() {
+    use wb_relay::keys;
+    let db = temp_db("slow");
+    let s = start(&db).await;
+    new_board(&s.addr).await; // the schema is in place
+    // A board of about 12 MB: its snapshot cannot all go out while nobody reads.
+    let edit = keys::random_key();
+    let view = keys::view_key(&edit);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&view), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]])
+            .unwrap();
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        let pts = format!("[{}]", v.join(","));
+        for seq in 1..=30 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,1,'#112233',0.004,?)",
+                rusqlite::params![id, seq, format!("s{seq}"), pts],
+            )
+            .unwrap();
+        }
+    }
+    let (mut b, _, strokes) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
+    assert_eq!(strokes.len(), 30);
+
+    // A joins and does not read yet, while the board is busy: more broadcasts
+    // than the ring holds go by during its snapshot.
+    let mut a = Client::open(&s.addr).await;
+    a.send(json!({"t": "join", "key": view})).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.send(json!({"t": "b", "id": "live", "c": "#112233", "w": 0.004})).await;
+    for i in 0..400 {
+        b.send(json!({"t": "p", "id": "live", "pts": [f64::from(i) / 1000.0, 0.1, 0.5]})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A gets the whole snapshot, then every one of them, in order.
+    a.expect("hello").await;
+    let mut got = 0;
+    loop {
+        let m = a.next().await;
+        match m["t"].as_str().unwrap() {
+            "ss" => got += m["a"].as_array().unwrap().len(),
+            "ready" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(got, 30);
+    assert_eq!(a.expect("b").await["id"], "live");
+    for i in 0..400 {
+        let m = a.expect("p").await;
+        assert_eq!(m["pts"][0].as_f64(), Some(f64::from(i) / 1000.0));
+    }
+    s.stop().await;
+}
+
+/// A client that the relay, trusting its proxy, takes to be at `ip`.
+async fn join_from(addr: &str, key: &str, who: &str, ip: &str) -> Client {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+    let (ws, _) = connect_async(req).await.unwrap();
+    let mut c = Client { ws };
+    c.send(json!({"t": "join", "key": key, "who": who})).await;
+    c.expect("hello").await;
+    while c.next().await["t"] != "ready" {}
+    c
+}
+
+#[tokio::test]
+async fn whole_sheets_sent_to_everyone_are_charged_to_the_board_and_the_address() {
+    use wb_relay::keys;
+    let db = temp_db("sheets");
+    let s = start_with(Config { trust_proxy: true, ..config(&db) }).await;
+    new_board(&s.addr).await; // the schema is in place
+    // A shelved sheet of about 10 MB, and nothing on the sheet in use.
+    let edit = keys::random_key();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&keys::view_key(&edit)), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]])
+            .unwrap();
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        let pts = format!("[{}]", v.join(","));
+        for seq in 1..=25 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts, sheet) VALUES(?,?,?,1,'#112233',0.004,?,1)",
+                rusqlite::params![id, seq, format!("s{seq}"), pts],
+            )
+            .unwrap();
+        }
+    }
+    // Bring the sheet back, then crumple it again, until refused. A refused
+    // bring-back is ignored, so the next thing heard is the `ok` for a stroke.
+    async fn cycles(c: &mut Client, k: &mut u64, tag: &str) -> u32 {
+        let mut n = 0;
+        loop {
+            c.send(json!({"t": "un", "k": *k})).await;
+            c.send(json!({"t": "s", "id": format!("{tag}{n}"), "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+            let m = c.next().await;
+            if m["t"] == "ok" {
+                return n;
+            }
+            assert_eq!(m["t"], "un", "{m}");
+            c.expect("ok").await;
+            n += 1;
+            c.send(json!({"t": "cr"})).await;
+            *k = c.expect("cr").await["k"].as_u64().unwrap();
+        }
+    }
+    let mut k = 1;
+    // One address, over two connections: its budget is shared, so the second
+    // connection gets nothing the first did not leave.
+    let mut a1 = join_from(&s.addr, &edit, WHO_A, "2001:db8:a::1").await;
+    let mut a2 = join_from(&s.addr, &edit, WHO_A, "2001:db8:a::2").await;
+    assert_eq!(cycles(&mut a1, &mut k, "a").await, 3, "32 MB of reply budget holds three 10 MB sheets");
+    // a2 hears a1's frames; drain them.
+    while tokio::time::timeout(Duration::from_millis(300), a2.ws.next()).await.is_ok() {}
+    assert_eq!(cycles(&mut a2, &mut k, "b").await, 0, "the address's budget is spent");
+    drop((a1, a2));
+    // Another address has its own budget, but the board has 48 MB in all.
+    let mut b = join_from(&s.addr, &edit, WHO_B, "2001:db8:b::1").await;
+    // Its own budget alone would allow three, as it did the first address;
+    // the board's, part spent, allows fewer (it refills as the test runs).
+    let n = cycles(&mut b, &mut k, "c").await;
+    assert!((1..3).contains(&n), "{n} sheets for the second address");
+    s.stop().await;
+}
+
+#[tokio::test]
 async fn other_sites_cannot_use_the_relay() {
     let s = start(&temp_db("origin")).await;
     let mut sock = TcpStream::connect(&s.addr).await.unwrap();
@@ -755,5 +1051,293 @@ async fn presence_lists_the_layers_that_are_connected() {
             break;
         }
     }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn previews_draw_on_the_heavy_budget_even_when_cached() {
+    let s = start(&temp_db("svbudget")).await;
+    let (edit, _) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    a.draw("one").await;
+    a.send(json!({"t": "cr"})).await;
+    a.expect("cr").await;
+    // The crumple took one token of twelve; the first preview builds the cache and every
+    // later one is a cache hit, which must cost a token all the same.
+    for _ in 0..30 {
+        a.send(json!({"t": "sv", "k": 1})).await;
+    }
+    let mut got = 0;
+    while let Some(m) = a.raw().await {
+        if m["t"] == "sv" {
+            got += 1;
+        }
+        if got > 12 {
+            break;
+        }
+    }
+    assert!((11..=12).contains(&got), "{got} previews answered");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn boards_past_the_shared_memory_budget_are_refused_and_idle_ones_make_way() {
+    // Room for two empty boards, not three.
+    let s = start_with(Config { max_loaded: 2 * ROOM_COST + 1024, ..config(&temp_db("budget")) }).await;
+    let (a, _) = new_board(&s.addr).await;
+    let (b, _) = new_board(&s.addr).await;
+    let (c, _) = new_board(&s.addr).await;
+    let (d, _) = new_board(&s.addr).await;
+    {
+        let (mut dc, _, _) = Client::join(&s.addr, &d, Some(WHO_A)).await;
+        dc.draw("d1").await;
+    }
+    tokio::time::sleep(GRACE * 3).await;
+    // Spoil board d's row: reading it now would fail.
+    let db = rusqlite::Connection::open(&s.db).unwrap();
+    db.execute("UPDATE strokes SET width = 'x' WHERE id = 'd1'", []).unwrap();
+    let (_a, _, _) = Client::join(&s.addr, &a, Some(WHO_A)).await;
+    let (bc, _, _) = Client::join(&s.addr, &b, Some(WHO_A)).await;
+    let mut x = Client::open(&s.addr).await;
+    x.send(json!({"t": "join", "key": c, "who": WHO_A})).await;
+    let m = x.next().await;
+    assert_eq!(m["code"], "busy", "{m}");
+    // Board b goes idle: still in its grace period, but it makes way for c.
+    drop(bc);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (_c, _, _) = Client::join(&s.addr, &c, Some(WHO_A)).await;
+    let mut y = Client::open(&s.addr).await;
+    y.send(json!({"t": "join", "key": b, "who": WHO_A})).await;
+    assert_eq!(y.next().await["code"], "busy", "a and c are in use; b can't come back");
+    let mut z = Client::open(&s.addr).await;
+    z.send(json!({"t": "join", "key": d, "who": WHO_A})).await;
+    let m = z.next().await;
+    assert!(m["m"].as_str().unwrap().contains("capacity"), "weighed and refused before it is read: {m}");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_stroke_past_the_shared_memory_budget_is_refused_and_undo_gives_room_back() {
+    // An empty board fits with room for a few strokes.
+    let s = start_with(Config { max_loaded: ROOM_COST + COPIES * 600, ..config(&temp_db("grow")) }).await;
+    let (edit, _) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let mut drawn = 0;
+    let refused = loop {
+        let id = format!("a{drawn}");
+        a.send(json!({"t": "s", "id": id, "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5, 0.2, 0.2, 0.5]})).await;
+        let m = a.next().await;
+        if m["t"] == "no" {
+            break m;
+        }
+        assert_eq!(m["t"], "ok", "{m}");
+        drawn += 1;
+        assert!(drawn < 50, "the budget never said no");
+    };
+    assert!(drawn > 0);
+    assert!(refused["m"].as_str().unwrap().contains("memory"), "{refused}");
+    a.send(json!({"t": "u", "id": format!("a{}", drawn - 1)})).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    a.draw("again").await;
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn storage_near_its_quota_refuses_new_strokes_and_boards_without_losing_any() {
+    // A quota a few dozen pages past what the empty schema takes. Council H5: one address
+    // may hold only a share of it, so it takes several to reach the quota.
+    let s = start_with(Config { max_db: 160 * 1024, trust_proxy: true, ..config(&temp_db("quota")) }).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let pts: Vec<f64> = (0..201).map(|i| f64::from(i % 50) / 100.0).collect();
+    let (mut stored, mut addresses, mut own_limit) = (0, 0, 0);
+    let refused = 'all: loop {
+        addresses += 1;
+        assert!(addresses < 100, "the quota never said no");
+        // documentation addresses, one /56 each
+        let mut a = join_from(&s.addr, &edit, WHO_A, &format!("2001:db8:{addresses:x}::1")).await;
+        loop {
+            a.send(json!({"t": "s", "id": format!("a{stored}"), "c": "#112233", "w": 0.004, "pts": pts})).await;
+            let m = a.next().await;
+            if m["t"] == "no" {
+                if m["m"].as_str().unwrap().contains("your network") {
+                    own_limit += 1;
+                    continue 'all;
+                }
+                break 'all m;
+            }
+            assert_eq!(m["t"], "ok", "a stroke is stored or refused, never lost: {m}");
+            stored += 1;
+        }
+    };
+    assert!(stored > 0, "{refused}");
+    assert!(own_limit >= 2, "one address cannot fill storage for everyone: {own_limit} of {addresses}");
+    assert!(refused["m"].as_str().unwrap().contains("storage"), "{refused}");
+    assert_eq!(http(&s.addr, "POST", "/api/boards").await.0, 503, "no new boards either");
+    // Every stroke told ok is there.
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    assert_eq!(strokes.len(), stored);
+    s.stop().await;
+}
+
+/// Resident memory of this process, from /proc (Linux only).
+fn rss_mb() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kb: f64 = s.lines().find(|l| l.starts_with("VmRSS:")).unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+    kb / 1024.0
+}
+
+/// Not a check, a measurement: fill boards close to the per-board cap and
+/// load them until the shared budget says no, then report resident memory.
+/// `cargo test --release --test relay memory_harness -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn memory_harness() {
+    use wb_relay::keys;
+    let db = temp_db("harness");
+    let s = start_with(Config { max_loaded: wb_relay::memory::MAX_LOADED, max_rooms: wb_relay::memory::MAX_ROOMS, ..config(&db) }).await;
+    new_board(&s.addr).await; // the schema is in place
+    let base = rss_mb();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    // About 400 KB of JSON a stroke, 38 a board: just under the 16 MB cap.
+    let pts: String = {
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        format!("[{}]", v.join(","))
+    };
+    let mut views = Vec::new();
+    for b in 0..12 {
+        let edit = keys::random_key();
+        let view = keys::view_key(&edit);
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&view), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]]).unwrap();
+        for seq in 1..=38 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,1,'#112233',0.004,?)",
+                rusqlite::params![id, seq, format!("s{b}x{seq}"), pts],
+            )
+            .unwrap();
+        }
+        views.push(view);
+    }
+    drop(conn);
+    let mut held = Vec::new();
+    let mut peak = base;
+    for (i, view) in views.iter().enumerate() {
+        let mut c = Client::open(&s.addr).await;
+        c.send(json!({"t": "join", "key": view})).await;
+        let hello = c.next().await;
+        if hello["t"] != "hello" {
+            eprintln!("board {i}: refused ({})", hello["m"]);
+            continue;
+        }
+        while c.next().await["t"] != "ready" {}
+        held.push(c);
+        peak = peak.max(rss_mb());
+        eprintln!("board {i}: loaded; rss {:.0} MB", rss_mb());
+    }
+    eprintln!("baseline {base:.0} MB, peak {peak:.0} MB with {} full boards loaded", held.len());
+    s.stop().await;
+}
+
+/// The first thing the relay says to a join from `ip` that then reads nothing more.
+async fn stall_from(addr: &str, key: &str, ip: &str) -> (Client, Value) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+    let (ws, _) = connect_async(req).await.unwrap();
+    let mut c = Client { ws };
+    c.send(json!({"t": "join", "key": key})).await;
+    let first = c.next().await;
+    (c, first)
+}
+
+/// Council P3-B: on 4229513 one address could hold slow joins open on a big board until
+/// every other join was told the relay is busy, and a stalled reader held its charge for
+/// as long as its socket lasted. Now an address may hold only its share of the memory
+/// budget in join copies, so another address still joins, and a join that has not sent
+/// its snapshot by the deadline is dropped and gives its charge back.
+#[tokio::test]
+async fn a_stalled_join_gives_its_charge_back_at_the_deadline_and_another_address_still_joins() {
+    use wb_relay::keys;
+    let db = temp_db("stall");
+    // Room for the board and a few builds of its snapshot; one address's share is about one build.
+    let cfg = Config {
+        trust_proxy: true,
+        max_loaded: 8 * 16 * 1024 * 1024,
+        catch_up_min: Duration::from_secs(2),
+        catch_up_rate: 1 << 40,
+        ..config(&db)
+    };
+    let s = start_with(cfg).await;
+    new_board(&s.addr).await; // the schema is in place
+    let edit = keys::random_key();
+    let view = keys::view_key(&edit);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&view), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]])
+            .unwrap();
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        let pts = format!("[{}]", v.join(","));
+        for seq in 1..=30 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,1,'#112233',0.004,?)",
+                rusqlite::params![id, seq, format!("s{seq}"), pts],
+            )
+            .unwrap();
+        }
+    }
+    let mut b = join_from(&s.addr, &edit, WHO_B, "2001:db8:b::1").await;
+    let mut n = 0;
+    let mut draw = async || {
+        n += 1;
+        b.send(json!({"t": "s", "id": format!("d{n}"), "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+        b.expect("ok").await;
+    };
+    const X: &str = "2001:db8:1::1";
+
+    // X holds the build the board counts, then a second build of its own after a change.
+    draw().await;
+    let (_x1, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello");
+    draw().await;
+    let (_x2, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello", "an address's first charged join always may try");
+    draw().await;
+    let (_x3, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!((m["t"].as_str(), m["code"].as_str()), (Some("err"), Some("busy")), "X is at its share: {m}");
+
+    // Another address still joins, and gets the whole board.
+    let (mut y, m) = stall_from(&s.addr, &view, "2001:db8:2::1").await;
+    assert_eq!(m["t"], "hello", "another address still joins: {m}");
+    let mut got = 0;
+    loop {
+        let m = y.next().await;
+        match m["t"].as_str().unwrap() {
+            "ss" => got += m["a"].as_array().unwrap().len(),
+            "ready" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(got, 33);
+
+    // Past the deadline (well before a send would time out), X's stalled joins are dropped
+    // and their charges given back: X may hold a counted build and an extra build again.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    draw().await;
+    let (_x4, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello", "X's charge was given back: {m}");
+    draw().await;
+    let (_x5, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello", "X's charge was given back: {m}");
     s.stop().await;
 }

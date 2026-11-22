@@ -1,7 +1,7 @@
 # Roadmap
 
 What comes next for Plasma Whiteboard, in order. Each item says where the project is today, what changes, and
-what it depends on. Nothing here is built yet. The design history is in [`DESIGN-NOTES.pdf`](DESIGN-NOTES.pdf).
+what it depends on. Item 3 is done in v0.2.0; nothing else here is built yet. The design history is in [`DESIGN-NOTES.pdf`](DESIGN-NOTES.pdf).
 
 **Direction: by default, the server is a single binary with no database.** It serves the page and relays
 encrypted traffic between the browsers on a board. Saving boards on the server becomes an opt-in build
@@ -11,7 +11,7 @@ feature (item 4). Today's relay keeps boards in SQLite; items 1 and 4 together r
 | --- | --- | --- |
 | 1 | [End-to-end encryption](#1-end-to-end-encryption) | — |
 | 2 | [TLS in the relay](#2-tls-in-the-relay) | — |
-| 3 | [The whole client in Rust](#3-the-whole-client-in-rust) | — |
+| 3 | [The whole client in Rust](#3-the-whole-client-in-rust) (done in v0.2.0) | — |
 | 4 | [Saved boards (opt-in)](#4-saved-boards-opt-in) | 1 |
 | later | [Scene model and export, agent collaboration, voice input](#later) | 1 |
 
@@ -51,7 +51,10 @@ online to hand over the board. `DESIGN-NOTES.pdf` section 2 has the first draft.
 
 ## 3. The whole client in Rust
 
-**Today:** the page logic is `web/app.js` (about 1,900 lines) and `web/app.css` (about 220). Only stroke
+**Done in v0.2.0.** The page is now Rust in `page/`, and `web/app.js` is gone; see [`CHANGELOG.md`](CHANGELOG.md).
+The plan below is kept as it was written.
+
+**Before v0.2.0:** the page logic is `web/app.js` (about 1,900 lines) and `web/app.css` (about 220). Only stroke
 simplification (`smooth/`) and the crumple mesh (`crumple/`) are Rust compiled to WebAssembly.
 
 **Goal:** all page logic in Rust compiled to WebAssembly, behaving exactly as the current page does: private

@@ -4,12 +4,14 @@
 pub mod db;
 pub mod keys;
 pub mod limits;
+pub mod memory;
 pub mod room;
+pub mod rooms;
 
 use axum::{
     body::Body,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
         ConnectInfo, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
@@ -18,11 +20,12 @@ use axum::{
     Router,
 };
 use db::{Db, Role};
-use limits::{Bucket, IpGuard, IpLimits};
+use limits::{Bucket, Budget, IpGuard, IpLimits};
 use room::{In, Room, MAX_MSG};
+use rooms::{Refused, Rooms};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::VecDeque,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -44,12 +47,24 @@ pub struct Config {
     pub trust_proxy: bool,
     /// Serve the page from this directory instead of the copy in the binary.
     pub web_dir: Option<PathBuf>,
+    /// How long a board stays loaded after its last connection leaves.
+    pub unload_grace: Duration,
+    /// What all loaded boards may hold in memory together, in bytes.
+    pub max_loaded: usize,
+    /// Boards loaded at once.
+    pub max_rooms: usize,
+    /// How large the database may grow, in bytes.
+    pub max_db: u64,
+    /// A join must send its whole snapshot within this ([`CATCH_UP_MIN`])...
+    pub catch_up_min: Duration,
+    /// ...plus its size at this many bytes a second ([`CATCH_UP_RATE`]), or it is dropped.
+    pub catch_up_rate: u64,
 }
 
 struct App {
     cfg: Config,
     db: Db,
-    rooms: tokio::sync::Mutex<HashMap<i64, Arc<Room>>>,
+    rooms: Arc<Rooms>,
     ips: IpLimits,
     next_conn: AtomicU64,
     assets: Vec<Asset>,
@@ -69,10 +84,10 @@ connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; f
 fn assets() -> Vec<Asset> {
     let raw: [(&str, &str, &str, &[u8]); 6] = [
         ("/", "index.html", "text/html; charset=utf-8", include_bytes!("../../web/index.html")),
-        ("/app.js", "app.js", "text/javascript; charset=utf-8", include_bytes!("../../web/app.js")),
+        ("/boot.js", "boot.js", "text/javascript; charset=utf-8", include_bytes!("../../web/boot.js")),
+        ("/page.js", "page.js", "text/javascript; charset=utf-8", include_bytes!("../../web/page.js")),
+        ("/page_bg.wasm", "page_bg.wasm", "application/wasm", include_bytes!("../../web/page_bg.wasm")),
         ("/app.css", "app.css", "text/css; charset=utf-8", include_bytes!("../../web/app.css")),
-        ("/smooth.wasm", "smooth.wasm", "application/wasm", include_bytes!("../../web/smooth.wasm")),
-        ("/crumple.wasm", "crumple.wasm", "application/wasm", include_bytes!("../../web/crumple.wasm")),
         ("/favicon.svg", "favicon.svg", "image/svg+xml", include_bytes!("../../web/favicon.svg")),
     ];
     raw.into_iter()
@@ -170,6 +185,9 @@ async fn create_board(
     if !app.ips.may_create(ip) {
         return plain(StatusCode::TOO_MANY_REQUESTS, "too many new boards; wait a moment");
     }
+    if app.db.is_full() {
+        return plain(StatusCode::SERVICE_UNAVAILABLE, "storage is full; try again later");
+    }
     for _ in 0..3 {
         let edit = keys::random_key();
         let view = keys::view_key(&edit);
@@ -195,8 +213,9 @@ async fn ws_upgrade(
         return plain(StatusCode::FORBIDDEN, "wrong origin");
     }
     let ip = client_ip(&app, &headers, addr);
-    let Some(guard) = app.ips.connect(ip) else {
-        return plain(StatusCode::TOO_MANY_REQUESTS, "too many connections from this address");
+    let guard = match app.ips.connect(ip) {
+        Ok(g) => g,
+        Err(why) => return plain(StatusCode::TOO_MANY_REQUESTS, why),
     };
     ws.max_message_size(MAX_MSG)
         .max_frame_size(MAX_MSG)
@@ -230,7 +249,7 @@ async fn hang_up(mut sock: WebSocket) {
     .await;
 }
 
-async fn connection(app: Arc<App>, mut sock: WebSocket, _guard: IpGuard) {
+async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
     // The first message must be a join.
     let first = tokio::time::timeout(Duration::from_secs(10), sock.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
@@ -253,40 +272,113 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, _guard: IpGuard) {
     let view = (role == Role::Edit).then(|| keys::view_key(&key));
     let conn = app.next_conn.fetch_add(1, Ordering::Relaxed);
 
-    // Find or load the board and join it, all under the registry lock, so a
-    // board can't be unloaded between the two.
-    let (room, joined) = {
-        let mut rooms = app.rooms.lock().await;
-        let room = match rooms.get(&board) {
-            Some(r) => r.clone(),
-            None => {
-                let r = Arc::new(Room::new(board, app.db.load(board).await));
-                rooms.insert(board, r.clone());
-                r
-            }
-        };
-        let joined = room.join(conn, role, who_hash, view.as_deref(), &app.db);
-        if joined.is_err() && room.conns() == 0 {
-            rooms.remove(&board);
+    let held = guard.held();
+    let joined = app
+        .rooms
+        .join(&app.db, board, |r| r.join_from(conn, role, who_hash, view.as_deref(), &app.db, Some(&held), || guard.may_add_layer()))
+        .await;
+    let (room, mut joined) = match joined {
+        Ok(j) => j,
+        Err(Refused::Unreadable) => {
+            return bye(sock, "busy", "this board can't be opened right now; try again later").await
         }
-        (room, joined)
-    };
-    let Ok(mut joined) = joined else {
-        return bye(sock, "busy", "this board has too many connections").await;
+        Err(Refused::Full) => return bye(sock, "busy", "this board has too many connections").await,
+        Err(Refused::Busy) => return bye(sock, "busy", "the server is at capacity; try again later").await,
     };
 
-    let reason = relay(&app, &room, &mut sock, &mut joined).await;
+    let reason = relay(&app, &room, &mut sock, &mut joined, guard.budget()).await;
 
-    {
-        let mut rooms = app.rooms.lock().await;
-        room.leave(joined.peer);
-        if room.conns() == 0 {
-            rooms.remove(&board);
-        }
-    }
+    room.leave(joined.peer);
+    app.rooms.left(room);
     match reason {
         Some((code, m)) => bye(sock, code, m).await,
         None => hang_up(sock).await,
+    }
+}
+
+const LOST: (&str, &str) = ("busy", "this board had a storage error; reconnecting");
+const SLOW: (&str, &str) = ("slow", "this connection cannot keep up with this board; reconnecting");
+
+/// What a connection may queue of the board's broadcasts while its snapshot
+/// is still being sent. The frames are shared with every other receiver, so
+/// this bounds the queue's length rather than memory the connection owns.
+const CATCH_UP_BYTES: usize = 8 * 1024 * 1024;
+
+/// The whole snapshot must be sent within this, plus [`catch_up_time`]'s share for its size,
+/// or the join is dropped with its charges (council P3-B): a slow reader cannot hold its
+/// copy of the board, and the memory budget it is charged to, for longer.
+pub const CATCH_UP_MIN: Duration = Duration::from_secs(30);
+/// The slowest link a big snapshot is waited for, in bytes a second (about 2 Mbit/s).
+pub const CATCH_UP_RATE: u64 = 256 * 1024;
+
+/// How long a join may take to send `bytes` of snapshot.
+fn catch_up_time(cfg: &Config, bytes: usize) -> Duration {
+    cfg.catch_up_min + Duration::from_millis((bytes as u64).saturating_mul(1000) / cfg.catch_up_rate.max(1))
+}
+
+/// Whether a broadcast is for this peer.
+fn for_peer(out: &room::Out, peer: room::Peer) -> bool {
+    out.skip != peer.conn && (out.only == 0 || out.only == peer.conn)
+}
+
+/// Send the snapshot, reading the board's broadcasts at the same time, so a
+/// slow link with a big snapshot does not overflow the broadcast ring and
+/// get dropped, only to reconnect and do the same again. What arrives
+/// meanwhile is queued and sent after the snapshot, in order.
+async fn catch_up(
+    sock: &mut WebSocket,
+    joined: &mut room::Joined,
+) -> Result<(), Option<(&'static str, &'static str)>> {
+    let peer = joined.peer;
+    let mut snapshot = std::mem::take(&mut joined.snapshot).into_iter();
+    let mut queue: VecDeque<Utf8Bytes> = VecDeque::new();
+    let mut held = 0usize;
+    loop {
+        let text = match snapshot.next() {
+            Some(t) => t,
+            // the chunks are sent: let their build (and any charge for it) go (H4)
+            None => {
+                joined.hold = None;
+                joined.live = None;
+                match queue.pop_front() {
+                    Some(t) => {
+                        held -= t.len();
+                        t
+                    }
+                    None => return Ok(()),
+                }
+            }
+        };
+        let sent = send(sock, Message::Text(text));
+        tokio::pin!(sent);
+        loop {
+            tokio::select! {
+                biased;
+                ok = &mut sent => {
+                    if !ok {
+                        return Err(None);
+                    }
+                    break;
+                }
+                out = joined.rx.recv() => match out {
+                    Ok(out) => {
+                        if out.end {
+                            return Err(Some(LOST));
+                        }
+                        if !for_peer(&out, peer) {
+                            continue;
+                        }
+                        held += out.text.len();
+                        if held > CATCH_UP_BYTES {
+                            return Err(Some(SLOW));
+                        }
+                        queue.push_back(out.text);
+                    }
+                    Err(RecvError::Lagged(_)) => return Err(Some(SLOW)),
+                    Err(RecvError::Closed) => return Err(None),
+                },
+            }
+        }
     }
 }
 
@@ -297,18 +389,28 @@ async fn relay(
     room: &Room,
     sock: &mut WebSocket,
     joined: &mut room::Joined,
+    mut budget: Budget,
 ) -> Option<(&'static str, &'static str)> {
-    for text in joined.snapshot.drain(..) {
-        if !send(sock, Message::Text(text)).await {
-            return None;
-        }
+    let bytes = joined.snapshot.iter().map(|t| t.len()).sum();
+    let done = tokio::time::timeout(catch_up_time(&app.cfg, bytes), catch_up(sock, joined)).await;
+    if !matches!(done, Ok(Ok(()))) {
+        // let the charges go now, not after the goodbye (which can take seconds more)
+        joined.hold = None;
+        joined.live = None;
+    }
+    match done {
+        Ok(Ok(())) => {}
+        Ok(Err(why)) => return why,
+        Err(_) => return Some(SLOW),
     }
     let peer = joined.peer;
+    // Subscribed before this check, so a loss after it arrives as an `end`.
+    if room.is_dead() {
+        return Some(LOST);
+    }
     let mut bucket = Bucket::new(600.0, 300.0);
     // Bytes: a burst of 2 MB (a few very long strokes), then 256 KB a second.
     let mut bytes = Bucket::new(2.0 * 1024.0 * 1024.0, 256.0 * 1024.0);
-    // Whole-sheet operations (crumple, bring back, preview, layer restore).
-    let mut heavy = Bucket::new(12.0, 0.5);
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = Instant::now();
@@ -320,23 +422,27 @@ async fn relay(
                     if !bucket.take() || !bytes.take_n(t.len() as f64) {
                         return Some(("rate", "sending too fast"));
                     }
-                    room.handle(peer, &t, &app.db, &mut heavy);
+                    room.handle(peer, &t, &app.db, &mut budget);
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => heard = Instant::now(),
                 Some(Ok(Message::Binary(_) | Message::Close(_))) | Some(Err(_)) | None => return None,
             },
             out = joined.rx.recv() => match out {
                 Ok(out) => {
-                    if out.skip == peer.conn || (out.only != 0 && out.only != peer.conn) {
+                    if out.end {
+                        return Some(LOST);
+                    }
+                    if !for_peer(&out, peer) {
                         continue;
                     }
                     if !send(sock, Message::Text(out.text)).await {
                         return None;
                     }
                 }
-                // Too far behind: drop the connection; the page reconnects
-                // and gets a fresh snapshot.
-                Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => return None,
+                // Too far behind: drop the connection, saying why; the page
+                // backs off, reconnects and gets a fresh snapshot.
+                Err(RecvError::Lagged(_)) => return Some(SLOW),
+                Err(RecvError::Closed) => return None,
             },
             _ = ping.tick() => {
                 if heard.elapsed() > Duration::from_secs(80) {
@@ -357,7 +463,7 @@ async fn janitor(app: Arc<App>) {
         tick.tick().await;
         app.ips.prune();
         if app.cfg.ttl_days > 0 && n % 6 == 0 {
-            let skip: Vec<i64> = app.rooms.lock().await.keys().copied().collect();
+            let skip = app.rooms.boards();
             let cutoff = db::now() - i64::from(app.cfg.ttl_days) * 86_400;
             let gone = app.db.sweep(cutoff, skip).await;
             if gone > 0 {
@@ -374,12 +480,15 @@ pub async fn serve(
     cfg: Config,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let db = Db::open(&cfg.db_path).map_err(std::io::Error::other)?;
+    let db = Db::open_with(&cfg.db_path, cfg.max_db).map_err(std::io::Error::other)?;
+    let grace = cfg.unload_grace;
+    let (max_loaded, max_rooms) = (cfg.max_loaded, cfg.max_rooms);
+    let ips = IpLimits::new(cfg.max_db, cfg.ttl_days);
     let app = Arc::new(App {
         cfg,
         db: db.clone(),
-        rooms: tokio::sync::Mutex::new(HashMap::new()),
-        ips: IpLimits::default(),
+        rooms: Rooms::new(grace, memory::Memory::new(max_loaded, max_rooms)),
+        ips,
         next_conn: AtomicU64::new(1),
         assets: assets(),
     });
@@ -406,10 +515,10 @@ pub async fn serve(
     let router = Router::new()
         .route("/", get(page))
         .route("/b/{key}", get(page))
-        .route("/app.js", get(file))
+        .route("/boot.js", get(file))
+        .route("/page.js", get(file))
+        .route("/page_bg.wasm", get(file))
         .route("/app.css", get(file))
-        .route("/smooth.wasm", get(file))
-        .route("/crumple.wasm", get(file))
         .route("/favicon.svg", get(file))
         .route("/favicon.ico", get(|| async { plain(StatusCode::NO_CONTENT, "") }))
         .route("/api/boards", post(create_board))

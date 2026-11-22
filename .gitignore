@@ -2,6 +2,9 @@ target/
 *.db
 *.db-wal
 *.db-shm
+web/page.js
+web/page_bg.wasm
+# built by the old JS page; kept ignored so a stale copy is never committed
 web/smooth.wasm
 whiteboard.zip
 proto/

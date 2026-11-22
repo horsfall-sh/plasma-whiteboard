@@ -13,6 +13,16 @@ async fn main() -> std::io::Result<()> {
         ttl_days: env("WB_TTL_DAYS").and_then(|v| v.parse().ok()).unwrap_or(90),
         trust_proxy: env("WB_TRUST_PROXY").is_some_and(|v| v == "1"),
         web_dir: env("WB_WEB_DIR").map(PathBuf::from),
+        unload_grace: wb_relay::rooms::UNLOAD_GRACE,
+        max_loaded: env("WB_MAX_LOADED_MB")
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(wb_relay::memory::MAX_LOADED, |mb| mb * 1024 * 1024),
+        max_db: env("WB_MAX_DB_MB")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(wb_relay::db::MAX_DB, |mb| mb * 1024 * 1024),
+        max_rooms: env("WB_MAX_ROOMS").and_then(|v| v.parse().ok()).unwrap_or(wb_relay::memory::MAX_ROOMS),
+        catch_up_min: wb_relay::CATCH_UP_MIN,
+        catch_up_rate: wb_relay::CATCH_UP_RATE,
     };
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!(

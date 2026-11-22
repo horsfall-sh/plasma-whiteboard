@@ -11,7 +11,7 @@ The contract between the page (`web/`) and the relay (`relay/`). Change both sid
 - The database stores only SHA-256 hashes of both keys.
 - Link form: `https://host/b/<key>`. The same page serves both; the relay decides the role from the key.
 - `POST /api/boards` (no body) returns `201 {"edit":"<key>","view":"<key>"}`. `429` when one address makes
-  boards too fast.
+  boards too fast, `503` when storage is near its quota.
 - `GET /` serves the page, which calls `POST /api/boards` and moves to `/b/<edit key>` with
   `history.replaceState` (no reload).
 
@@ -48,7 +48,7 @@ the connection. The key is sent in the first message, never in the URL.
 | `b` | `id`, `c`, `w` | Begin a live stroke. `id`: 1 to 40 characters of `[A-Za-z0-9_-]`, unique in the board. `c`: `#rrggbb`. `w`: width in board units, over 0 and at most 0.2. |
 | `p` | `id`, `pts` | More points for my live stroke. |
 | `e` | `id`, `c`, `w`, `pts` | End my live stroke. `pts` is the final simplified point list. If it is missing or empty the relay keeps the points it collected from `p`. `c` and `w` repeat the values from `b`, so that when the relay has no live stroke with this `id` (the stroke began while offline) it stores the stroke as if it were an `s`. |
-| `s` | `id`, `c`, `w`, `pts`, `txt`? | A whole finished stroke in one message. With `txt` it is a **text annotation**: `pts` is then exactly one point (the top left of the text), `w` is the font size in board units, and `txt` is 1 to 500 characters on at most 20 lines, with no control characters other than newline. Used to resend strokes that were not confirmed before a disconnect. Sending an `id` the relay already holds from the same layer is confirmed again with `ok` and not stored twice. |
+| `s` | `id`, `c`, `w`, `pts`, `txt`? | A whole finished stroke in one message. With `txt` it is a **text annotation**: `pts` is then exactly one point (the top left of the text), `w` is the font size in board units, and `txt` is 1 to 500 characters on at most 20 lines, with no control characters other than newline. Used to resend strokes that were not confirmed before a disconnect. Sending an `id` the relay already holds is not stored twice: if it is still that layer's stroke on the sheet in use it is confirmed again with `ok`; otherwise (crumpled, deleted with its layer, undone, or another layer's) the sender gets `u` for it. |
 | `u` | `id` | Undo one of my own strokes. |
 | `ld` | `l` | Delete layer `l` for everyone (any editor). |
 | `lr` | `l` | Restore the deleted strokes of layer `l` (any editor). |
@@ -64,14 +64,14 @@ Messages from a viewer other than `join` are ignored.
 
 | `t` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. Each layer is `{l, c, del, n}` (`n`: name or null). `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key (null for viewers). `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
+| `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. Each layer is `{l, c, del, n}` (`n`: name or null). `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key: sent to every edit-key holder, including one joined as a viewer because the board had no room for another contributor; null for view-key holders. `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
 | `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`. |
 | `ready` | | Snapshot complete. The client now resends unconfirmed strokes with `s`. |
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
 | `p` | `id`, `pts` | Points for a live stroke. |
 | `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`? | A stroke or text annotation was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
-| `ok` | `id`, `q` | To the author: the stroke is stored, with sequence number `q`. |
-| `no` | `id`, `m` | To the author: the stroke was refused (board full, bad data). The client removes it. |
+| `ok` | `id`, `q` | To the author: the stroke is committed to storage, with sequence number `q`. It is sent only after the commit, so the page may forget its own copy. A stroke that fails to store gets no `ok`: the board ends every connection with `busy`, and the page resends it on reconnect. |
+| `no` | `id`, `m` | To the author: the stroke was refused (board full, server out of memory, storage full, bad data). The client removes it. |
 | `u` | `id` | A stroke was removed (undone, or a live stroke abandoned). Not sent to the author of an undo. |
 | `l` | `l`, `c` | A new layer (a new contributor joined). Sent to everyone. |
 | `ld` | `l` | Layer `l` was deleted: drop its finished strokes and mark it restorable. Sent to everyone, including the sender. |
@@ -80,9 +80,9 @@ Messages from a viewer other than `join` are ignored.
 | `un` | `k`, `by`, `shelf`, `layers`, `a` | Sheet `k` was brought back: `a` holds its items, `layers` the layer list as in `hello`. Replace the board with them. Sent to everyone. |
 | `sv` | `k`, `a` | To the one who asked: the items of crumpled sheet `k`. |
 | `n` | `n`, `on` | Number of connections on the board now, and the layers that have one open. |
-| `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. |
+| `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. Also sent (`n` null, the layer's first colour) when an empty layer no one is on is handed to a new contributor. |
 | `pg` | `l`, `k`, `pts` | A ping from layer `l` with letter `k` (A to Z, then round again). Sent to everyone, including the sender. |
-| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections (retry later). `rate`: sending too fast. `bad`: malformed join. |
+| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, the server at capacity, or the board could not be read or written (retry later). `rate`: sending too fast. `slow`: the connection fell too far behind the board's broadcasts to keep up (wait the longest before reconnecting). `bad`: malformed join. Not fatal: `full`, sent right after `hello` when an edit link joins as a viewer because the board has no room for another contributor (or the address was given too many new layers lately); the page says so and stays connected. |
 
 `q` is a per-board sequence number. Strokes are drawn in `q` order. A stroke is never changed after it is
 stored; undo, layer delete and restore only flip its state.
@@ -90,7 +90,7 @@ stored; undo, layer delete and restore only flip its state.
 ### Ordering
 
 The relay handles one board's messages one at a time and broadcasts in that order, so every client sees the
-same sequence. A client that falls too far behind is disconnected and gets a fresh snapshot when it reconnects.
+same sequence. What is broadcast while a joining client's snapshot is still being sent is held for it (up to 8 MB) and sent right after, so a slow link is not dropped just for joining a big, busy board. A client that falls too far behind is disconnected with `slow` and gets a fresh snapshot when it reconnects; the page waits from the shortest delay again only after a connection has stayed ready for 30 s.
 
 ## Limits
 
@@ -104,8 +104,13 @@ same sequence. A client that falls too far behind is disconnected and gets a fre
 | Stroke data kept per board (sheet in use plus shelf) | 16 MB |
 | Bytes per connection | burst of 2 MB, then 256 KB a second |
 | Whole-sheet operations per connection (`cr`, `un`, `sv`, `lr`) | burst of 12, then one every 2 s; over the limit they are ignored |
+| Whole sheets sent to everyone (`un`, `lr`), in bytes | per board: burst 48 MB, then 1 MB a second; also drawn from the address's reply budget; over either, the request is ignored |
+| Reply budget per address (sheet previews, and the whole sheets above), in bytes | burst 32 MB, then 1 MB a second, shared by all its connections |
 | Live strokes per board / per connection | 64 / 4 |
-| Contributors per board | 200 (later browsers join as viewers) |
-| Connections per board / per address | 100 / 40 |
+| Contributors per board | 200; when all are taken, an empty layer no one is on is handed to the next one, else it joins as a viewer and is told (`full`) |
+| New contributor layers per address | burst 60, then one per 30 s (over it, the browser joins as a viewer) |
+| Connections per board / per address | 100 / 40; viewers may hold at most 80 of a board's 100 |
 | Messages per connection | 300 per second sustained, burst 600 |
 | New boards per address | burst 10, then one per 10 s |
+
+An "address" is one IPv4 address, or one IPv6 /56 (all of a home's networks share it).

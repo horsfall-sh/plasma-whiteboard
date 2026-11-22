@@ -1,0 +1,77 @@
+[package]
+name = "wb-page"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The Plasma Whiteboard page, in Rust compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wb-smooth = { path = "../smooth" }
+wb-crumple = { path = "../crumple" }
+indexmap = "2"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# pinned: the wasm-bindgen-cli that `make wasm` runs must be this exact version
+wasm-bindgen = "=0.2.100"
+# pinned with wasm-bindgen: a newer web-sys can ask for a newer wasm-bindgen
+web-sys = { version = "=0.3.77", features = [
+  "CanvasRenderingContext2d",
+    "console",
+  "DomRect",
+  "Document",
+  "Element",
+  "HtmlCanvasElement",
+  "HtmlElement",
+  "MediaQueryList",
+  "Performance",
+  "TextMetrics",
+  "WebGlBuffer",
+  "WebGlProgram",
+  "WebGlRenderingContext",
+  "WebGlShader",
+  "WebGlTexture",
+  "WebGlUniformLocation",
+  "Window",
+  "AddEventListenerOptions",
+  "Blob",
+  "BlobPropertyBag",
+  "Clipboard",
+  "CloseEvent",
+  "Crypto",
+  "CssStyleDeclaration",
+  "DomStringMap",
+  "DomTokenList",
+  "Event",
+  "EventTarget",
+  "History",
+  "HtmlAnchorElement",
+  "HtmlButtonElement",
+  "HtmlInputElement",
+  "HtmlTextAreaElement",
+  "KeyboardEvent",
+  "Location",
+  "MessageEvent",
+  "MouseEvent",
+  "Navigator",
+  "Node",
+  "HtmlDocument",
+  "VisibilityState",
+  "NodeList",
+  "PointerEvent",
+  "RequestInit",
+  "Response",
+  "Storage",
+  "StorageEvent",
+  "Url",
+  "VisualViewport",
+  "WebSocket",
+  "WheelEvent",
+] }
+# the same release as web-sys
+js-sys = "=0.3.77"
+
+[profile.release]
+opt-level = "s"
+lto = true

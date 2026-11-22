@@ -109,6 +109,10 @@
 <div id="msg" role="alert" hidden></div>
 <div id="status"><b></b><span>connecting</span></div>
 
-<script src="/app.js" defer></script>
+<div id="needsWasm" class="needs" role="alert" hidden><p>This board needs a browser with WebAssembly. Try a current version of Chrome, Firefox, Safari or Edge.</p></div>
+<div id="broke" class="needs" role="alert" hidden><p>Something broke on this page. Reload it to go on; what was saved is kept.</p><a href="">Reload</a></div>
+<noscript><div class="needs"><p>This board needs JavaScript and WebAssembly turned on.</p></div></noscript>
+
+<script type="module" src="/boot.js"></script>
 </body>
 </html>
