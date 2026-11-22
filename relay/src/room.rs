@@ -26,6 +26,10 @@ pub const MAX_LIVE_ROOM: usize = 64;
 pub const MAX_LIVE_CONN: usize = 4;
 pub const MAX_LAYERS: usize = 200;
 pub const MAX_ROOM_CONNS: usize = 100;
+/// Viewers may fill this many of a board's connections; the rest are kept
+/// for contributors, so a few addresses holding view sockets can't lock the
+/// editors out.
+pub const MAX_ROOM_VIEWERS: usize = 80;
 pub const MAX_WIDTH: f32 = 0.2;
 pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_TEXT_LINES: usize = 20;
@@ -153,6 +157,8 @@ struct State {
     layers: Vec<Layer>,
     live: HashMap<String, Live>,
     conns: usize,
+    /// The connections that joined as viewers (counted in `conns` too).
+    viewers: usize,
     /// The next ping's letter, 0 for A, wrapping after Z.
     next_ping: u8,
 }
@@ -420,6 +426,7 @@ impl Room {
                 layers,
                 live: HashMap::new(),
                 conns: 0,
+                viewers: 0,
                 next_ping: 0,
             }),
         }
@@ -460,6 +467,19 @@ impl Room {
         if st.conns >= MAX_ROOM_CONNS {
             return Err(());
         }
+        // Settle the role before counting it: whoever will be a viewer
+        // (including an edit-key holder when the layers are full) takes a
+        // viewer's seat.
+        let seat = match role {
+            Role::Edit => {
+                let who = who.ok_or(())?;
+                st.layers.iter().any(|l| l.who == who) || st.layers.len() < MAX_LAYERS
+            }
+            Role::View => false,
+        };
+        if !seat && st.viewers >= MAX_ROOM_VIEWERS {
+            return Err(());
+        }
         let mut layer = 0;
         if role == Role::Edit {
             let who = who.ok_or(())?;
@@ -477,6 +497,9 @@ impl Room {
             }
         }
         st.conns += 1;
+        if role == Role::View {
+            st.viewers += 1;
+        }
         // Subscribe after the layer notice (the newcomer reads its layer from
         // hello) and before anything else can be broadcast.
         let rx = self.tx.subscribe();
@@ -527,6 +550,9 @@ impl Room {
         let conn = peer.conn;
         let mut st = self.st.lock().unwrap();
         st.conns = st.conns.saturating_sub(1);
+        if peer.role == Role::View {
+            st.viewers = st.viewers.saturating_sub(1);
+        }
         if peer.role == Role::Edit {
             if let Some(l) = st.layers.iter_mut().find(|l| l.n == peer.layer) {
                 l.on = l.on.saturating_sub(1);

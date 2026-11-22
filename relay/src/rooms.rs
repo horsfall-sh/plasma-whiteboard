@@ -238,6 +238,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn viewers_cannot_take_the_seats_kept_for_contributors() {
+        use crate::room::{MAX_ROOM_CONNS, MAX_ROOM_VIEWERS};
+        let db = temp_db();
+        let a = db.create_board([9; 32], [10; 32]).await.unwrap();
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
+        let (room, first) = rooms.join(&db, a, |r| r.join(0, Role::View, None, None, &db)).await.unwrap();
+        let mut held = vec![first.peer];
+        for n in 1..MAX_ROOM_VIEWERS {
+            held.push(room.join(n as u64, Role::View, None, None, &db).unwrap().peer);
+        }
+        assert!(room.join(500, Role::View, None, None, &db).is_err(), "the viewer seats are full");
+        for n in 0..MAX_ROOM_CONNS - MAX_ROOM_VIEWERS {
+            let who = [n as u8 + 1; 32];
+            let j = room.join(600 + n as u64, Role::Edit, Some(who), Some("vk"), &db).unwrap();
+            assert_eq!(j.peer.role, Role::Edit, "a contributor still gets in");
+            held.push(j.peer);
+        }
+        assert!(room.join(700, Role::Edit, Some([0xaa; 32]), Some("vk"), &db).is_err(), "the room is full");
+        // A viewer leaving frees a viewer seat.
+        room.leave(held.remove(0));
+        assert!(room.join(800, Role::View, None, None, &db).is_ok());
+    }
+
+    #[tokio::test]
     async fn a_join_that_waited_on_an_unloaded_cell_starts_again() {
         let db = temp_db();
         let a = db.create_board([5; 32], [6; 32]).await.unwrap();
