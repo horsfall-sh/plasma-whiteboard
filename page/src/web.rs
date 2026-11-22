@@ -976,6 +976,11 @@ impl Page {
                 listen(&b, "click", |_| create_board());
                 let _ = m.append_child(&b);
             }
+            Then::Private => {
+                let a = el("a", None, Some("Back to your board"));
+                attr(&a, "href", "/");
+                let _ = m.append_child(&a);
+            }
         }
         m.set_hidden(false);
     }
@@ -1571,6 +1576,11 @@ impl net::Host for Page {
         // LOCAL_KEY still holds the whole private board: nothing was forgotten yet
         self.ls_remove(SHARING_KEY);
         let _ = win().location().replace("/");
+    }
+
+    fn share_refused(&mut self) {
+        // LOCAL_KEY still holds the whole private board
+        self.ls_remove(SHARING_KEY);
     }
 
     fn sheet_view(&mut self, k: i64, a: Vec<Item>) {

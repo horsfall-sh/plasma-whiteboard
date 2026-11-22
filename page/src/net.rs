@@ -43,6 +43,8 @@ pub enum Then {
     NewBoard,
     /// A "Retry" button that makes a board again.
     Retry,
+    /// A link back to the private board at `/`.
+    Private,
 }
 
 /// The connection's view of the page, and its effects.
@@ -97,6 +99,9 @@ pub trait Host {
     /// The board a share was going to is gone or not valid: remove `SHARING_KEY`, keep
     /// `LOCAL_KEY` as it is, and go back to the private board at `/` (council H2).
     fn share_lost(&mut self);
+    /// A share was seated view-only, so nothing can be uploaded: remove `SHARING_KEY` and keep
+    /// `LOCAL_KEY` as it is (council pass 3, P3-A). The page stays put to show why.
+    fn share_refused(&mut self);
 
     /// The share is done with the private board (its last write is made, or it is lost):
     /// let another tab take the writer's lock now and not before (council G5).
@@ -466,6 +471,24 @@ impl Conn {
         self.ready = true;
         h.schedule(SETTLE_MS, Timer::Settled(self.sock));
         let me = if self.edit { self.me } else { None };
+        // A share the relay seated view-only (a busy network, or a full board) can upload
+        // nothing; `ready(None)` would drop the pending items and the next `upload_check`
+        // would write an empty private board. Stop here, with the private board whole
+        // (council pass 3, P3-A).
+        if self.uploading && me.is_none() {
+            self.stopped = true;
+            self.uploading = false;
+            self.kept.clear();
+            h.writer_done();
+            h.share_refused();
+            h.message(
+                "Nothing was shared: the relay opened the new board view-only, as it does when \
+                 many boards were made from your network just now. Your board is still private \
+                 and whole; try sharing again later.",
+                Then::Private,
+            );
+            return;
+        }
         let r = h.board().ready(me);
         if me.is_none() {
             return;
@@ -490,7 +513,9 @@ impl Conn {
     /// answered (`ok`, `no` or `u`), so drop this browser's copy of them, except the ones
     /// the relay refused: those stay on the private board, and the user is told (council H1).
     fn upload_check(&mut self, h: &mut impl Host) {
-        if self.uploading && self.ready && h.board().pending.is_empty() {
+        // only a socket that may write the board has uploaded it (P3-A)
+        let may_edit = self.edit && self.me.is_some();
+        if self.uploading && self.ready && may_edit && h.board().pending.is_empty() {
             self.uploading = false;
             let kept = std::mem::take(&mut self.kept);
             h.forget_local(&kept);
@@ -839,6 +864,9 @@ mod tests {
         }
         fn share_lost(&mut self) {
             self.log.push("share_lost".into());
+        }
+        fn share_refused(&mut self) {
+            self.log.push("share_refused".into());
         }
         fn writer_done(&mut self) {
             self.log.push("writer_done".into());
@@ -1395,6 +1423,43 @@ mod tests {
         c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
         assert!(!c.uploading);
         assert!(h.take().contains(&"forget_local".to_string()));
+    }
+
+    #[test]
+    fn a_share_seated_view_only_keeps_the_private_board() {
+        // council pass 3 P3-A: the relay seats the share view-only (the G7 bucket, or a full
+        // board); ready(None) dropped the pending items and the next `u` or a reconnect seated
+        // as editor finished the share with nothing uploaded, writing an empty private board
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = Conn::default();
+        assert_eq!(c.start(&mut h, "KEY"), Some(1));
+        c.uploading = true;
+        for id in ["a", "b"] {
+            h.b.pending.insert(id.into(), it(id, 2, None));
+            h.b.insert(it(id, 2, None));
+        }
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"hello","role":"view"}"#);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"u","id":"someone"}"#);
+        c.frame(&mut h, &mut inp, 1, HELLO_EDIT);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        let log = h.take();
+        assert!(!log.iter().any(|l| l == "forget_local"), "{log:?}");
+        assert_eq!(log.iter().filter(|l| *l == "writer_done").count(), 1, "{log:?}");
+        assert!(log.iter().any(|l| l == "share_refused"), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("message Nothing was shared") && l.ends_with("Private")), "{log:?}");
+        assert!(!c.uploading && c.stopped, "the share is over and does not reconnect");
+        assert!(c.connect().is_none(), "stopped: no reconnect");
+
+        // and a share still marked uploading never finishes on a socket that cannot write
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = Conn::default();
+        c.start(&mut h, "KEY");
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"hello","role":"view"}"#);
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        c.uploading = true;
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"u","id":"someone"}"#);
+        assert!(!h.take().iter().any(|l| l == "forget_local"), "upload_check needs edit and me");
     }
 
     #[test]

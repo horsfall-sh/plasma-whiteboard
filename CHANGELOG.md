@@ -59,6 +59,11 @@ From the council's pass 2:
   "something broke" card with a Reload link instead of a page that has stopped silently.
 - The relay unit restarts on any exit (`Restart=always`).
 
+From the council's pass 3:
+
+- P3-A: a share the relay opens view-only no longer empties the private board. The share
+  stops, the private board stays whole, and the page says why.
+
 ### Waived
 
 - F7 (relay memory under load): waived by operator, 2026-11-22. The relay unit restarts
