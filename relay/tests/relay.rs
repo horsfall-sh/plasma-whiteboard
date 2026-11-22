@@ -757,3 +757,29 @@ async fn presence_lists_the_layers_that_are_connected() {
     }
     s.stop().await;
 }
+
+#[tokio::test]
+async fn previews_draw_on_the_heavy_budget_even_when_cached() {
+    let s = start(&temp_db("svbudget")).await;
+    let (edit, _) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    a.draw("one").await;
+    a.send(json!({"t": "cr"})).await;
+    a.expect("cr").await;
+    // The crumple took one token of twelve; the first preview builds the cache and every
+    // later one is a cache hit, which must cost a token all the same.
+    for _ in 0..30 {
+        a.send(json!({"t": "sv", "k": 1})).await;
+    }
+    let mut got = 0;
+    while let Some(m) = a.raw().await {
+        if m["t"] == "sv" {
+            got += 1;
+        }
+        if got > 12 {
+            break;
+        }
+    }
+    assert!((11..=12).contains(&got), "{got} previews answered");
+    s.stop().await;
+}

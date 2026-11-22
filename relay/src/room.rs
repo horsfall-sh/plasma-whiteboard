@@ -4,7 +4,7 @@
 
 use crate::db::{Db, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
-use crate::limits::Bucket;
+use crate::limits::Budget;
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -480,7 +480,8 @@ impl Room {
     /// Apply one message from a connection that has joined.
     /// `heavy` is the connection's budget for the operations that send a whole
     /// sheet or layer (crumple, bring back, preview, layer restore).
-    pub fn handle(&self, peer: Peer, text: &str, db: &Db, heavy: &mut Bucket) {
+    pub fn handle(&self, peer: Peer, text: &str, db: &Db, budget: &mut Budget) {
+        let heavy = &mut budget.heavy;
         if peer.role != Role::Edit {
             return; // viewers can't change the board
         }
@@ -709,15 +710,19 @@ impl Room {
             }
             In::SheetView { k } => {
                 let Some(sheet) = st.shelf.iter_mut().find(|s| s.k == k) else { return };
+                // A cached preview costs as much to send as a new one.
+                if !heavy.take() {
+                    return;
+                }
                 if sheet.view.is_none() {
-                    if !heavy.take() {
-                        return;
-                    }
                     let head = format!(r#"{{"t":"sv","k":{k},"a":["#);
                     let drawn = sheet.strokes.iter().filter(|s| s.state == LIVE).map(|s| s.json.as_str());
                     sheet.view = Some(strokes_msg(&head, drawn).into());
                 }
                 let text = sheet.view.clone().expect("just built");
+                if !budget.send(text.len()) {
+                    return;
+                }
                 let _ = self.tx.send(Out { skip: 0, only: conn, text });
             }
             In::LayerRestore { l } => {

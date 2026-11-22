@@ -18,7 +18,7 @@ use axum::{
     Router,
 };
 use db::{Db, Role};
-use limits::{Bucket, IpGuard, IpLimits};
+use limits::{Bucket, Budget, IpGuard, IpLimits};
 use room::{In, Room, MAX_MSG};
 use sha2::{Digest, Sha256};
 use std::{
@@ -230,7 +230,7 @@ async fn hang_up(mut sock: WebSocket) {
     .await;
 }
 
-async fn connection(app: Arc<App>, mut sock: WebSocket, _guard: IpGuard) {
+async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
     // The first message must be a join.
     let first = tokio::time::timeout(Duration::from_secs(10), sock.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
@@ -275,7 +275,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, _guard: IpGuard) {
         return bye(sock, "busy", "this board has too many connections").await;
     };
 
-    let reason = relay(&app, &room, &mut sock, &mut joined).await;
+    let reason = relay(&app, &room, &mut sock, &mut joined, Budget::new(guard.out())).await;
 
     {
         let mut rooms = app.rooms.lock().await;
@@ -297,6 +297,7 @@ async fn relay(
     room: &Room,
     sock: &mut WebSocket,
     joined: &mut room::Joined,
+    mut budget: Budget,
 ) -> Option<(&'static str, &'static str)> {
     for text in joined.snapshot.drain(..) {
         if !send(sock, Message::Text(text)).await {
@@ -307,8 +308,6 @@ async fn relay(
     let mut bucket = Bucket::new(600.0, 300.0);
     // Bytes: a burst of 2 MB (a few very long strokes), then 256 KB a second.
     let mut bytes = Bucket::new(2.0 * 1024.0 * 1024.0, 256.0 * 1024.0);
-    // Whole-sheet operations (crumple, bring back, preview, layer restore).
-    let mut heavy = Bucket::new(12.0, 0.5);
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = Instant::now();
@@ -320,7 +319,7 @@ async fn relay(
                     if !bucket.take() || !bytes.take_n(t.len() as f64) {
                         return Some(("rate", "sending too fast"));
                     }
-                    room.handle(peer, &t, &app.db, &mut heavy);
+                    room.handle(peer, &t, &app.db, &mut budget);
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => heard = Instant::now(),
                 Some(Ok(Message::Binary(_) | Message::Close(_))) | Some(Err(_)) | None => return None,

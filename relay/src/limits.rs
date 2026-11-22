@@ -7,6 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const MAX_CONNS_PER_IP: u32 = 40;
+/// What one address may be sent in replies it asked for (sheet previews): a burst of two
+/// full boards, then 1 MB a second, across all its connections.
+pub const OUT_BURST: f64 = 32.0 * 1024.0 * 1024.0;
+pub const OUT_PER_SEC: f64 = 1024.0 * 1024.0;
 const CREATE_BURST: f64 = 10.0;
 const CREATE_PER_SEC: f64 = 0.1;
 
@@ -43,7 +47,7 @@ impl Bucket {
         }
     }
 
-    fn full(&mut self) -> bool {
+    pub fn full(&mut self) -> bool {
         self.refill();
         self.tokens >= self.cap
     }
@@ -71,6 +75,8 @@ fn key(ip: IpAddr) -> IpKey {
 struct Inner {
     creates: HashMap<IpKey, Bucket>,
     conns: HashMap<IpKey, u32>,
+    /// Kept after the last connection closes, so reconnecting does not refill it.
+    outs: HashMap<IpKey, Arc<Mutex<Bucket>>>,
 }
 
 #[derive(Default, Clone)]
@@ -82,6 +88,33 @@ pub struct IpLimits {
 pub struct IpGuard {
     inner: Arc<Mutex<Inner>>,
     key: IpKey,
+    out: Arc<Mutex<Bucket>>,
+}
+
+impl IpGuard {
+    /// The address's budget for replies it asked for.
+    pub fn out(&self) -> Arc<Mutex<Bucket>> {
+        self.out.clone()
+    }
+}
+
+/// A connection's budgets for the messages that cost the relay a whole sheet.
+pub struct Budget {
+    /// Whole-sheet operations (crumple, bring back, preview, layer restore), per connection.
+    pub heavy: Bucket,
+    /// Bytes of requested replies, shared by the address's connections.
+    pub out: Arc<Mutex<Bucket>>,
+}
+
+impl Budget {
+    pub fn new(out: Arc<Mutex<Bucket>>) -> Budget {
+        Budget { heavy: Bucket::new(12.0, 0.5), out }
+    }
+
+    /// Take `n` bytes from the reply budget.
+    pub fn send(&mut self, n: usize) -> bool {
+        self.out.lock().unwrap().take_n(n as f64)
+    }
 }
 
 impl Drop for IpGuard {
@@ -113,12 +146,16 @@ impl IpLimits {
             return None;
         }
         *n += 1;
-        Some(IpGuard { inner: self.inner.clone(), key: k })
+        let out = g.outs.entry(k).or_insert_with(|| Arc::new(Mutex::new(Bucket::new(OUT_BURST, OUT_PER_SEC)))).clone();
+        Some(IpGuard { inner: self.inner.clone(), key: k, out })
     }
 
     /// Forget addresses whose bucket has refilled.
     pub fn prune(&self) {
-        self.inner.lock().unwrap().creates.retain(|_, b| !b.full());
+        let mut g = self.inner.lock().unwrap();
+        g.creates.retain(|_, b| !b.full());
+        let Inner { conns, outs, .. } = &mut *g;
+        outs.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
     }
 }
 
@@ -157,5 +194,22 @@ mod tests {
         assert!(l.connect(ip).is_none());
         drop(guards);
         assert!(l.connect(ip).is_some());
+    }
+
+    #[test]
+    fn the_reply_budget_is_shared_by_an_address_and_outlives_its_connections() {
+        let l = IpLimits::default();
+        let ip = IpAddr::from([198, 51, 100, 2]);
+        let (g1, g2) = (l.connect(ip).unwrap(), l.connect(ip).unwrap());
+        let (mut a, mut b) = (Budget::new(g1.out()), Budget::new(g2.out()));
+        let half = (OUT_BURST / 2.0) as usize;
+        assert!(a.send(half) && b.send(half));
+        assert!(!a.send(64 * 1024) && !b.send(64 * 1024), "both connections drew on one budget");
+        drop((a, b, g1, g2));
+        l.prune();
+        let mut c = Budget::new(l.connect(ip).unwrap().out());
+        assert!(!c.send(64 * 1024), "a new connection does not get a fresh budget");
+        let other = IpAddr::from([198, 51, 100, 3]);
+        assert!(Budget::new(l.connect(other).unwrap().out()).send(half));
     }
 }
