@@ -94,6 +94,12 @@ From the council's passes 1 to 3. Each is minor or a nit and stays open in this 
 - H5: the per-address storage share is kept in memory, so a relay restart refills it.
 - H5: one network with many addresses (an IPv6 /48, or 16 IPv4 addresses) can still fill
   storage.
+- P3-B: a sender with several addresses can still make joins busy; the per-address share only
+  stops a single address. Each address's first join may hold a copy of any size, and an IPv6
+  /48 holds 256 addresses as the relay counts them.
+- P3-B: behind a shared address (a classroom), while one join is still catching up on a board
+  with large live strokes, other joins from that address are told the relay is busy until it
+  finishes. A board with no live strokes costs a join almost nothing, so this is rare.
 - H5: the per-address storage share refills over the board lifetime, so one heavy user behind a
   shared address (a mobile carrier, a school) can stop everyone there from storing strokes for
   weeks. Undo and crumple give nothing back.
@@ -116,8 +122,14 @@ From the council's passes 1 to 3. Each is minor or a nit and stays open in this 
   open another tab on `/` is read-only.
 - H1: in edge cases the share's toast can count strokes as not shared that were; they are
   kept on the private board as well.
-- F17: a share's upload is quadratic in the number of strokes (about 0.4 s for 10,000); no user
-  cost was found.
+- F17: a share's upload is quadratic in the number of strokes, since each confirm shifts the
+  pending list (about 0.4 s for 10,000); no user cost was found.
+- serde_json's `preserve_order` pulls in `indexmap`: a size and dependency cost only.
+- The private board's save reads the whole of `wb.local` before its signature check, every 1.5
+  seconds.
+- Writing a number to the wire costs two formats and a parse.
+- If a guard stops a share's last write to the private board, the write is dropped without a
+  message and the share is forgotten, so a later share can upload the same strokes again.
 - G10: until the relay's hello arrives, the share panel's view-only link shows the edit link.
 - G11: if you cancel an edit of your own text before its ack, it draws on top locally until
   reload.
