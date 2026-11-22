@@ -150,8 +150,9 @@ impl Local {
             board.insert(s); // no q: it goes last, as `strokes.push` put it
         }
         if let Some(shelf) = d.get("shelf").and_then(Value::as_array) {
-            // `h && Array.isArray(h.a)`, then the last five. A sheet without a number is one the
-            // page never wrote; it is skipped rather than kept as NaN.
+            // `h && Array.isArray(h.a)`, then the last five. Only what the page wrote round-trips:
+            // anything else (a sheet with no integer k, items that do not parse) is dropped, not
+            // coerced.
             let kept: Vec<Sheet> = shelf
                 .iter()
                 .filter_map(|h| {
@@ -343,7 +344,7 @@ mod tests {
         assert_eq!(b.strokes[0].txt, None, "a txt that is not a string is dropped");
         let y = Item { id: "y".into(), l: None, q: None, c: String::new(), w: 0.0, pts: vec![], txt: None };
         assert_eq!(st.shelf, [Sheet { k: 2, a: vec![y] }]);
-        assert_eq!(st.next_k, 3, "max(1, '9'|0 = 0, 2+1)");
+        assert_eq!(st.next_k, 3, "Rust reads a string k as 0, where JS would coerce '9' to 9; the page never writes one");
     }
 
     #[test]

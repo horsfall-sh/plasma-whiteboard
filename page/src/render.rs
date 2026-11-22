@@ -44,7 +44,9 @@ pub trait Surface {
 
 /// Each item's bounding box, worked out once: items never change. JavaScript kept it on the
 /// item (`s.bb`); here it is kept by id. An id that comes back (a restored layer, a sheet off
-/// the shelf) comes back with the same item, so its box still holds.
+/// the shelf) comes back with the same item, so its box still holds. An item that leaves the
+/// board is dropped with [`Bounds::forget`] (the step-9 host calls it on undo, delete and a
+/// layer drop); short of that the map is bounded by the board's lifetime, as `dropBoard` clears it.
 #[derive(Clone, Debug, Default)]
 pub struct Bounds(HashMap<String, [f64; 4]>);
 
@@ -60,6 +62,21 @@ impl Bounds {
         b
     }
 
+    /// Forget one item's box: it left the board (undo, delete, its layer dropped).
+    pub fn forget(&mut self, id: &str) {
+        self.0.remove(id);
+    }
+
+    /// How many boxes are kept.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no box is kept.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Forget every box (`dropBoard`: a new board).
     pub fn clear(&mut self) {
         self.0.clear();
@@ -70,7 +87,8 @@ impl Bounds {
 /// not drawn.
 pub fn draw_full(ctx: &mut impl Surface, s: &Item, view: &View, cull: Option<V>, bounds: &mut Bounds) {
     if s.pts.len() < 3 {
-        // JavaScript drew nothing visible here either (an empty path, or NaN widths)
+        // JS drew nothing visible for a stroke here (an empty path, or NaN widths). A text item
+        // with 2 numbers would have drawn at pts[0], pts[1], but the page never makes one.
         return;
     }
     if let Some(v) = cull {
@@ -283,6 +301,7 @@ impl Surface for CanvasRenderingContext2d {
 
 /// The end of a buffered redraw: the spare canvas, pixel for pixel, onto the wiped base.
 pub fn blit(base: &CanvasRenderingContext2d, spare: &HtmlCanvasElement) {
+    // a clone of the handle (the same context), only because wipe() takes &mut self
     let mut b = base.clone();
     b.wipe();
     base.save();
@@ -373,8 +392,15 @@ mod tests {
         assert_eq!(texts.len(), 2);
         let (font, lines) = geom::text_layout("ab\nc", &t.pts, t.w, v.bw);
         assert_eq!(*texts[0], format!("text {font} #d63031 {lines:?}"));
+        assert_eq!(b.len(), 2, "far and t");
+        b.forget("far");
+        b.forget("gone");
+        assert_eq!(b.len(), 1, "forget drops one box; an unknown id is a no-op");
+        let mut r = Rec::default();
+        draw_full(&mut r, &t, &v, Some(cur), &mut b);
+        assert!(!r.0.iter().any(|c| c.starts_with("measure")), "t kept its box");
         b.clear();
-        assert!(b.0.is_empty());
+        assert!(b.is_empty());
     }
 
     #[test]
