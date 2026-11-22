@@ -189,8 +189,8 @@ stroke, 200 contributors per board, 100 connections per board.
 ## Roadmap
 
 Next, in order: end-to-end encryption with boards kept only in the browsers, TLS in the relay itself, and saved
-boards as an opt-in build feature. The whole client in Rust is done in v0.2.0. By default the server becomes a single binary with no
-database. See [`ROADMAP.md`](ROADMAP.md).
+boards as an opt-in build feature. By default the server becomes a single binary with no database. See
+[`ROADMAP.md`](ROADMAP.md). The whole client in Rust is done in v0.2.0.
 
 ## Licence
 
