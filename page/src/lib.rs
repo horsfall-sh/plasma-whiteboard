@@ -8,3 +8,4 @@ pub mod model;
 pub mod view;
 pub mod geom;
 pub mod local;
+pub mod render;

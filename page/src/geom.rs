@@ -207,7 +207,7 @@ pub fn measure_font() -> String {
 
 /// `bbox`, in board units [x0, y0, x1, y1]. A text item's width comes from `measure`, the
 /// width in px of a line drawn in [`measure_font`].
-pub fn bbox(pts: &[f64], w: f64, txt: Option<&str>, measure: impl Fn(&str) -> f64) -> [f64; 4] {
+pub fn bbox(pts: &[f64], w: f64, txt: Option<&str>, mut measure: impl FnMut(&str) -> f64) -> [f64; 4] {
     let (mut x0, mut x1, mut y0, mut y1) = (pts[0], pts[0], pts[1], pts[1]);
     if let Some(t) = txt {
         let px = 100.0;
