@@ -126,7 +126,8 @@ body.edit #bar #swatches { display: contents; }
 }
 #msg p { margin: 0 0 14px; font-size: 16px; }
 .needs p { margin: 0; font-size: 16px; }
-#msg a {
+.needs a { margin-top: 14px; }
+#msg a, .needs a {
   display: inline-block; line-height: 44px; padding: 0 16px; border-radius: 10px;
   background: #3a3f47; color: #fff; text-decoration: none;
 }

@@ -2572,9 +2572,21 @@ fn wire(page: &Page) {
     });
 }
 
+/// Council G6: a panic leaves [`with`]'s borrow of the app held, so every later event is
+/// dropped and the page stops without a word. Say so instead, and offer a reload. The hook
+/// borrows nothing and cannot panic itself.
+fn on_panic(info: &std::panic::PanicHookInfo<'_>) {
+    web_sys::console::error_1(&JsValue::from_str(&format!("the page stopped: {info}")));
+    let Some(card) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("broke")) else {
+        return;
+    };
+    let _ = card.remove_attribute("hidden");
+}
+
 /// The page's entry point, called by `boot.js` once the module is loaded.
 #[wasm_bindgen]
 pub fn start() {
+    std::panic::set_hook(Box::new(on_panic));
     let Some(page) = Page::new() else { return };
     wire(&page);
     let mut conn = Conn::default();
