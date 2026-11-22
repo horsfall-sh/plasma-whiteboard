@@ -528,8 +528,12 @@ async fn text_annotations() {
     assert_eq!(a.expect("lr").await["a"][0]["txt"], text);
     // The author can undo it like a stroke.
     a.send(json!({"t": "u", "id": "t1"})).await;
+    // The relay answers the undo to nobody but the others, so a stroke after it is the round
+    // trip that proves it was applied: one connection's frames are handled in order.
+    a.draw("after").await;
     let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
-    assert!(strokes.is_empty());
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["after"]);
     s.stop().await;
 }
 
