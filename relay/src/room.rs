@@ -192,6 +192,20 @@ impl Drop for Snap {
     }
 }
 
+/// The bytes of one join's copy of the live strokes, charged to the shared memory budget
+/// until the join has sent them (council H4: 64 live strokes of 20k points are some 33MB
+/// a join, and a slow join keeps its copy for minutes).
+pub struct Charge {
+    bytes: usize,
+    mem: Arc<Memory>,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.mem.shrink(self.bytes);
+    }
+}
+
 /// Why a join was refused.
 #[derive(Debug, PartialEq)]
 pub enum NoJoin {
@@ -236,6 +250,8 @@ pub struct Joined {
     /// The build of the chunks in `snapshot`, held until they are sent so its charge lasts
     /// as long as the copy does.
     pub hold: Option<Arc<Snap>>,
+    /// The charge for the live strokes in `snapshot`, held until they are sent.
+    pub live: Option<Charge>,
 }
 
 // ---- numbers on the wire ----------------------------------------------------
@@ -574,6 +590,20 @@ impl Room {
                 s
             }
         };
+        // Each join's copy of the live strokes is its own: charge it too, before anything changes.
+        let mut live = Vec::new();
+        for (id, s) in &st.live {
+            let w = width_json(s.w);
+            live.push(Utf8Bytes::from(format!(r#"{{"t":"b","id":"{id}","l":{},"c":"{}","w":{w}}}"#, s.layer, s.c)));
+            if !s.pts.is_empty() {
+                live.push(format!(r#"{{"t":"p","id":"{id}","pts":{}}}"#, pts_json(&s.pts)).into());
+            }
+        }
+        let bytes: usize = live.iter().map(|t| t.len()).sum();
+        if !self.mem.grow(bytes) {
+            return Err(NoJoin::Busy);
+        }
+        let charge = Charge { bytes, mem: self.mem.clone() };
         let who = who.unwrap_or_default();
         let mut layer = 0;
         match seat {
@@ -634,15 +664,9 @@ impl Room {
         }
 
         snapshot.extend(snap.chunks.iter().cloned());
-        for (id, s) in &st.live {
-            let w = width_json(s.w);
-            snapshot.push(format!(r#"{{"t":"b","id":"{id}","l":{},"c":"{}","w":{w}}}"#, s.layer, s.c).into());
-            if !s.pts.is_empty() {
-                snapshot.push(format!(r#"{{"t":"p","id":"{id}","pts":{}}}"#, pts_json(&s.pts)).into());
-            }
-        }
+        snapshot.extend(live);
         snapshot.push(Utf8Bytes::from_static(r#"{"t":"ready"}"#));
-        Ok(Joined { peer: Peer { conn, role, layer }, rx, snapshot, hold: Some(snap) })
+        Ok(Joined { peer: Peer { conn, role, layer }, rx, snapshot, hold: Some(snap), live: Some(charge) })
     }
 
     /// Remove a connection and abandon the strokes it left unfinished.

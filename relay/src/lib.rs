@@ -319,6 +319,7 @@ async fn catch_up(
             // the chunks are sent: let their build (and any charge for it) go (H4)
             None => {
                 joined.hold = None;
+                joined.live = None;
                 match queue.pop_front() {
                     Some(t) => {
                         held -= t.len();

@@ -320,6 +320,7 @@ mod tests {
         let (room, mut ed) =
             rooms.join(&db, a, |r| r.join(1, Role::Edit, Some([1; 32]), Some("vk"), &db, || true)).await.unwrap();
         ed.hold = None; // its snapshot is sent, as catch_up does
+        ed.live = None;
         let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))), Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
         let pts: Vec<String> = (0..3000).map(|i| format!("0.{:05},0.25,0.5", i)).collect();
         let draw = |id: &str, b: &mut Budget| {
@@ -356,6 +357,50 @@ mod tests {
         drop(slow2);
         assert_eq!(used(), base - held, "the last holder of a charged build gives the charge back");
         drop(next);
+    }
+
+    /// Council H4 (pass 2, the live part): on 2eaf2c4 every join still built its own copy of
+    /// the live strokes, uncharged; 64 live strokes of 20k points are some 33MB a join, and
+    /// about 11 slow joins went past the unit's memory limit. Each join's copy is charged now.
+    #[tokio::test]
+    async fn every_joins_copy_of_the_live_strokes_is_charged() {
+        use crate::limits::{Budget, Bucket};
+        use crate::room::NoJoin;
+        let db = temp_db();
+        let a = db.create_board([15; 32], [16; 32]).await.unwrap();
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
+        let (room, mut ed) =
+            rooms.join(&db, a, |r| r.join(1, Role::Edit, Some([1; 32]), Some("vk"), &db, || true)).await.unwrap();
+        ed.hold = None;
+        ed.live = None;
+        let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))), Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
+        let pts: Vec<String> = (0..3000).map(|i| format!("0.{:05},0.25,0.5", i)).collect();
+        for id in ["l1", "l2", "l3", "l4"] {
+            room.handle(ed.peer, &format!(r##"{{"t":"b","id":"{id}","c":"#112233","w":0.004}}"##), &db, &mut b);
+            room.handle(ed.peer, &format!(r#"{{"t":"p","id":"{id}","pts":[{}]}}"#, pts.join(",")), &db, &mut b);
+        }
+        let live = |j: &Joined| -> usize {
+            j.snapshot.iter().filter(|t| t.starts_with(r#"{"t":"b""#) || t.starts_with(r#"{"t":"p""#)).map(|t| t.len()).sum()
+        };
+        let used = || rooms.mem.used().0;
+
+        let base = used();
+        let v1 = room.join(2, Role::View, None, None, &db, || true).unwrap();
+        assert!(live(&v1) > 4 * 30_000, "{}", live(&v1));
+        assert_eq!(used(), base + live(&v1), "a join's copy of the live strokes is charged");
+        let v2 = room.join(3, Role::View, None, None, &db, || true).unwrap();
+        assert_eq!(used(), base + live(&v1) + live(&v2), "and every other join's copy too");
+
+        let fill = usize::MAX / 2 - used() - 100;
+        assert!(rooms.mem.grow(fill));
+        let conns = room.conns();
+        assert_eq!(room.join(4, Role::View, None, None, &db, || true).err(), Some(NoJoin::Busy), "no room for a third copy");
+        assert_eq!(room.conns(), conns, "a refused join changes nothing");
+        rooms.mem.shrink(fill);
+
+        drop(v1);
+        drop(v2);
+        assert_eq!(used(), base, "a join that has sent its copy gives the charge back");
     }
 
     #[tokio::test]
