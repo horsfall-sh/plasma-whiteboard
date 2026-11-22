@@ -1,0 +1,18 @@
+[package]
+name = "wb-page"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The Plasma Whiteboard page, in Rust compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wb-smooth = { path = "../smooth" }
+wb-crumple = { path = "../crumple" }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
