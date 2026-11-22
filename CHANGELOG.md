@@ -50,6 +50,26 @@ protocol is unchanged, so the relay serves old and new pages alike.
   operator, 2026-11-22.
   This is by design.
 
+### Known limitations / deferred
+
+From the council's pass 1. Each is minor or a nit and stays open in this release.
+
+- F27a-c: rated negligible by the council; left as they are.
+- F27f: PROTOCOL.md has drifted from the code in places; a documentation pass is deferred.
+- F27h: a layer id can be taken by someone else after its holder leaves; minor, deferred.
+- F27i: sheet numbers can be reused after a relay restart; minor, deferred.
+- F27j: `issue-cert.sh` names the `eth0` interface; works on the current host, deferred.
+- F27k: a malformed `WB_TRUST_PROXY` or `WB_TTL_DAYS` falls back to the default without
+  saying so; deferred.
+- F27l: the deploy has no SELinux step (partly refuted by the council); deferred.
+- F27m: rated plausible but generic by the council; no change made.
+- F27n: edit keys of boards a browser has opened build up in its localStorage; deferred.
+- F30: a null in a number list on the wire reads as 0, as the JavaScript page did; this is
+  documented in the code and kept.
+
+Resolved by the port itself: F27o (the name and colour are kept in `wb.name` and `wb.hue`)
+and F27p (`wb-crumple` is linked into the page).
+
 ## v0.1.0
 
 The JavaScript page and the Rust relay.
