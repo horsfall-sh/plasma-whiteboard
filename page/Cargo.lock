@@ -129,6 +129,7 @@ version = "0.1.0"
 name = "wb-page"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "serde_json",
  "wb-crumple",
  "wb-smooth",

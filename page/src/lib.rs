@@ -4,3 +4,4 @@
 
 pub mod json;
 pub mod proto;
+pub mod model;
