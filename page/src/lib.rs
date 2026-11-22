@@ -7,3 +7,4 @@ pub mod proto;
 pub mod model;
 pub mod view;
 pub mod geom;
+pub mod local;
