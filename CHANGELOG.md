@@ -44,13 +44,19 @@ protocol is unchanged, so the relay serves old and new pages alike.
 
 From the council's pass 2:
 
-- H1: a share keeps the strokes the relay refused on the private board.
+- H1: a share keeps the strokes the relay refused on the private board, including a live
+  stroke drawn during the upload and refused then.
 - H2: a share cut short to a board that has since gone returns to the private board at `/`.
 - H3: only the tab that writes the private board can share it, and a share's last write keeps
   the guards for a damaged or newer board.
-- H4: every snapshot that a slow join keeps alive is charged to the memory budget; a join that
-  cannot be charged is told the relay is busy.
+- H4: every join's copy of the board is charged to the memory budget until it is sent: each
+  build of the sheet's snapshot a slow join keeps alive, and each join's copy of the live
+  strokes. A join that cannot be charged is told the relay is busy.
 - H5: one address may hold only a sixteenth of storage, refilled over the board lifetime.
+- G5: a share keeps the private board's lock until its last write, so a waiting tab takes
+  over only after it.
+- G6: a text item with fewer than two numbers no longer stops the page, and any panic shows a
+  "something broke" card with a Reload link instead of a page that has stopped silently.
 - The relay unit restarts on any exit (`Restart=always`).
 
 ### Waived
@@ -76,6 +82,24 @@ From the council's passes 1 and 2. Each is minor or a nit and stays open in this
 - F27m: rated plausible but generic by the council; no change made.
 - F27n: edit keys of boards a browser has opened build up in its localStorage; deferred.
 - H5: the per-address storage share is kept in memory, so a relay restart refills it.
+- H5: one network with many addresses (an IPv6 /48, or 16 IPv4 addresses) can still fill
+  storage.
+- G4: reloading `/b/<edit>` mid-upload resumes the share only on the next visit to `/`.
+  Nothing is lost.
+- G7: behind a shared address, after about 60 new contributors in about 30 minutes, a new
+  board's creator may join view-only. One seat refills every 30 seconds.
+- G10: until the relay's hello arrives, the share panel's view-only link shows the edit link.
+- G11: if you cancel an edit of your own text before its ack, it draws on top locally until
+  reload.
+- G12: a name the relay rejects (C1 controls) or that is over the rate limit is dropped with no
+  message.
+- G13: a layer you hid stays hidden for you if its number is reclaimed by a new person.
+- G14: if the browser's crypto fails, the contributor secret is a constant (theoretical).
+- G16: undo, layer delete and crumple are broadcast before commit, so a crash within the write
+  batch can bring them back.
+- G17: the parity test passes silently when git history or node is missing.
+- G18: the deploy auto-rollback checks only `/healthz`, which does not load the page;
+  `rollback.sh` is manual.
 - The people panel can cover the people button on a narrow screen, as in v0.1.0; the panel's
   Close button shuts it.
 - F30: a null in a number list on the wire reads as 0, as the JavaScript page did; this is
