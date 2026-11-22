@@ -23,10 +23,18 @@ fn temp_db(name: &str) -> String {
 }
 
 async fn start(db: &str) -> Srv {
+    start_with(Config { db_path: db.to_string(), ttl_days: 0, trust_proxy: false, web_dir: None, unload_grace: GRACE })
+        .await
+}
+
+/// Short, so tests can watch a board unload.
+const GRACE: Duration = Duration::from_millis(300);
+
+async fn start_with(cfg: Config) -> Srv {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let cfg = Config { db_path: db.to_string(), ttl_days: 0, trust_proxy: false, web_dir: None };
+    let db = cfg.db_path.clone();
     let task = tokio::spawn(async move {
         serve(listener, cfg, async {
             let _ = stopped.await;
@@ -34,7 +42,7 @@ async fn start(db: &str) -> Srv {
         .await
         .unwrap();
     });
-    Srv { addr, db: db.to_string(), stop: Some(stop), task }
+    Srv { addr, db, stop: Some(stop), task }
 }
 
 impl Srv {
@@ -229,6 +237,46 @@ async fn draw_view_and_late_join() {
     assert_eq!(strokes.len(), 1);
     assert_eq!(strokes[0]["id"], "s1");
     assert_eq!(strokes[0]["pts"], json!([0.1, 0.1, 0.5, 0.2, 0.2, 0.6]));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_board_stays_loaded_for_a_grace_period_then_unloads() {
+    let s = start(&temp_db("grace")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    {
+        let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+        a.draw("a1").await;
+    }
+    // Spoil the stored row: only a fresh read of the board can notice.
+    let conn = rusqlite::Connection::open(&s.db).unwrap();
+    conn.execute("UPDATE strokes SET width = 'x' WHERE id = 'a1'", []).unwrap();
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    assert_eq!(strokes.len(), 1, "rejoined within the grace: still loaded, not read again");
+    drop(_v);
+    tokio::time::sleep(GRACE * 3).await;
+    let mut c = Client::open(&s.addr).await;
+    c.send(json!({"t": "join", "key": view})).await;
+    assert_eq!(c.next().await["code"], "busy", "after the grace it was unloaded and read again");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn joins_that_race_to_load_a_board_share_one_room() {
+    let s = start(&temp_db("race")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let viewers = futures_util::future::join_all((0..8).map(|_| Client::join(&s.addr, &view, None))).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    a.draw("a1").await;
+    for (mut v, _, _) in viewers {
+        loop {
+            let m = v.next().await;
+            if m["t"] == "e" {
+                assert_eq!(m["id"], "a1");
+                break;
+            }
+        }
+    }
     s.stop().await;
 }
 

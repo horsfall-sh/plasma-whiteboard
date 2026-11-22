@@ -11,6 +11,10 @@ pub const MAX_CONNS_PER_IP: u32 = 40;
 /// full boards, then 1 MB a second, across all its connections.
 pub const OUT_BURST: f64 = 32.0 * 1024.0 * 1024.0;
 pub const OUT_PER_SEC: f64 = 1024.0 * 1024.0;
+/// Connection attempts (each one a join) per address: a class of 40 opening
+/// the page at once, then two a second.
+const JOIN_BURST: f64 = 60.0;
+const JOIN_PER_SEC: f64 = 2.0;
 const CREATE_BURST: f64 = 10.0;
 const CREATE_PER_SEC: f64 = 0.1;
 
@@ -74,6 +78,7 @@ fn key(ip: IpAddr) -> IpKey {
 #[derive(Default)]
 struct Inner {
     creates: HashMap<IpKey, Bucket>,
+    joins: HashMap<IpKey, Bucket>,
     conns: HashMap<IpKey, u32>,
     /// Kept after the last connection closes, so reconnecting does not refill it.
     outs: HashMap<IpKey, Arc<Mutex<Bucket>>>,
@@ -138,22 +143,26 @@ impl IpLimits {
             .take()
     }
 
-    pub fn connect(&self, ip: IpAddr) -> Option<IpGuard> {
+    /// Open a connection slot. Err: why not, for the client.
+    pub fn connect(&self, ip: IpAddr) -> Result<IpGuard, &'static str> {
         let k = key(ip);
         let mut g = self.inner.lock().unwrap();
-        let n = g.conns.entry(k).or_insert(0);
-        if *n >= MAX_CONNS_PER_IP {
-            return None;
+        if g.conns.get(&k).is_some_and(|n| *n >= MAX_CONNS_PER_IP) {
+            return Err("too many connections from this address");
         }
-        *n += 1;
+        if !g.joins.entry(k).or_insert_with(|| Bucket::new(JOIN_BURST, JOIN_PER_SEC)).take() {
+            return Err("connecting too often; wait a moment");
+        }
+        *g.conns.entry(k).or_insert(0) += 1;
         let out = g.outs.entry(k).or_insert_with(|| Arc::new(Mutex::new(Bucket::new(OUT_BURST, OUT_PER_SEC)))).clone();
-        Some(IpGuard { inner: self.inner.clone(), key: k, out })
+        Ok(IpGuard { inner: self.inner.clone(), key: k, out })
     }
 
     /// Forget addresses whose bucket has refilled.
     pub fn prune(&self) {
         let mut g = self.inner.lock().unwrap();
         g.creates.retain(|_, b| !b.full());
+        g.joins.retain(|_, b| !b.full());
         let Inner { conns, outs, .. } = &mut *g;
         outs.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
     }
@@ -191,9 +200,20 @@ mod tests {
         let l = IpLimits::default();
         let ip: IpAddr = "198.51.100.1".parse().unwrap();
         let guards: Vec<_> = (0..MAX_CONNS_PER_IP).map(|_| l.connect(ip).unwrap()).collect();
-        assert!(l.connect(ip).is_none());
+        assert!(l.connect(ip).is_err());
         drop(guards);
-        assert!(l.connect(ip).is_some());
+        assert!(l.connect(ip).is_ok());
+    }
+
+    #[test]
+    fn connection_attempts_are_rate_limited_per_address() {
+        let l = IpLimits::default();
+        let ip = IpAddr::from([198, 51, 100, 4]);
+        for _ in 0..JOIN_BURST as usize {
+            drop(l.connect(ip).unwrap());
+        }
+        assert_eq!(l.connect(ip).err(), Some("connecting too often; wait a moment"));
+        assert!(l.connect(IpAddr::from([198, 51, 100, 5])).is_ok());
     }
 
     #[test]

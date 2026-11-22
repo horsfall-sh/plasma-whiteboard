@@ -13,6 +13,7 @@ async fn main() -> std::io::Result<()> {
         ttl_days: env("WB_TTL_DAYS").and_then(|v| v.parse().ok()).unwrap_or(90),
         trust_proxy: env("WB_TRUST_PROXY").is_some_and(|v| v == "1"),
         web_dir: env("WB_WEB_DIR").map(PathBuf::from),
+        unload_grace: wb_relay::rooms::UNLOAD_GRACE,
     };
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!(

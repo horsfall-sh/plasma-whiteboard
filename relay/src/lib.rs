@@ -5,6 +5,7 @@ pub mod db;
 pub mod keys;
 pub mod limits;
 pub mod room;
+pub mod rooms;
 
 use axum::{
     body::Body,
@@ -20,9 +21,9 @@ use axum::{
 use db::{Db, Role};
 use limits::{Bucket, Budget, IpGuard, IpLimits};
 use room::{In, Room, MAX_MSG};
+use rooms::{Refused, Rooms};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -44,12 +45,14 @@ pub struct Config {
     pub trust_proxy: bool,
     /// Serve the page from this directory instead of the copy in the binary.
     pub web_dir: Option<PathBuf>,
+    /// How long a board stays loaded after its last connection leaves.
+    pub unload_grace: Duration,
 }
 
 struct App {
     cfg: Config,
     db: Db,
-    rooms: tokio::sync::Mutex<HashMap<i64, Arc<Room>>>,
+    rooms: Arc<Rooms>,
     ips: IpLimits,
     next_conn: AtomicU64,
     assets: Vec<Asset>,
@@ -195,8 +198,9 @@ async fn ws_upgrade(
         return plain(StatusCode::FORBIDDEN, "wrong origin");
     }
     let ip = client_ip(&app, &headers, addr);
-    let Some(guard) = app.ips.connect(ip) else {
-        return plain(StatusCode::TOO_MANY_REQUESTS, "too many connections from this address");
+    let guard = match app.ips.connect(ip) {
+        Ok(g) => g,
+        Err(why) => return plain(StatusCode::TOO_MANY_REQUESTS, why),
     };
     ws.max_message_size(MAX_MSG)
         .max_frame_size(MAX_MSG)
@@ -253,53 +257,22 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
     let view = (role == Role::Edit).then(|| keys::view_key(&key));
     let conn = app.next_conn.fetch_add(1, Ordering::Relaxed);
 
-    // Find or load the board and join it, all under the registry lock, so a
-    // board can't be unloaded between the two.
-    let (room, joined) = {
-        let mut rooms = app.rooms.lock().await;
-        // A lost room is replaced; its own connections are on their way out.
-        let room = match rooms.get(&board).filter(|r| !r.is_dead()) {
-            Some(r) => r.clone(),
-            None => {
-                // A board that can't be read is refused, never loaded empty.
-                let Ok(loaded) = app.db.load(board).await else {
-                    drop(rooms);
-                    return bye(sock, "busy", "this board can't be opened right now; try again later").await;
-                };
-                let r = Arc::new(Room::new(board, loaded));
-                rooms.insert(board, r.clone());
-                r
-            }
-        };
-        let joined = room.join(conn, role, who_hash, view.as_deref(), &app.db);
-        if joined.is_err() && room.conns() == 0 {
-            forget(&mut rooms, &room);
+    let joined = app.rooms.join(&app.db, board, |r| r.join(conn, role, who_hash, view.as_deref(), &app.db)).await;
+    let (room, mut joined) = match joined {
+        Ok(j) => j,
+        Err(Refused::Unreadable) => {
+            return bye(sock, "busy", "this board can't be opened right now; try again later").await
         }
-        (room, joined)
-    };
-    let Ok(mut joined) = joined else {
-        return bye(sock, "busy", "this board has too many connections").await;
+        Err(Refused::Full) => return bye(sock, "busy", "this board has too many connections").await,
     };
 
     let reason = relay(&app, &room, &mut sock, &mut joined, Budget::new(guard.out())).await;
 
-    {
-        let mut rooms = app.rooms.lock().await;
-        room.leave(joined.peer);
-        if room.conns() == 0 {
-            forget(&mut rooms, &room);
-        }
-    }
+    room.leave(joined.peer);
+    app.rooms.left(room);
     match reason {
         Some((code, m)) => bye(sock, code, m).await,
         None => hang_up(sock).await,
-    }
-}
-
-/// Drop an empty room from the registry, unless a newer one has taken its place.
-fn forget(rooms: &mut HashMap<i64, Arc<Room>>, room: &Arc<Room>) {
-    if rooms.get(&room.board).is_some_and(|r| Arc::ptr_eq(r, room)) {
-        rooms.remove(&room.board);
     }
 }
 
@@ -378,7 +351,7 @@ async fn janitor(app: Arc<App>) {
         tick.tick().await;
         app.ips.prune();
         if app.cfg.ttl_days > 0 && n % 6 == 0 {
-            let skip: Vec<i64> = app.rooms.lock().await.keys().copied().collect();
+            let skip = app.rooms.boards();
             let cutoff = db::now() - i64::from(app.cfg.ttl_days) * 86_400;
             let gone = app.db.sweep(cutoff, skip).await;
             if gone > 0 {
@@ -396,10 +369,11 @@ pub async fn serve(
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let db = Db::open(&cfg.db_path).map_err(std::io::Error::other)?;
+    let grace = cfg.unload_grace;
     let app = Arc::new(App {
         cfg,
         db: db.clone(),
-        rooms: tokio::sync::Mutex::new(HashMap::new()),
+        rooms: Rooms::new(grace),
         ips: IpLimits::default(),
         next_conn: AtomicU64::new(1),
         assets: assets(),
