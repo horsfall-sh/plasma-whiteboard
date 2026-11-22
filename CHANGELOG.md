@@ -98,15 +98,22 @@ From the council's passes 1 to 3. Each is minor or a nit and stays open in this 
   stops a single address. Each address's first join may hold a copy of any size, and an IPv6
   /48 holds 256 addresses as the relay counts them.
 - P3-B: behind a shared address (a classroom), while one join is still catching up on a board
-  with large live strokes, other joins from that address are told the relay is busy until it
-  finishes. A board with no live strokes costs a join almost nothing, so this is rare.
+  with large live strokes, or a large board being edited, other joins from that address are
+  told the relay is busy until it finishes. A sheet that changes while an older build of it is
+  still being sent charges the address for one more build, up to 16 MB. A quiet board with no
+  live strokes costs a join almost nothing, so this is rare.
+- P3-B: an address is charged for every extra build of a sheet its joins are sent, even one it
+  only shares with another address's join. This errs safe, but makes the busy answer above a
+  little more likely.
 - H5: the per-address storage share refills over the board lifetime, so one heavy user behind a
   shared address (a mobile carrier, a school) can stop everyone there from storing strokes for
   weeks. Undo and crumple give nothing back.
 - Behind a shared address everyone also shares the join allowance (60, refilled at 2 a second)
   and the new-layer allowance (60, refilled at one every 30 seconds).
 - P3-B: a link slower than about 2 Mbit/s cannot open a very large board: its join is
-  dropped as too slow and reconnects.
+  dropped as too slow and reconnects. The deadline counts only the snapshot, not the strokes
+  sent to the join while it catches up (up to 8 MB), so on a large busy board a somewhat faster
+  link can be dropped too.
 - G4: reloading `/b/<edit>` mid-upload resumes the share only on the next visit to `/`.
   Nothing is lost.
 - G7: behind a shared address, one person can empty the new-layer allowance by joining and
