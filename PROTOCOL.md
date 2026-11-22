@@ -110,3 +110,5 @@ same sequence. A client that falls too far behind is disconnected and gets a fre
 | Connections per board / per address | 100 / 40; viewers may hold at most 80 of a board's 100 |
 | Messages per connection | 300 per second sustained, burst 600 |
 | New boards per address | burst 10, then one per 10 s |
+
+An "address" is one IPv4 address, or one IPv6 /56 (all of a home's networks share it).

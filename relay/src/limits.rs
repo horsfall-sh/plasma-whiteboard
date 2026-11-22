@@ -61,7 +61,9 @@ impl Bucket {
     }
 }
 
-/// One limit per IPv4 address or per IPv6 /64 (a home or phone gets a whole /64).
+/// One limit per IPv4 address or per IPv6 /56. A home is usually given a /56
+/// and a phone a /64; keying by /64 would hand a /48 holder 65,536 times
+/// every limit, where a /56 key leaves it 256.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct IpKey([u8; 16]);
 
@@ -72,7 +74,7 @@ fn key(ip: IpAddr) -> IpKey {
             Some(v4) => IpKey(v4.to_ipv6_mapped().octets()),
             None => {
                 let mut o = v6.octets();
-                o[8..].fill(0);
+                o[7..].fill(0);
                 IpKey(o)
             }
         },
@@ -197,14 +199,18 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_is_limited_by_slash_64() {
+    fn ipv6_is_limited_by_slash_56() {
         let l = IpLimits::default();
-        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
-        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let a: IpAddr = "2001:db8:1:200::1".parse().unwrap();
+        // Another /64 in the same /56.
+        let b: IpAddr = "2001:db8:1:2ff:ffff::9".parse().unwrap();
+        // The next /56.
+        let c: IpAddr = "2001:db8:1:300::1".parse().unwrap();
         for _ in 0..10 {
             assert!(l.may_create(a));
         }
         assert!(!l.may_create(b));
+        assert!(l.may_create(c));
     }
 
     #[test]
