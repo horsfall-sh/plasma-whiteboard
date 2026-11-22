@@ -14,6 +14,10 @@ async fn main() -> std::io::Result<()> {
         trust_proxy: env("WB_TRUST_PROXY").is_some_and(|v| v == "1"),
         web_dir: env("WB_WEB_DIR").map(PathBuf::from),
         unload_grace: wb_relay::rooms::UNLOAD_GRACE,
+        max_loaded: env("WB_MAX_LOADED_MB")
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(wb_relay::memory::MAX_LOADED, |mb| mb * 1024 * 1024),
+        max_rooms: env("WB_MAX_ROOMS").and_then(|v| v.parse().ok()).unwrap_or(wb_relay::memory::MAX_ROOMS),
     };
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!(

@@ -129,6 +129,8 @@ Environment variables for `wb-relay`:
 | `WB_ADDR` | `127.0.0.1:8787` | Listen address. |
 | `WB_DB` | `whiteboard.db` | SQLite file. |
 | `WB_TTL_DAYS` | `90` | A board not opened for this many days is deleted. `0` keeps boards for ever. |
+| `WB_MAX_LOADED_MB` | `144` | What all open boards may hold in memory together. Past it, new boards get `busy` and new strokes `no`. Keep it well under the unit's `MemoryMax`. |
+| `WB_MAX_ROOMS` | `2000` | Boards open at once. |
 | `WB_TRUST_PROXY` | unset | Set to `1` behind a reverse proxy you run, so rate limits use the last `X-Forwarded-For` address. Leave unset when the relay faces the network directly. |
 | `WB_WEB_DIR` | unset | Serve the page from this directory instead of the copy in the binary (development). |
 

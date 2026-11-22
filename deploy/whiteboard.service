@@ -2,6 +2,8 @@
 Description=Whiteboard relay
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting: a crash loop must not leave the relay down for good.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/wb-relay

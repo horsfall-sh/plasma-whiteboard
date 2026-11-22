@@ -3,6 +3,7 @@
 //! from storage or joined: one slow board does not stall the others.
 
 use crate::db::Db;
+use crate::memory::Memory;
 use crate::room::{Joined, Room};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,10 @@ use std::time::Duration;
 /// How long a board stays loaded after its last connection leaves, so a
 /// reconnect (or a leave and join loop) does not read it again each time.
 pub const UNLOAD_GRACE: Duration = Duration::from_secs(15);
+
+/// Boards read from storage at once: each read holds a whole board in
+/// memory before the budget can weigh it.
+const MAX_LOADING: usize = 4;
 
 #[derive(Default)]
 struct Cell {
@@ -24,16 +29,45 @@ pub enum Refused {
     Unreadable,
     /// The room said no (it is full).
     Full,
+    /// Loading it would go over the shared memory budget.
+    Busy,
 }
 
 pub struct Rooms {
     map: Mutex<HashMap<i64, Arc<Cell>>>,
     grace: Duration,
+    mem: Arc<Memory>,
+    loading: tokio::sync::Semaphore,
 }
 
 impl Rooms {
-    pub fn new(grace: Duration) -> Arc<Rooms> {
-        Arc::new(Rooms { map: Mutex::new(HashMap::new()), grace })
+    pub fn new(grace: Duration, mem: Memory) -> Arc<Rooms> {
+        Arc::new(Rooms {
+            map: Mutex::new(HashMap::new()),
+            grace,
+            mem: Arc::new(mem),
+            loading: tokio::sync::Semaphore::new(MAX_LOADING),
+        })
+    }
+
+    /// Unload boards no one is connected to (ones in their grace period),
+    /// until `room` fits in the budget. Cells being joined or loaded are
+    /// skipped, never waited on.
+    fn make_room(&self, room: &Room) -> bool {
+        let cells: Vec<(i64, Arc<Cell>)> =
+            self.map.lock().unwrap().iter().filter(|(b, _)| **b != room.board).map(|(b, c)| (*b, c.clone())).collect();
+        for (board, cell) in cells {
+            if room.admit() {
+                return true;
+            }
+            let Ok(mut slot) = cell.room.try_lock() else { continue };
+            if slot.as_ref().is_some_and(|r| r.conns() == 0) {
+                // Dropping the last hold on it gives its memory back.
+                *slot = None;
+                self.remove(board, &cell);
+            }
+        }
+        room.admit()
     }
 
     /// The boards loaded or being loaded.
@@ -72,6 +106,7 @@ impl Rooms {
                 Some(r) => r.clone(),
                 None => {
                     // A board that can't be read is refused, never loaded empty.
+                    let Ok(_turn) = self.loading.acquire().await else { return Err(Refused::Busy) };
                     let Ok(loaded) = db.load(board).await else {
                         if slot.as_ref().is_none_or(|r| r.conns() == 0) {
                             *slot = None;
@@ -79,7 +114,14 @@ impl Rooms {
                         }
                         return Err(Refused::Unreadable);
                     };
-                    let r = Arc::new(Room::new(board, loaded));
+                    let r = Arc::new(Room::new(board, loaded, self.mem.clone()));
+                    if !r.admit() && !self.make_room(&r) {
+                        if slot.as_ref().is_none_or(|r| r.conns() == 0) {
+                            *slot = None;
+                            self.remove(board, &cell);
+                        }
+                        return Err(Refused::Busy);
+                    }
                     *slot = Some(r.clone());
                     r
                 }
@@ -102,16 +144,20 @@ impl Rooms {
             return;
         }
         let rooms = self.clone();
+        let board = room.board;
+        // Not a strong hold: an idle board unloaded early (to make room for
+        // another) must free its memory now, not when this timer ends.
+        let room = Arc::downgrade(&room);
         tokio::spawn(async move {
             tokio::time::sleep(rooms.grace).await;
-            let Some(cell) = rooms.map.lock().unwrap().get(&room.board).cloned() else {
+            let Some(cell) = rooms.map.lock().unwrap().get(&board).cloned() else {
                 return;
             };
             let mut slot = cell.room.lock().await;
             // Joins happen under this lock, so the count can't change under us.
-            if slot.as_ref().is_some_and(|r| Arc::ptr_eq(r, &room)) && room.conns() == 0 {
+            if slot.as_ref().is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), room.as_ptr()) && r.conns() == 0) {
                 *slot = None;
-                rooms.remove(room.board, &cell);
+                rooms.remove(board, &cell);
             }
         });
     }
@@ -119,6 +165,11 @@ impl Rooms {
     /// Loaded rooms, for tests.
     pub fn loaded(&self) -> usize {
         self.map.lock().unwrap().len()
+    }
+
+    /// The shared budget's bytes and boards held, for tests.
+    pub fn memory(&self) -> (usize, usize) {
+        self.mem.used()
     }
 }
 
@@ -140,7 +191,7 @@ mod tests {
         let db = temp_db();
         let a = db.create_board([1; 32], [2; 32]).await.unwrap();
         let b = db.create_board([3; 32], [4; 32]).await.unwrap();
-        let rooms = Rooms::new(Duration::from_secs(60));
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(usize::MAX / 2, 100));
         // Stand in for a slow load of board a: hold its cell.
         let cell = rooms.map.lock().unwrap().entry(a).or_default().clone();
         let held = cell.room.lock().await;
@@ -159,7 +210,7 @@ mod tests {
     async fn a_join_that_waited_on_an_unloaded_cell_starts_again() {
         let db = temp_db();
         let a = db.create_board([5; 32], [6; 32]).await.unwrap();
-        let rooms = Rooms::new(Duration::ZERO);
+        let rooms = Rooms::new(Duration::ZERO, Memory::new(usize::MAX / 2, 100));
         let (room, j) = rooms.join(&db, a, |r| r.join(1, Role::View, None, None, &db)).await.unwrap();
         let old = rooms.map.lock().unwrap().get(&a).cloned().unwrap();
         let mut held = old.room.lock().await;

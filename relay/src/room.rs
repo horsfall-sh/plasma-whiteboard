@@ -5,6 +5,7 @@
 use crate::db::{Db, Link, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
 use crate::limits::Budget;
+use crate::memory::{weight, Memory};
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -143,6 +144,8 @@ struct State {
     next_sheet: u32,
     /// Bytes of stroke JSON held, sheet in use plus shelf.
     bytes: usize,
+    /// What the shared memory budget holds for this board; 0 until admitted.
+    charged: usize,
     /// The snapshot's `ss` chunks, shared by every join until the sheet changes.
     snap: Option<Vec<Utf8Bytes>>,
     /// Every stroke id the board has ever stored, undone ones included.
@@ -158,7 +161,17 @@ pub struct Room {
     pub board: i64,
     tx: broadcast::Sender<Out>,
     link: Arc<Link>,
+    mem: Arc<Memory>,
     st: Mutex<State>,
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
+        if st.charged > 0 {
+            self.mem.release(st.charged);
+        }
+    }
 }
 
 /// What a connection is allowed to be on this board.
@@ -313,7 +326,39 @@ pub fn layer_color(n: u32) -> String {
 // ---- the room ---------------------------------------------------------------
 
 impl Room {
-    pub fn new(board: i64, loaded: Loaded) -> Room {
+    /// Take this board into the shared memory budget. False if it does not fit.
+    pub fn admit(&self) -> bool {
+        let mut st = self.st.lock().unwrap();
+        if st.charged > 0 {
+            return true;
+        }
+        let w = weight(st.bytes);
+        if !self.mem.admit(w) {
+            return false;
+        }
+        st.charged = w;
+        true
+    }
+
+    /// Set the bytes held to `bytes`, charging or crediting the shared
+    /// budget. False, and nothing changed, if growth does not fit.
+    fn resize(&self, st: &mut State, bytes: usize) -> bool {
+        if st.charged > 0 {
+            let w = weight(bytes);
+            if w > st.charged {
+                if !self.mem.grow(w - st.charged) {
+                    return false;
+                }
+            } else {
+                self.mem.shrink(st.charged - w);
+            }
+            st.charged = w;
+        }
+        st.bytes = bytes;
+        true
+    }
+
+    pub fn new(board: i64, loaded: Loaded, mem: Arc<Memory>) -> Room {
         let mut ids = HashSet::new();
         let mut strokes = Vec::new();
         let mut shelf: Vec<Sheet> = Vec::new();
@@ -362,12 +407,14 @@ impl Room {
             board,
             tx,
             link,
+            mem,
             st: Mutex::new(State {
                 next_seq,
                 strokes,
                 shelf,
                 next_sheet,
                 bytes,
+                charged: 0,
                 snap: None,
                 ids,
                 layers,
@@ -651,7 +698,8 @@ impl Room {
                     return;
                 };
                 let gone = st.strokes.remove(i);
-                st.bytes = st.bytes.saturating_sub(gone.json.len());
+                let left = st.bytes.saturating_sub(gone.json.len());
+                self.resize(&mut st, left);
                 st.snap = None;
                 db.stroke_state(&self.link, id.clone(), UNDONE);
                 self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
@@ -683,7 +731,8 @@ impl Room {
                     let old = st.shelf.remove(0);
                     for s in &old.strokes {
                         st.ids.remove(&s.id);
-                        st.bytes = st.bytes.saturating_sub(s.json.len());
+                        let left = st.bytes.saturating_sub(s.json.len());
+                        self.resize(&mut st, left);
                     }
                     db.sheet_drop(&self.link, old.k);
                     dropped = old.k.to_string();
@@ -822,11 +871,16 @@ impl Room {
         let seq = st.next_seq;
         st.next_seq += 1;
         let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
+        let more = st.bytes + json.len();
+        if !self.resize(st, more) {
+            drop_live(self);
+            self.only(conn, refusal(&id, "the server is out of memory for strokes; try again later"));
+            return;
+        }
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
         let ok = self.ok_once_stored(conn, &id, seq);
         db.add_stroke(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, ok);
         st.ids.insert(id.clone());
-        st.bytes += json.len();
         st.snap = None;
         st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
     }

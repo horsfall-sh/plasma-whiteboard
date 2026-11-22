@@ -4,6 +4,7 @@
 pub mod db;
 pub mod keys;
 pub mod limits;
+pub mod memory;
 pub mod room;
 pub mod rooms;
 
@@ -47,6 +48,10 @@ pub struct Config {
     pub web_dir: Option<PathBuf>,
     /// How long a board stays loaded after its last connection leaves.
     pub unload_grace: Duration,
+    /// What all loaded boards may hold in memory together, in bytes.
+    pub max_loaded: usize,
+    /// Boards loaded at once.
+    pub max_rooms: usize,
 }
 
 struct App {
@@ -264,6 +269,7 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
             return bye(sock, "busy", "this board can't be opened right now; try again later").await
         }
         Err(Refused::Full) => return bye(sock, "busy", "this board has too many connections").await,
+        Err(Refused::Busy) => return bye(sock, "busy", "the server is at capacity; try again later").await,
     };
 
     let reason = relay(&app, &room, &mut sock, &mut joined, Budget::new(guard.out())).await;
@@ -370,10 +376,11 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let db = Db::open(&cfg.db_path).map_err(std::io::Error::other)?;
     let grace = cfg.unload_grace;
+    let (max_loaded, max_rooms) = (cfg.max_loaded, cfg.max_rooms);
     let app = Arc::new(App {
         cfg,
         db: db.clone(),
-        rooms: Rooms::new(grace),
+        rooms: Rooms::new(grace, memory::Memory::new(max_loaded, max_rooms)),
         ips: IpLimits::default(),
         next_conn: AtomicU64::new(1),
         assets: assets(),

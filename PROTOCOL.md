@@ -71,7 +71,7 @@ Messages from a viewer other than `join` are ignored.
 | `p` | `id`, `pts` | Points for a live stroke. |
 | `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`? | A stroke or text annotation was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
 | `ok` | `id`, `q` | To the author: the stroke is committed to storage, with sequence number `q`. It is sent only after the commit, so the page may forget its own copy. A stroke that fails to store gets no `ok`: the board ends every connection with `busy`, and the page resends it on reconnect. |
-| `no` | `id`, `m` | To the author: the stroke was refused (board full, bad data). The client removes it. |
+| `no` | `id`, `m` | To the author: the stroke was refused (board full, server out of memory, bad data). The client removes it. |
 | `u` | `id` | A stroke was removed (undone, or a live stroke abandoned). Not sent to the author of an undo. |
 | `l` | `l`, `c` | A new layer (a new contributor joined). Sent to everyone. |
 | `ld` | `l` | Layer `l` was deleted: drop its finished strokes and mark it restorable. Sent to everyone, including the sender. |
@@ -82,7 +82,7 @@ Messages from a viewer other than `join` are ignored.
 | `n` | `n`, `on` | Number of connections on the board now, and the layers that have one open. |
 | `nm` | `l`, `n`, `c` | Layer `l` now has this name and colour. Sent to everyone. |
 | `pg` | `l`, `k`, `pts` | A ping from layer `l` with letter `k` (A to Z, then round again). Sent to everyone, including the sender. |
-| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, or the board could not be read or written (retry later). `rate`: sending too fast. `bad`: malformed join. |
+| `err` | `code`, `m` | Fatal; the relay closes after it. `gone`: no such board (do not reconnect). `busy`: too many connections, the server at capacity, or the board could not be read or written (retry later). `rate`: sending too fast. `bad`: malformed join. |
 
 `q` is a per-board sequence number. Strokes are drawn in `q` order. A stroke is never changed after it is
 stored; undo, layer delete and restore only flip its state.

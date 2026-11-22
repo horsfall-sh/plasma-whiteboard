@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use wb_relay::memory::{COPIES, ROOM_COST};
 use wb_relay::{serve, Config};
 
 struct Srv {
@@ -23,8 +24,19 @@ fn temp_db(name: &str) -> String {
 }
 
 async fn start(db: &str) -> Srv {
-    start_with(Config { db_path: db.to_string(), ttl_days: 0, trust_proxy: false, web_dir: None, unload_grace: GRACE })
-        .await
+    start_with(config(db)).await
+}
+
+fn config(db: &str) -> Config {
+    Config {
+        db_path: db.to_string(),
+        ttl_days: 0,
+        trust_proxy: false,
+        web_dir: None,
+        unload_grace: GRACE,
+        max_loaded: usize::MAX / 2,
+        max_rooms: 1000,
+    }
 }
 
 /// Short, so tests can watch a board unload.
@@ -913,5 +925,54 @@ async fn previews_draw_on_the_heavy_budget_even_when_cached() {
         }
     }
     assert!((11..=12).contains(&got), "{got} previews answered");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn boards_past_the_shared_memory_budget_are_refused_and_idle_ones_make_way() {
+    // Room for two empty boards, not three.
+    let s = start_with(Config { max_loaded: 2 * ROOM_COST + 1024, ..config(&temp_db("budget")) }).await;
+    let (a, _) = new_board(&s.addr).await;
+    let (b, _) = new_board(&s.addr).await;
+    let (c, _) = new_board(&s.addr).await;
+    let (_a, _, _) = Client::join(&s.addr, &a, Some(WHO_A)).await;
+    let (bc, _, _) = Client::join(&s.addr, &b, Some(WHO_A)).await;
+    let mut x = Client::open(&s.addr).await;
+    x.send(json!({"t": "join", "key": c, "who": WHO_A})).await;
+    let m = x.next().await;
+    assert_eq!(m["code"], "busy", "{m}");
+    // Board b goes idle: still in its grace period, but it makes way for c.
+    drop(bc);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (_c, _, _) = Client::join(&s.addr, &c, Some(WHO_A)).await;
+    let mut y = Client::open(&s.addr).await;
+    y.send(json!({"t": "join", "key": b, "who": WHO_A})).await;
+    assert_eq!(y.next().await["code"], "busy", "a and c are in use; b can't come back");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_stroke_past_the_shared_memory_budget_is_refused_and_undo_gives_room_back() {
+    // An empty board fits with room for a few strokes.
+    let s = start_with(Config { max_loaded: ROOM_COST + COPIES * 600, ..config(&temp_db("grow")) }).await;
+    let (edit, _) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let mut drawn = 0;
+    let refused = loop {
+        let id = format!("a{drawn}");
+        a.send(json!({"t": "s", "id": id, "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5, 0.2, 0.2, 0.5]})).await;
+        let m = a.next().await;
+        if m["t"] == "no" {
+            break m;
+        }
+        assert_eq!(m["t"], "ok", "{m}");
+        drawn += 1;
+        assert!(drawn < 50, "the budget never said no");
+    };
+    assert!(drawn > 0);
+    assert!(refused["m"].as_str().unwrap().contains("memory"), "{refused}");
+    a.send(json!({"t": "u", "id": format!("a{}", drawn - 1)})).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    a.draw("again").await;
     s.stop().await;
 }
