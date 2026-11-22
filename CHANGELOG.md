@@ -79,7 +79,7 @@ From the council's pass 3:
 
 ### Known limitations / deferred
 
-From the council's passes 1 and 2. Each is minor or a nit and stays open in this release.
+From the council's passes 1 to 3. Each is minor or a nit and stays open in this release.
 
 - F27a-c: rated negligible by the council; left as they are.
 - F27f: PROTOCOL.md has drifted from the code in places; a documentation pass is deferred.
@@ -94,12 +94,30 @@ From the council's passes 1 and 2. Each is minor or a nit and stays open in this
 - H5: the per-address storage share is kept in memory, so a relay restart refills it.
 - H5: one network with many addresses (an IPv6 /48, or 16 IPv4 addresses) can still fill
   storage.
+- H5: the per-address storage share refills over the board lifetime, so one heavy user behind a
+  shared address (a mobile carrier, a school) can stop everyone there from storing strokes for
+  weeks. Undo and crumple give nothing back.
+- Behind a shared address everyone also shares the join allowance (60, refilled at 2 a second)
+  and the new-layer allowance (60, refilled at one every 30 seconds).
 - P3-B: a link slower than about 2 Mbit/s cannot open a very large board: its join is
   dropped as too slow and reconnects.
 - G4: reloading `/b/<edit>` mid-upload resumes the share only on the next visit to `/`.
   Nothing is lost.
-- G7: behind a shared address, after about 60 new contributors in about 30 minutes, a new
-  board's creator may join view-only. One seat refills every 30 seconds.
+- G7: behind a shared address, one person can empty the new-layer allowance by joining and
+  leaving boards, and keep it empty with about 2 joins a minute; a new board's creator there
+  then joins view-only. A share made then stops with a message, and the private board is kept
+  whole (P3-A).
+- A transient database error while a board is looked up reads as "gone", so a share resumed
+  then is abandoned. The private board is kept, but the edit link to the half-filled board is
+  forgotten.
+- A share resumed when the page loads runs without the private board's writer lock. The other
+  guards hold, so the worst case is a stroke kept twice on the private board.
+- Every page, a shared board included, takes the private board's writer lock, so while one is
+  open another tab on `/` is read-only.
+- H1: in edge cases the share's toast can count strokes as not shared that were; they are
+  kept on the private board as well.
+- F17: a share's upload is quadratic in the number of strokes (about 0.4 s for 10,000); no user
+  cost was found.
 - G10: until the relay's hello arrives, the share panel's view-only link shows the edit link.
 - G11: if you cancel an edit of your own text before its ack, it draws on top locally until
   reload.
