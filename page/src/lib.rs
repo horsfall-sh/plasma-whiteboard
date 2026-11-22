@@ -1,6 +1,9 @@
-//! The Plasma Whiteboard page. The pure modules (`json`, `proto`, `model`, `view`, `geom`,
-//! `local`) know nothing of the browser and are tested on the host with `cargo test`; the web
-//! modules drive the DOM, the canvases and the socket through web-sys.
+//! The Plasma Whiteboard page, ported from `web/app.js`. Every module here is tested on the
+//! host by `cargo test` (and so by `make test`): `json`, `proto`, `model`, `view`, `geom`,
+//! `local`, `input` and `net` know nothing of the browser, and `render` draws through a
+//! [`render::Surface`] trait that the browser's 2D context implements and the tests record.
+//! `tests/parity.rs` checks `geom` and `view` against app.js itself. The glue that wires these
+//! to the DOM, the socket and storage is not written yet, so `web/index.html` still runs app.js.
 
 pub mod json;
 pub mod proto;

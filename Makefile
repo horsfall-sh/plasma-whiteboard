@@ -18,6 +18,7 @@ test: wasm
 	cd smooth && cargo test
 	cd crumple && cargo test
 	cd relay && cargo test
+	cd page && cargo test
 	node --check web/app.js
 
 # Local run on http://127.0.0.1:8787, serving web/ from disk so page edits show on reload.
