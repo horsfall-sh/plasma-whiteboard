@@ -16,8 +16,17 @@ use serde_json::Value;
 
 /// Where the private board is kept.
 pub const LOCAL_KEY: &str = "wb.local";
+/// While a private board is being shared, the edit key of the board it is going to. A reload
+/// before the upload finished resumes it there ([`sharing_target`]) instead of making a
+/// second board on the next Share.
+pub const SHARING_KEY: &str = "wb.sharing";
 /// How many crumpled sheets the shelf keeps, as the relay does.
 pub const SHELF_MAX: usize = 5;
+
+/// What [`SHARING_KEY`] holds, if it is a key a link can carry.
+pub fn sharing_target(stored: Option<&str>) -> Option<&str> {
+    stored.filter(|k| valid_secret(k))
+}
 
 /// The `localStorage` key for my contributor secret on board `key`.
 pub fn who_key(key: &str) -> String {
@@ -232,6 +241,12 @@ impl Local {
         }
         st.next_k = st.shelf.iter().map(|h| h.k + 1).fold(to_int32(d.get("k")).max(1), i64::max);
         (st, mine)
+    }
+
+    /// What [`LOCAL_KEY`] holds once a share has finished: no items (they are on the relay
+    /// now) but the same shelf and sheet number, because crumpled sheets are not shared.
+    pub fn after_share(&self) -> String {
+        self.text(&Board::default())
     }
 
     /// `localShelfList`: the shelf as the relay lists it.
@@ -466,6 +481,20 @@ mod tests {
             assert_eq!(st.save(&b, Some(s)), Save::Damaged, "{s}: never written over");
             st.discard_damaged();
             assert!(matches!(st.save(&b, Some(s)), Save::Write { .. }), "{s}: the user chose to start over");
+        }
+    }
+
+    #[test]
+    fn a_finished_share_keeps_the_shelf_and_a_reload_can_resume_it() {
+        let mut b = Board::default();
+        let (st, _) = Local::load(Some(JS_WROTE), &mut b);
+        let after = st.after_share();
+        let (back, mine) = Local::load(Some(&after), &mut Board::default());
+        assert!(mine.is_empty(), "the items went to the relay");
+        assert_eq!((back.shelf, back.next_k), (st.shelf, 5), "crumpled sheets stay in this browser");
+        assert_eq!(sharing_target(Some("abcdefghijklmnop_-12")), Some("abcdefghijklmnop_-12"));
+        for bad in [None, Some(""), Some("short"), Some("../../etc/passwd/xx"), Some("a b c d e f g h i j")] {
+            assert_eq!(sharing_target(bad), None, "{bad:?}");
         }
     }
 

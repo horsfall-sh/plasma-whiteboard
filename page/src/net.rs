@@ -90,7 +90,8 @@ pub trait Host {
     fn toast(&mut self, text: &str, undo: Option<Out>, ms: u32);
     /// `showMessage`.
     fn message(&mut self, text: &str, then: Then);
-    /// `localStorage.removeItem(LOCAL_KEY)`: the private board is on the relay now.
+    /// The private board is on the relay now: write [`crate::local::Local::after_share`] to
+    /// `LOCAL_KEY`, which keeps the shelf, and remove `SHARING_KEY`.
     fn forget_local(&mut self);
 
     /// `onSheetView` after its checks: draw the preview of sheet `k`, if it is still on the shelf.
@@ -312,12 +313,8 @@ impl Conn {
                 h.insert_stroke(s, false);
             }
             In::Ok { id, q } => {
-                // Everything from a board that was private is on the relay now: drop this
-                // browser's copy.
-                if h.board().confirm(&id, q, self.uploading) {
-                    self.uploading = false;
-                    h.forget_local();
-                }
+                h.board().confirm(&id, q, self.uploading);
+                self.upload_check(h);
             }
             In::No { id, m } => {
                 if h.board().refused(&id) {
@@ -325,6 +322,7 @@ impl Conn {
                 }
                 let text = m.map_or("Stroke not saved".into(), |m| format!("Stroke not saved: {m}"));
                 h.toast(&text, None, 4000);
+                self.upload_check(h);
             }
             In::Undo { id } => {
                 // `cur` is the old socket's copy of the stroke I am drawing
@@ -336,6 +334,7 @@ impl Conn {
                 if base {
                     self.removed(h, &[id]);
                 }
+                self.upload_check(h);
             }
             In::NewLayer { l, c } => {
                 if h.board().new_layer(l, &c) {
@@ -468,6 +467,16 @@ impl Conn {
         // limits allow (about 100 items or 120 KB every half second).
         self.todo = r.todo;
         self.bite(h, self.sock);
+        self.upload_check(h); // a share of an empty board is done at once
+    }
+
+    /// The one place a share finishes: every item of the board that was private has been
+    /// answered (`ok`, `no` or `u`), so drop this browser's copy of them.
+    fn upload_check(&mut self, h: &mut impl Host) {
+        if self.uploading && self.ready && h.board().pending.is_empty() {
+            self.uploading = false;
+            h.forget_local();
+        }
     }
 
     /// Socket `sock` has been ready for [`SETTLE_MS`]: if it is still the one in use and
@@ -611,9 +620,17 @@ impl Conn {
     }
 
     /// `shareNow` once the board is made: not private any more. The host saves the private
-    /// board first, then calls [`Conn::start`] with the new key.
+    /// board, writes the new key to `SHARING_KEY`, then calls [`Conn::start`] with it.
     pub fn shared(&mut self) {
         self.local = false;
+    }
+
+    /// At boot on `/`, `SHARING_KEY` named a board (`sharing_target`): a share was cut short.
+    /// The host loads the private board (its items are pending), moves to that board's link
+    /// and calls [`Conn::start`]; `ready` sends what the relay does not have yet.
+    pub fn resume_share(&mut self) {
+        self.local = false;
+        self.uploading = true;
     }
 }
 
@@ -1236,7 +1253,42 @@ mod tests {
         c.share_failed();
         assert!(c.share_begin());
         c.shared();
-        assert!(!c.local && c.uploading, "uploading lasts until the last ok");
+        assert!(!c.local && c.uploading, "uploading lasts until the last answer");
+        let mut r = Conn::default();
+        r.resume_share();
+        assert!(!r.local && r.uploading);
+    }
+
+    #[test]
+    fn a_share_finishes_on_the_last_answer_whatever_it_is() {
+        let last = [r#"{"t":"ok","id":"b","q":2}"#, r#"{"t":"no","id":"b","m":"too big"}"#, r#"{"t":"u","id":"b"}"#];
+        for answer in last {
+            let (mut h, mut inp) = (Rec::default(), Input::default());
+            let mut c = online(&mut h, &mut inp, false);
+            c.uploading = true;
+            for id in ["a", "b"] {
+                h.b.pending.insert(id.into(), it(id, 2, None));
+                h.b.insert(it(id, 2, None));
+            }
+            c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+            c.frame(&mut h, &mut inp, 1, r#"{"t":"ok","id":"a","q":1}"#);
+            assert!(c.uploading && !h.take().contains(&"forget_local".to_string()), "b is still out");
+            c.frame(&mut h, &mut inp, 1, answer);
+            assert!(!c.uploading, "{answer} ends it");
+            assert_eq!(h.take().iter().filter(|l| *l == "forget_local").count(), 1, "{answer}");
+            c.frame(&mut h, &mut inp, 1, r#"{"t":"ok","id":"b","q":2}"#);
+            assert!(!h.take().contains(&"forget_local".to_string()), "a late answer does not finish it twice");
+        }
+
+        // an empty private board is shared as soon as the new board is ready
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = online(&mut h, &mut inp, false);
+        c.uploading = true;
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"u","id":"someone"}"#);
+        assert!(c.uploading, "nothing finishes before ready");
+        c.frame(&mut h, &mut inp, 1, r#"{"t":"ready"}"#);
+        assert!(!c.uploading);
+        assert!(h.take().contains(&"forget_local".to_string()));
     }
 
     #[test]
