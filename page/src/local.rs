@@ -326,14 +326,18 @@ impl Local {
 
     /// `cr`, done here instead of by the relay: the board goes on the shelf. The caller clears
     /// `mine`, handles the returned frame as if the relay had sent it, then calls
-    /// [`Local::save`] (`localSend` ends every branch with `saveLocal`).
-    pub fn crumple(&mut self, board: &mut Board) -> In {
+    /// [`Local::save`] (`localSend` ends every branch with `saveLocal`). A blank board is not
+    /// shelved and nothing changes (`None`), as the relay ignores `cr` on a blank board.
+    pub fn crumple(&mut self, board: &mut Board) -> Option<In> {
+        if board.strokes.is_empty() {
+            return None;
+        }
         let k = self.next_k;
         self.next_k += 1;
         self.shelf.push(Sheet { k, a: board.strokes.iter().map(item_of).collect() });
         let drop = if self.shelf.len() > SHELF_MAX { Some(self.shelf.remove(0).k) } else { None };
         board.pending.clear();
-        In::Crumpled { k, by: Some(1), drop, shelf: self.shelf_list() }
+        Some(In::Crumpled { k, by: Some(1), drop, shelf: self.shelf_list() })
     }
 
     /// `un`: sheet `k` comes back off the shelf, and the board as it is goes on it (when it has
@@ -582,13 +586,24 @@ mod tests {
         for k in 1..=5 {
             assert_eq!(
                 st.crumple(&mut b),
-                In::Crumpled { k, by: Some(1), drop: None, shelf: st.shelf_list() }
+                Some(In::Crumpled { k, by: Some(1), drop: None, shelf: st.shelf_list() })
             );
         }
         assert!(b.pending.is_empty());
-        let In::Crumpled { k: 6, drop: Some(1), shelf, .. } = st.crumple(&mut b) else { panic!() };
+        let Some(In::Crumpled { k: 6, drop: Some(1), shelf, .. }) = st.crumple(&mut b) else { panic!() };
         assert_eq!(shelf.iter().map(|h| (h.k, h.n)).collect::<Vec<_>>(), [(2, 2), (3, 2), (4, 2), (5, 2), (6, 2)]);
         assert_eq!(st.next_k, 7);
+    }
+
+    #[test]
+    fn crumpling_a_blank_board_changes_nothing() {
+        let mut st = Local::default();
+        let mut b = board(&["a"]);
+        st.crumple(&mut b).unwrap();
+        let mut blank = board(&[]);
+        blank.pending.insert("x".into(), it("x"));
+        assert_eq!(st.crumple(&mut blank), None);
+        assert_eq!((st.shelf.len(), st.next_k, blank.pending.len()), (1, 2, 1));
     }
 
     #[test]
