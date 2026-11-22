@@ -260,7 +260,12 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
         let room = match rooms.get(&board) {
             Some(r) => r.clone(),
             None => {
-                let r = Arc::new(Room::new(board, app.db.load(board).await));
+                // A board that can't be read is refused, never loaded empty.
+                let Ok(loaded) = app.db.load(board).await else {
+                    drop(rooms);
+                    return bye(sock, "busy", "this board can't be opened right now; try again later").await;
+                };
+                let r = Arc::new(Room::new(board, loaded));
                 rooms.insert(board, r.clone());
                 r
             }

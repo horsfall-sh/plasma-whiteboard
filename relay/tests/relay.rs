@@ -233,6 +233,43 @@ async fn draw_view_and_late_join() {
 }
 
 #[tokio::test]
+async fn a_board_that_cannot_be_read_is_refused_not_loaded_empty() {
+    let s = start(&temp_db("unreadable")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    {
+        let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+        a.draw("a1").await;
+        a.draw("a2").await;
+    }
+    let db = s.stop().await;
+
+    // A row that does not parse: the width is text.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE strokes SET width = 'x' WHERE id = 'a2'", []).unwrap();
+
+    let s = start(&db).await;
+    for _ in 0..2 {
+        let mut c = Client::open(&s.addr).await;
+        c.send(json!({"t": "join", "key": edit, "who": WHO_A})).await;
+        let m = c.next().await;
+        assert_eq!(m["t"], "err", "{m}");
+        assert_eq!(m["code"], "busy", "{m}");
+    }
+    let db = s.stop().await;
+
+    // Nothing was written over the stored board while it was refused.
+    let n: i64 = conn.query_row("SELECT count(*) FROM strokes", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
+    conn.execute("UPDATE strokes SET width = 0.004 WHERE id = 'a2'", []).unwrap();
+    drop(conn);
+    let s = start(&db).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1", "a2"], "once readable, the board opens with every stroke");
+    s.stop().await;
+}
+
+#[tokio::test]
 async fn boards_survive_a_restart() {
     let s = start(&temp_db("restart")).await;
     let (edit, view) = new_board(&s.addr).await;

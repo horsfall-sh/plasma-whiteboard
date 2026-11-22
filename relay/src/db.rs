@@ -49,7 +49,7 @@ enum Cmd {
     },
     Load {
         board: i64,
-        reply: oneshot::Sender<Loaded>,
+        reply: oneshot::Sender<Result<Loaded, ()>>,
     },
     AddLayer {
         board: i64,
@@ -184,10 +184,14 @@ impl Db {
         rx.await.ok().flatten()
     }
 
-    pub async fn load(&self, board: i64) -> Loaded {
+    /// Read a board's layers and strokes. Err: they could not all be read
+    /// (a storage error or a row that does not parse). The caller must not
+    /// stand in an empty board for it: anything done on an empty stand-in
+    /// (a crumple, a layer drop) would be written over the real rows.
+    pub async fn load(&self, board: i64) -> Result<Loaded, ()> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Load { board, reply });
-        rx.await.unwrap_or_default()
+        rx.await.unwrap_or(Err(()))
     }
 
     pub fn add_layer(&self, board: i64, n: u32, who: [u8; 32], color: String) {
@@ -269,6 +273,36 @@ fn run(conn: Connection, rx: mpsc::Receiver<Cmd>) {
     }
 }
 
+fn load(conn: &Connection, board: i64) -> rusqlite::Result<Loaded> {
+    let mut out = Loaded::default();
+    let mut q = conn
+        .prepare_cached("SELECT n, who_hash, color FROM layers WHERE board = ? ORDER BY n")?;
+    let rows = q.query_map(params![board], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    for row in rows {
+        out.layers.push(row?);
+    }
+    let mut q = conn.prepare_cached(
+        "SELECT seq, id, layer, color, width, pts, state, txt, sheet FROM strokes WHERE board = ? ORDER BY seq",
+    )?;
+    let rows = q.query_map(params![board], |r| {
+        Ok(StrokeRow {
+            seq: r.get::<_, i64>(0)? as u64,
+            id: r.get(1)?,
+            layer: r.get(2)?,
+            color: r.get(3)?,
+            width: r.get(4)?,
+            pts: r.get(5)?,
+            state: r.get(6)?,
+            txt: r.get(7)?,
+            sheet: r.get(8)?,
+        })
+    })?;
+    for row in rows {
+        out.strokes.push(row?);
+    }
+    Ok(out)
+}
+
 fn apply(
     conn: &Connection,
     cmd: Cmd,
@@ -304,35 +338,11 @@ fn apply(
             }));
         }
         Cmd::Load { board, reply } => {
-            let mut out = Loaded::default();
-            {
-                let mut q = conn
-                    .prepare_cached("SELECT n, who_hash, color FROM layers WHERE board = ? ORDER BY n")?;
-                let rows = q.query_map(params![board], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-                for row in rows {
-                    out.layers.push(row?);
-                }
-                let mut q = conn.prepare_cached(
-                    "SELECT seq, id, layer, color, width, pts, state, txt, sheet FROM strokes WHERE board = ? ORDER BY seq",
-                )?;
-                let rows = q.query_map(params![board], |r| {
-                    Ok(StrokeRow {
-                        seq: r.get::<_, i64>(0)? as u64,
-                        id: r.get(1)?,
-                        layer: r.get(2)?,
-                        color: r.get(3)?,
-                        width: r.get(4)?,
-                        pts: r.get(5)?,
-                        state: r.get(6)?,
-                        txt: r.get(7)?,
-                        sheet: r.get(8)?,
-                    })
-                })?;
-                for row in rows {
-                    out.strokes.push(row?);
-                }
+            let r = load(conn, board);
+            if let Err(e) = &r {
+                eprintln!("wb-relay: storage: board {board} could not be loaded: {e}");
             }
-            let _ = reply.send(out);
+            let _ = reply.send(r.map_err(|_| ()));
         }
         Cmd::AddLayer { board, n, who, color } => {
             conn.prepare_cached("INSERT INTO layers(board, n, who_hash, color) VALUES(?,?,?,?)")?
