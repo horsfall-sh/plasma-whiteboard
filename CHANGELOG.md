@@ -63,6 +63,11 @@ From the council's pass 3:
 
 - P3-A: a share the relay opens view-only no longer empties the private board. The share
   stops, the private board stays whole, and the page says why.
+- P3-B: one address may hold only an eighth of the relay's memory budget in copies of a board
+  being sent to its joins (its first join may always try), so another address still joins;
+  a join refused for memory spends none of the address's new-layer allowance; and a join
+  must send its whole snapshot within 30 seconds plus its size at 256 kB a second, or it is
+  dropped and its charge given back.
 
 ### Waived
 
@@ -89,6 +94,8 @@ From the council's passes 1 and 2. Each is minor or a nit and stays open in this
 - H5: the per-address storage share is kept in memory, so a relay restart refills it.
 - H5: one network with many addresses (an IPv6 /48, or 16 IPv4 addresses) can still fill
   storage.
+- P3-B: a link slower than about 2 Mbit/s cannot open a very large board: its join is
+  dropped as too slow and reconnects.
 - G4: reloading `/b/<edit>` mid-upload resumes the share only on the next visit to `/`.
   Nothing is lost.
 - G7: behind a shared address, after about 60 new contributors in about 30 minutes, a new

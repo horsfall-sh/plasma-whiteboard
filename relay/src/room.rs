@@ -5,7 +5,7 @@
 use crate::db::{Db, Link, Loaded, Role, DELETED, LIVE, UNDONE};
 use crate::keys::{valid_color, valid_id};
 use crate::limits::{Bucket, Budget, SHEETS_BURST, SHEETS_PER_SEC};
-use crate::memory::{weight, Memory};
+use crate::memory::{weight, Held, Memory};
 use axum::extract::ws::Utf8Bytes;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -195,14 +195,21 @@ impl Drop for Snap {
 /// The bytes of one join's copy of the live strokes, charged to the shared memory budget
 /// until the join has sent them (council H4: 64 live strokes of 20k points are some 33MB
 /// a join, and a slow join keeps its copy for minutes).
+///
+/// The address that joined is charged too, for these bytes and for an extra build of the
+/// snapshot it holds, so one address cannot hold the whole budget with slow joins (P3-B).
 pub struct Charge {
     bytes: usize,
     mem: Arc<Memory>,
+    addr: Option<(Held, usize)>,
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
         self.mem.shrink(self.bytes);
+        if let Some((h, n)) = &self.addr {
+            h.give(*n);
+        }
     }
 }
 
@@ -525,18 +532,35 @@ impl Room {
         self.st.lock().unwrap().conns
     }
 
-    /// Add a connection. `who` is the hash of the contributor secret (edit
-    /// links only). `view` is the view key to hand to an editor.
-    /// `may_add` is asked, once, before a new contributor is given a layer:
-    /// false (the address made too many lately) makes them a viewer.
-    /// Err: the board has no room for another connection.
+    /// [`Room::join_from`] for no address in particular (tests).
     pub fn join(
+        &self,
+        conn: u64,
+        role: Role,
+        who: Option<[u8; 32]>,
+        view: Option<&str>,
+        db: &Db,
+        may_add: impl FnOnce() -> bool,
+    ) -> Result<Joined, NoJoin> {
+        self.join_from(conn, role, who, view, db, None, may_add)
+    }
+
+    /// Add a connection. `who` is the hash of the contributor secret (edit
+    /// links only). `view` is the view key to hand to an editor. `held` is what
+    /// the joining address holds of the memory budget (P3-B).
+    /// `may_add` is asked, once, before a new contributor is given a layer, and
+    /// only once the join's copies are charged (P3-B2): false (the address made
+    /// too many lately) makes them a viewer.
+    /// Err: the board has no room for another connection, or the budget for its copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_from(
         &self,
         conn: u64,
         mut role: Role,
         who: Option<[u8; 32]>,
         view: Option<&str>,
         db: &Db,
+        held: Option<&Held>,
         may_add: impl FnOnce() -> bool,
     ) -> Result<Joined, NoJoin> {
         let mut st = self.st.lock().unwrap();
@@ -552,21 +576,15 @@ impl Room {
             Reclaim(usize),
             Full,
         }
-        let seat = match (role, who) {
+        let mut seat = match (role, who) {
             (Role::Edit, None) => return Err(NoJoin::Full),
             (Role::Edit, Some(who)) => match st.layers.iter().position(|l| l.who == who) {
                 Some(i) => Seat::Mine(i),
-                None => {
-                    let free = if st.layers.len() < MAX_LAYERS { Some(Seat::New) } else { reclaimable(&st).map(Seat::Reclaim) };
-                    match free {
-                        Some(f) if may_add() => f,
-                        _ => Seat::Full,
-                    }
-                }
+                None if st.layers.len() < MAX_LAYERS => Seat::New,
+                None => reclaimable(&st).map_or(Seat::Full, Seat::Reclaim),
             },
             (Role::View, _) => Seat::Full,
         };
-        let full = role == Role::Edit && matches!(seat, Seat::Full);
         if matches!(seat, Seat::Full) && st.viewers >= MAX_ROOM_VIEWERS {
             return Err(NoJoin::Full);
         }
@@ -600,10 +618,27 @@ impl Room {
             }
         }
         let bytes: usize = live.iter().map(|t| t.len()).sum();
-        if !self.mem.grow(bytes) {
+        // The address holds this copy and any extra build of the snapshot it keeps alive.
+        let addr_bytes = bytes + snap.extra;
+        if held.is_some_and(|h| !h.take(addr_bytes, self.mem.addr_cap())) {
             return Err(NoJoin::Busy);
         }
-        let charge = Charge { bytes, mem: self.mem.clone() };
+        let addr = held.map(|h| (h.clone(), addr_bytes));
+        if !self.mem.grow(bytes) {
+            if let Some((h, n)) = &addr {
+                h.give(*n);
+            }
+            return Err(NoJoin::Busy);
+        }
+        let charge = Charge { bytes, mem: self.mem.clone(), addr };
+        // Only now, with the copies charged, may a new contributor spend a layer token (P3-B2).
+        if matches!(seat, Seat::New | Seat::Reclaim(_)) && !may_add() {
+            seat = Seat::Full;
+            if st.viewers >= MAX_ROOM_VIEWERS {
+                return Err(NoJoin::Full);
+            }
+        }
+        let full = role == Role::Edit && matches!(seat, Seat::Full);
         let who = who.unwrap_or_default();
         let mut layer = 0;
         match seat {

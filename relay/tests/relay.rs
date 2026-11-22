@@ -37,6 +37,8 @@ fn config(db: &str) -> Config {
         max_loaded: usize::MAX / 2,
         max_rooms: 1000,
         max_db: 1 << 30,
+        catch_up_min: wb_relay::CATCH_UP_MIN,
+        catch_up_rate: wb_relay::CATCH_UP_RATE,
     }
 }
 
@@ -1238,5 +1240,104 @@ async fn memory_harness() {
         eprintln!("board {i}: loaded; rss {:.0} MB", rss_mb());
     }
     eprintln!("baseline {base:.0} MB, peak {peak:.0} MB with {} full boards loaded", held.len());
+    s.stop().await;
+}
+
+/// The first thing the relay says to a join from `ip` that then reads nothing more.
+async fn stall_from(addr: &str, key: &str, ip: &str) -> (Client, Value) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+    let (ws, _) = connect_async(req).await.unwrap();
+    let mut c = Client { ws };
+    c.send(json!({"t": "join", "key": key})).await;
+    let first = c.next().await;
+    (c, first)
+}
+
+/// Council P3-B: on 4229513 one address could hold slow joins open on a big board until
+/// every other join was told the relay is busy, and a stalled reader held its charge for
+/// as long as its socket lasted. Now an address may hold only its share of the memory
+/// budget in join copies, so another address still joins, and a join that has not sent
+/// its snapshot by the deadline is dropped and gives its charge back.
+#[tokio::test]
+async fn a_stalled_join_gives_its_charge_back_at_the_deadline_and_another_address_still_joins() {
+    use wb_relay::keys;
+    let db = temp_db("stall");
+    // Room for the board and a few builds of its snapshot; one address's share is about one build.
+    let cfg = Config {
+        trust_proxy: true,
+        max_loaded: 8 * 16 * 1024 * 1024,
+        catch_up_min: Duration::from_secs(2),
+        catch_up_rate: 1 << 40,
+        ..config(&db)
+    };
+    let s = start_with(cfg).await;
+    new_board(&s.addr).await; // the schema is in place
+    let edit = keys::random_key();
+    let view = keys::view_key(&edit);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO boards(edit_hash, view_hash, created, touched) VALUES(?,?,?,?)",
+            rusqlite::params![keys::hash(&edit), keys::hash(&view), 1, i64::MAX / 2],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO layers(board, n, who_hash, color) VALUES(?, 1, ?, '#112233')", rusqlite::params![id, [0u8; 32]])
+            .unwrap();
+        let v: Vec<String> = (0..60_000).map(|i| format!("{:.4}", f64::from(i % 50) / 100.0 + 0.0001)).collect();
+        let pts = format!("[{}]", v.join(","));
+        for seq in 1..=30 {
+            conn.execute(
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts) VALUES(?,?,?,1,'#112233',0.004,?)",
+                rusqlite::params![id, seq, format!("s{seq}"), pts],
+            )
+            .unwrap();
+        }
+    }
+    let mut b = join_from(&s.addr, &edit, WHO_B, "2001:db8:b::1").await;
+    let mut n = 0;
+    let mut draw = async || {
+        n += 1;
+        b.send(json!({"t": "s", "id": format!("d{n}"), "c": "#112233", "w": 0.004, "pts": [0.1, 0.1, 0.5]})).await;
+        b.expect("ok").await;
+    };
+    const X: &str = "2001:db8:1::1";
+
+    // X holds the build the board counts, then a second build of its own after a change.
+    draw().await;
+    let (_x1, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello");
+    draw().await;
+    let (_x2, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello", "an address's first charged join always may try");
+    draw().await;
+    let (_x3, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!((m["t"].as_str(), m["code"].as_str()), (Some("err"), Some("busy")), "X is at its share: {m}");
+
+    // Another address still joins, and gets the whole board.
+    let (mut y, m) = stall_from(&s.addr, &view, "2001:db8:2::1").await;
+    assert_eq!(m["t"], "hello", "another address still joins: {m}");
+    let mut got = 0;
+    loop {
+        let m = y.next().await;
+        match m["t"].as_str().unwrap() {
+            "ss" => got += m["a"].as_array().unwrap().len(),
+            "ready" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(got, 33);
+
+    // Past the deadline (well before a send would time out), X's stalled joins are dropped
+    // and their charges given back: X may hold a counted build and an extra build again.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    draw().await;
+    let (_x4, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello", "X's charge was given back: {m}");
+    draw().await;
+    let (_x5, m) = stall_from(&s.addr, &view, X).await;
+    assert_eq!(m["t"], "hello", "X's charge was given back: {m}");
     s.stop().await;
 }

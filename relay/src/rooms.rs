@@ -403,6 +403,54 @@ mod tests {
         assert_eq!(used(), base, "a join that has sent its copy gives the charge back");
     }
 
+    /// Council P3-B: on 4229513 the memory budget was one pool, so one address could open
+    /// slow joins until every other join was told the relay is busy. Now an address may
+    /// hold only its share of the budget in join copies (its first join always fits), so a
+    /// second address still joins; and a join refused for the budget spends no layer
+    /// token (P3-B2).
+    #[tokio::test]
+    async fn one_address_at_its_share_of_memory_does_not_keep_another_out() {
+        use crate::limits::{Budget, Bucket};
+        use crate::memory::Held;
+        use crate::room::NoJoin;
+        let db = temp_db();
+        let a = db.create_board([17; 32], [18; 32]).await.unwrap();
+        // The share of one address is a few hundred kB.
+        let rooms = Rooms::new(Duration::from_secs(60), Memory::new(8 * 300_000, 100));
+        let cap = rooms.mem.addr_cap();
+        let (room, mut ed) =
+            rooms.join(&db, a, |r| r.join(1, Role::Edit, Some([1; 32]), Some("vk"), &db, || true)).await.unwrap();
+        ed.hold = None;
+        ed.live = None;
+        let mut b = Budget::new(Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))), Arc::new(std::sync::Mutex::new(Bucket::new(1e9, 1e9))));
+        let pts: Vec<String> = (0..3000).map(|i| format!("0.{:05},0.25,0.5", i)).collect();
+        for id in ["l1", "l2", "l3", "l4"] {
+            room.handle(ed.peer, &format!(r##"{{"t":"b","id":"{id}","c":"#112233","w":0.004}}"##), &db, &mut b);
+            room.handle(ed.peer, &format!(r#"{{"t":"p","id":"{id}","pts":[{}]}}"#, pts.join(",")), &db, &mut b);
+        }
+        let (x, y) = (Held::default(), Held::default());
+
+        let x1 = room.join_from(2, Role::View, None, None, &db, Some(&x), || true).unwrap();
+        let copy = x.bytes();
+        assert!(copy > cap / 2 && copy <= cap, "one copy fits the share, two do not: {copy} of {cap}");
+        let conns = room.conns();
+        let asked = std::cell::Cell::new(0);
+        let refused = room.join_from(3, Role::Edit, Some([0xee; 32]), Some("vk"), &db, Some(&x), || {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(refused.err(), Some(NoJoin::Busy), "the address is at its share");
+        assert_eq!(asked.get(), 0, "a join refused as busy spends no layer token");
+        assert_eq!((room.conns(), x.bytes()), (conns, copy), "a refused join changes nothing");
+
+        let y1 = room.join_from(4, Role::View, None, None, &db, Some(&y), || true);
+        assert!(y1.is_ok(), "another address still joins");
+
+        drop(x1);
+        assert_eq!(x.bytes(), 0, "a join that has sent its copy gives the address its share back");
+        assert!(room.join_from(5, Role::View, None, None, &db, Some(&x), || true).is_ok());
+    }
+
     #[tokio::test]
     async fn a_join_that_waited_on_an_unloaded_cell_starts_again() {
         let db = temp_db();

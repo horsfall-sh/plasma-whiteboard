@@ -2,7 +2,8 @@
 //! alone would let enough boards, each under its own cap, exhaust the
 //! process; this budget is shared by every board and fails closed.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The default for everything loaded at once, in bytes of weight.
 pub const MAX_LOADED: usize = 144 * 1024 * 1024;
@@ -18,6 +19,31 @@ pub const COPIES: usize = 4;
 /// The weight of a board holding `bytes` of stroke JSON.
 pub fn weight(bytes: usize) -> usize {
     ROOM_COST + COPIES * bytes
+}
+
+/// One address's joins may hold at most this share of the budget at a time with their
+/// copies of a board (council P3-B), beyond the first join, which may always try.
+pub const ADDR_SHARE: usize = 8;
+
+/// What one address's joins hold of the memory budget while their snapshots are sent,
+/// shared by the address's connections (council P3-B).
+#[derive(Clone, Default)]
+pub struct Held(Arc<AtomicUsize>);
+
+impl Held {
+    /// Hold `n` more bytes, if the address holds nothing yet or stays within `cap`.
+    pub fn take(&self, n: usize, cap: usize) -> bool {
+        self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| (h == 0 || h + n <= cap).then_some(h + n)).is_ok()
+    }
+
+    /// Let go of `n` bytes taken with [`Held::take`].
+    pub fn give(&self, n: usize) {
+        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| Some(h.saturating_sub(n)));
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Default)]
@@ -75,6 +101,11 @@ impl Memory {
         let mut u = self.used.lock().unwrap();
         u.rooms = u.rooms.saturating_sub(1);
         u.bytes = u.bytes.saturating_sub(weight);
+    }
+
+    /// What one address's joins may hold of this budget ([`ADDR_SHARE`]).
+    pub fn addr_cap(&self) -> usize {
+        self.max_bytes / ADDR_SHARE
     }
 
     /// Bytes and boards held, for tests.

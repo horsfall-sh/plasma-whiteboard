@@ -55,6 +55,10 @@ pub struct Config {
     pub max_rooms: usize,
     /// How large the database may grow, in bytes.
     pub max_db: u64,
+    /// A join must send its whole snapshot within this ([`CATCH_UP_MIN`])...
+    pub catch_up_min: Duration,
+    /// ...plus its size at this many bytes a second ([`CATCH_UP_RATE`]), or it is dropped.
+    pub catch_up_rate: u64,
 }
 
 struct App {
@@ -268,7 +272,11 @@ async fn connection(app: Arc<App>, mut sock: WebSocket, guard: IpGuard) {
     let view = (role == Role::Edit).then(|| keys::view_key(&key));
     let conn = app.next_conn.fetch_add(1, Ordering::Relaxed);
 
-    let joined = app.rooms.join(&app.db, board, |r| r.join(conn, role, who_hash, view.as_deref(), &app.db, || guard.may_add_layer())).await;
+    let held = guard.held();
+    let joined = app
+        .rooms
+        .join(&app.db, board, |r| r.join_from(conn, role, who_hash, view.as_deref(), &app.db, Some(&held), || guard.may_add_layer()))
+        .await;
     let (room, mut joined) = match joined {
         Ok(j) => j,
         Err(Refused::Unreadable) => {
@@ -295,6 +303,18 @@ const SLOW: (&str, &str) = ("slow", "this connection cannot keep up with this bo
 /// is still being sent. The frames are shared with every other receiver, so
 /// this bounds the queue's length rather than memory the connection owns.
 const CATCH_UP_BYTES: usize = 8 * 1024 * 1024;
+
+/// The whole snapshot must be sent within this, plus [`catch_up_time`]'s share for its size,
+/// or the join is dropped with its charges (council P3-B): a slow reader cannot hold its
+/// copy of the board, and the memory budget it is charged to, for longer.
+pub const CATCH_UP_MIN: Duration = Duration::from_secs(30);
+/// The slowest link a big snapshot is waited for, in bytes a second (about 2 Mbit/s).
+pub const CATCH_UP_RATE: u64 = 256 * 1024;
+
+/// How long a join may take to send `bytes` of snapshot.
+fn catch_up_time(cfg: &Config, bytes: usize) -> Duration {
+    cfg.catch_up_min + Duration::from_millis((bytes as u64).saturating_mul(1000) / cfg.catch_up_rate.max(1))
+}
 
 /// Whether a broadcast is for this peer.
 fn for_peer(out: &room::Out, peer: room::Peer) -> bool {
@@ -371,8 +391,17 @@ async fn relay(
     joined: &mut room::Joined,
     mut budget: Budget,
 ) -> Option<(&'static str, &'static str)> {
-    if let Err(why) = catch_up(sock, joined).await {
-        return why;
+    let bytes = joined.snapshot.iter().map(|t| t.len()).sum();
+    let done = tokio::time::timeout(catch_up_time(&app.cfg, bytes), catch_up(sock, joined)).await;
+    if !matches!(done, Ok(Ok(()))) {
+        // let the charges go now, not after the goodbye (which can take seconds more)
+        joined.hold = None;
+        joined.live = None;
+    }
+    match done {
+        Ok(Ok(())) => {}
+        Ok(Err(why)) => return why,
+        Err(_) => return Some(SLOW),
     }
     let peer = joined.peer;
     // Subscribed before this check, so a loss after it arrives as an `end`.

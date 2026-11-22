@@ -482,9 +482,9 @@ impl Conn {
             h.writer_done();
             h.share_refused();
             h.message(
-                "Nothing was shared: the relay opened the new board view-only, as it does when \
-                 many boards were made from your network just now. Your board is still private \
-                 and whole; try sharing again later.",
+                "Nothing was shared: the relay could not give this share an editing seat (a busy \
+                 network or a full board). Your board is still private and whole; try sharing \
+                 again later.",
                 Then::Private,
             );
             return;

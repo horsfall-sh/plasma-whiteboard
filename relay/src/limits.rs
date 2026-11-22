@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::memory::Held;
+
 pub const MAX_CONNS_PER_IP: u32 = 40;
 /// What one address may be sent in replies it asked for (sheet previews): a burst of two
 /// full boards, then 1 MB a second, across all its connections.
@@ -102,6 +104,8 @@ struct Inner {
     outs: HashMap<IpKey, Arc<Mutex<Bucket>>>,
     /// Bytes of strokes the address may still store; kept like `outs`.
     stores: HashMap<IpKey, Arc<Mutex<Bucket>>>,
+    /// What the address's joins hold of the memory budget (P3-B).
+    helds: HashMap<IpKey, Held>,
 }
 
 /// What one address may store, as a share of the storage quota: it can hold at most this
@@ -128,9 +132,15 @@ pub struct IpGuard {
     key: IpKey,
     out: Arc<Mutex<Bucket>>,
     store: Arc<Mutex<Bucket>>,
+    held: Held,
 }
 
 impl IpGuard {
+    /// What the address's joins hold of the memory budget, shared by its connections.
+    pub fn held(&self) -> Held {
+        self.held.clone()
+    }
+
     /// The address's budget for replies it asked for.
     pub fn out(&self) -> Arc<Mutex<Bucket>> {
         self.out.clone()
@@ -213,7 +223,8 @@ impl IpLimits {
         let out = g.outs.entry(k).or_insert_with(|| Arc::new(Mutex::new(Bucket::new(OUT_BURST, OUT_PER_SEC)))).clone();
         let (cap, per_sec) = self.store;
         let store = g.stores.entry(k).or_insert_with(|| Arc::new(Mutex::new(Bucket::new(cap, per_sec)))).clone();
-        Ok(IpGuard { inner: self.inner.clone(), key: k, out, store })
+        let held = g.helds.entry(k).or_default().clone();
+        Ok(IpGuard { inner: self.inner.clone(), key: k, out, store, held })
     }
 
     /// Forget addresses whose bucket has refilled.
@@ -222,7 +233,8 @@ impl IpLimits {
         g.creates.retain(|_, b| !b.full());
         g.joins.retain(|_, b| !b.full());
         g.layers.retain(|_, b| !b.full());
-        let Inner { conns, outs, stores, .. } = &mut *g;
+        let Inner { conns, outs, stores, helds, .. } = &mut *g;
+        helds.retain(|k, h| conns.contains_key(k) || h.bytes() > 0);
         outs.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
         stores.retain(|k, b| conns.contains_key(k) || !b.lock().unwrap().full());
     }

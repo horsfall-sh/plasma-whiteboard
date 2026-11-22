@@ -21,6 +21,8 @@ async fn main() -> std::io::Result<()> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(wb_relay::db::MAX_DB, |mb| mb * 1024 * 1024),
         max_rooms: env("WB_MAX_ROOMS").and_then(|v| v.parse().ok()).unwrap_or(wb_relay::memory::MAX_ROOMS),
+        catch_up_min: wb_relay::CATCH_UP_MIN,
+        catch_up_rate: wb_relay::CATCH_UP_RATE,
     };
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!(
