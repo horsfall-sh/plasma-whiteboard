@@ -26,7 +26,7 @@ view keys in the link are bearer secrets the relay checks.
   only the connections and orders the messages between them. Item 4 adds opt-in, encrypted saving.
 - **The link carries the key, the relay never does.** A share link is a session key in the URL fragment (the
   part after `#`, which a browser never sends to a server), plus a separate **one-time join token**. The token
-  admits one browser and is burned on first use. Whoever redeems it first gets in.
+  admits one browser and is burned on first use. Whoever redeems it first gets in. That means one link per person, where today one link serves everyone.
 - **View-only links still work.** A view link admits a browser that can decrypt and watch but not draw. The
   relay refuses any board traffic sent from a view-token peer, without reading its content.
 - **The crumple shelf and history live only in the browsers.** A crumpled page can be brought back by any
@@ -47,7 +47,7 @@ online to hand over the board. `DESIGN-NOTES.pdf` section 2 has the first draft.
 - Certificates are issued and renewed **in the relay process** over ACME (Let's Encrypt or any ACME CA). There is
   no cron job, certbot or proxy.
 - Plain-HTTP mode stays for local development and for anyone who still wants their own proxy.
-- `deploy/` shrinks to the systemd unit.
+- `deploy/` drops the nginx and Caddy files and `issue-cert.sh`.
 
 ## 3. The whole client in Rust
 
@@ -77,7 +77,7 @@ until Share, view-only links, finger mode, smoothing, labels, pings, layers, cru
     - `storage`: `localStorage` with a memory fallback.
 - **What stays JavaScript:** only the loader that `wasm-bindgen` generates (built by `make`, never hand-written)
   and a two-line `boot.js` that imports and starts it. The loader cannot be inline in `index.html`, because the
-  page's Content Security Policy (`script-src 'self'`) refuses inline script, and that policy stays as it is.
+  page's Content Security Policy (`script-src 'self' 'wasm-unsafe-eval'`) refuses inline script, and the Rust page needs its `'wasm-unsafe-eval'` part, and that policy stays as it is.
   `index.html` stays a minimal shell.
 - **CSS.** Generating CSS at runtime would mean injecting a `<style>` element, which the policy
   (`style-src 'self'`) also refuses. So `app.css` stays a static file, cut down to what the Rust page uses.
@@ -99,7 +99,7 @@ until Share, view-only links, finger mode, smoothing, labels, pings, layers, cru
 
 ## 4. Saved boards (opt-in)
 
-**Today:** every board is saved in SQLite and deleted after 90 days unopened.
+**Today:** every board is saved in SQLite and deleted after 90 days unopened by default (`WB_TTL_DAYS`; 0 keeps boards for ever).
 
 **Goal:** saving is something an operator chooses to compile in and switch on, and even then the server cannot
 read what it saves.
