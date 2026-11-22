@@ -156,7 +156,7 @@ copy it to `deploy/HOST.local.md`, which is gitignored.
 
 ## How it works
 
-A Rust relay (axum, tokio, SQLite) serves a plain HTML/CSS/JS page and relays strokes over WebSocket; the page uses two small Rust modules compiled to WebAssembly (stroke smoothing and the crumple animation). The wire contract is in [`PROTOCOL.md`](PROTOCOL.md); design history and plans are in [`DESIGN-NOTES.pdf`](DESIGN-NOTES.pdf).
+A Rust relay (axum, tokio, SQLite) serves the page and relays strokes over WebSocket. The page is Rust compiled to WebAssembly, using the `smooth` (stroke smoothing) and `crumple` (the crumple animation) crates; a small `boot.js` loads it from the HTML and CSS in `web/`. The wire contract is in [`PROTOCOL.md`](PROTOCOL.md); design history and plans are in [`DESIGN-NOTES.pdf`](DESIGN-NOTES.pdf).
 
 
 - **Keys.** The edit key is 144 random bits. The view key is derived from it with HMAC-SHA256, so an edit
