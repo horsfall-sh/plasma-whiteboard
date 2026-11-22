@@ -42,7 +42,11 @@ clean:
 
 # Test, build for the server and deploy to the live board. Run after every
 # change so the public board always matches the latest commit.
-HOST ?= root@HOST_IP
+# Set HOST (ssh target, e.g. root@server) and DOMAIN (public hostname) when running:
+#   make ship HOST=root@server DOMAIN=whiteboard.example.org
+HOST ?=
+DOMAIN ?= whiteboard.example.com
 ship: test linux
+	@test -n "$(HOST)" || { echo "HOST is not set: run make ship HOST=user@server DOMAIN=your.domain" >&2; exit 1; }
 	sh deploy/deploy.sh $(HOST)
-	@curl -fsS -o /dev/null -w "live: %{http_code}\n" https://whiteboard.example.com/healthz
+	@curl -fsS -o /dev/null -w "live: %{http_code}\n" https://$(DOMAIN)/healthz

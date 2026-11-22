@@ -10,3 +10,14 @@ node_modules/
 relay/target-linux/
 .playwright-mcp/
 web/crumple.wasm
+
+# local-only notes and secrets
+deploy/*.local.md
+deploy/HOST.md
+*.local.md
+.scrub-patterns.local
+.env
+.env.*
+*.pem
+*.key
+secrets/

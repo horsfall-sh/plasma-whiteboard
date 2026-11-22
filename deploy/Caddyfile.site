@@ -1,3 +1,4 @@
+# Replace whiteboard.example.com with your own domain.
 whiteboard.example.com {
     encode gzip zstd
     header Strict-Transport-Security "max-age=31536000"

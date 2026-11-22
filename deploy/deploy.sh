@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install or update the relay on the server. Usage: deploy/deploy.sh root@host
-# Build first with `make linux`. The TLS proxy (deploy/HOST.md) is set up once;
+# Build first with `make linux`. The TLS proxy (see deploy/nginx-whiteboard.conf or deploy/Caddyfile.site) is set up once;
 # this script never touches it.
 set -eu
 HOST="$1"

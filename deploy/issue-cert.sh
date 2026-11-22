@@ -1,9 +1,10 @@
 #!/bin/sh
-# Obtain the Let's Encrypt certificate for whiteboard.example.com and turn on
+# Obtain the Let's Encrypt certificate for $DOMAIN and turn on
 # the nginx 443 site. Run once DNS points at this host. Safe to run again:
 # certbot keeps an existing valid cert, the TLS site is copied only if changed.
 set -eu
-D=whiteboard.example.com
+# Usage: DOMAIN=your.domain sh issue-cert.sh
+D="${DOMAIN:-whiteboard.example.com}"
 STAGED=/etc/nginx/whiteboard-tls.conf.staged
 LIVE=/etc/nginx/conf.d/whiteboard-tls.conf
 
