@@ -64,8 +64,8 @@ Open `http://127.0.0.1:8787/`. The status line at the bottom right shows the con
 - **Select and group:** the Select tool picks by box or Shift-click; move or delete the selection as
   one step. Ctrl/Cmd+G groups, Shift+Ctrl/Cmd+G ungroups; groups nest.
 - **Style:** a paint bucket for the inside of a shape, Solid/Dashed/Dotted lines, bold and italic
-  text (Ctrl/Cmd+B, Ctrl/Cmd+I), eight swatches plus a "More colours" picker that remembers the
-  last three, and a Grid button (show or snap, just for you).
+  text (Ctrl/Cmd+B, Ctrl/Cmd+I), eight swatches that each open a shade and hue picker (click or hover)
+  that remembers the last three, and a Grid button (show or snap, just for you).
 - **Crumple:** wipes the board for everyone and puts it on a shelf of up to five crumpled boards. **Shelf**
   shows them with a small preview; **Bring back** swaps one in and crumples the board in use in its place.
   A sixth crumple throws the oldest away. The toast after a crumple has an Undo.

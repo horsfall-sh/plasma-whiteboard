@@ -181,6 +181,11 @@ fn js_number(s: &str) -> f64 {
     JsValue::from_str(s).unchecked_into_f64()
 }
 
+/// How long the pointer rests on a swatch before its colour menu opens, and how long a
+/// hovered-open menu waits after the pointer leaves before it closes.
+const HOVER_OPEN_MS: i32 = 350;
+const HOVER_CLOSE_MS: i32 = 400;
+
 fn timeout(ms: i32, f: impl FnOnce() + 'static) -> i32 {
     let cb = Closure::once_into_js(f);
     win().set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), ms).unwrap_or(0)
@@ -364,6 +369,11 @@ pub struct Page {
     /// Colours picked from the colour menu, newest first (not swatches, not mine).
     recent: Vec<String>,
     picker: colour::Picker,
+    /// The swatch the colour menu is anchored to and seeded from (None: the More colours button).
+    color_at: Option<String>,
+    /// The colour menu was opened by hovering a swatch, so it closes when the pointer leaves.
+    color_hover: bool,
+    hover_timer: i32,
     width: f64,
     fill: bool,
     heads: Heads,
@@ -478,6 +488,9 @@ impl Page {
             my_color: None,
             recent: vec![],
             picker: colour::Picker::default(),
+            color_at: None,
+            color_hover: false,
+            hover_timer: 0,
             width: 0.004,
             fill: false,
             heads: Heads::End,
@@ -1137,11 +1150,16 @@ impl Page {
 
     /// Shows one of the toolbar's menus under its button, or none.
     fn open_menu(&mut self, m: Option<&str>) {
+        clear_timeout(self.hover_timer);
+        self.hover_timer = 0;
         if m == Some("colorMenu") {
-            if let Some(c) = self.color.clone() {
+            if let Some(c) = self.color_at.clone().or_else(|| self.color.clone()) {
                 self.picker.seed(&c);
             }
             self.paint_picker();
+        } else {
+            self.color_at = None;
+            self.color_hover = false;
         }
         for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu"), ("dashBtn", "dashMenu"), ("gridBtn", "gridMenu"), ("colorBtn", "colorMenu")] {
             let on = m == Some(menu);
@@ -1149,7 +1167,12 @@ impl Page {
                 attr(&b, "aria-expanded", if on { "true" } else { "false" });
                 if let (true, Some(el)) = (on, html(menu)) {
                     el.set_hidden(false);
-                    let r = b.get_bounding_client_rect();
+                    // the colour menu opened from a swatch sits under that swatch
+                    let at = match (menu, &self.color_at) {
+                        ("colorMenu", Some(c)) => doc().query_selector(&format!("#swatches [data-c=\"{c}\"]")).ok().flatten(),
+                        _ => None,
+                    };
+                    let r = at.map_or_else(|| b.get_bounding_client_rect(), |a| a.get_bounding_client_rect());
                     let vw = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(r.right());
                     let left = r.left().min(vw - el.offset_width() as f64 - 8.0).max(8.0);
                     css(&el, "left", &format!("{left}px"));
@@ -1159,6 +1182,60 @@ impl Page {
             }
             set_hidden(menu, !on);
         }
+    }
+
+    /// Open the colour menu under swatch `c`, seeded with its colour. A click on the swatch whose
+    /// menu it opened by click closes it again; a click on a hovered-open one keeps it open.
+    fn open_swatch(&mut self, c: &str, hover: bool, was_open: bool) {
+        let same = was_open && self.color_at.as_deref() == Some(c);
+        if !hover && same && !self.color_hover {
+            self.open_menu(None);
+            return;
+        }
+        if hover && same {
+            return;
+        }
+        let keep = was_open && !hover && same;
+        self.color_at = Some(c.to_string());
+        self.color_hover = hover;
+        if !keep {
+            self.open_menu(Some("colorMenu"));
+        }
+    }
+
+    /// The pointer left the swatches and the colour menu: a hover-opened menu closes soon.
+    fn hover_off(&mut self) {
+        clear_timeout(self.hover_timer);
+        self.hover_timer = 0;
+        if self.color_hover && !is_hidden("colorMenu") {
+            self.hover_timer = timeout(HOVER_CLOSE_MS, || {
+                with(|a| {
+                    if a.page.color_hover {
+                        a.page.open_menu(None);
+                    }
+                });
+            });
+        }
+    }
+
+    /// The pointer rests on swatch `c`: after a short delay, its colour menu opens. Never over a
+    /// menu that a click opened.
+    fn hover_on(&mut self, c: Option<String>) {
+        clear_timeout(self.hover_timer);
+        self.hover_timer = 0;
+        let Some(c) = c else { return };
+        if !is_hidden("colorMenu") && !self.color_hover {
+            return;
+        }
+        self.hover_timer = timeout(HOVER_OPEN_MS, move || {
+            with(|a| {
+                a.page.hover_timer = 0;
+                let open = !is_hidden("colorMenu");
+                if !open || a.page.color_hover {
+                    a.page.open_swatch(&c, true, open);
+                }
+            });
+        });
     }
 
     fn toggle_menu(&mut self, id: &str) {
@@ -1520,6 +1597,7 @@ impl Page {
         let fx = if r.width() > 0.0 { (x - r.left()) / r.width() } else { 0.0 };
         let fy = if r.height() > 0.0 { (y - r.top()) / r.height() } else { 0.0 };
         let c = if id == "hueStrip" { self.picker.hue_at(fx) } else { self.picker.shade_at(fx, fy) };
+        self.color_hover = false;
         self.color = Some(c);
         if !matches!(self.tool, Tool::Text | Tool::Bucket) {
             self.tool = Tool::Pen;
@@ -2374,17 +2452,25 @@ impl App {
             "headBtn" => return self.page.toggle_menu("headMenu"),
             "gridBtn" => return self.page.toggle_menu("gridMenu"),
             "dashBtn" => return self.page.toggle_menu("dashMenu"),
-            "colorBtn" => return self.page.toggle_menu("colorMenu"),
-            _ => self.page.open_menu(None),
+            "colorBtn" => {
+                if self.page.color_at.is_some() {
+                    self.page.open_menu(None);
+                }
+                return self.page.toggle_menu("colorMenu");
+            }
+            _ => {}
         }
         if let Some(c) = b.get_attribute("data-c").filter(|c| !c.is_empty()) {
-            self.page.color = Some(c);
+            let was_open = !is_hidden("colorMenu");
+            self.page.color = Some(c.clone());
             if !matches!(self.page.tool, Tool::Text | Tool::Bucket) {
                 self.page.tool = Tool::Pen;
             }
             self.page.mark_tools();
+            self.page.open_swatch(&c, false, was_open);
             return;
         }
+        self.page.open_menu(None);
         if let Some(w) = b.get_attribute("data-w").filter(|w| !w.is_empty()) {
             self.page.width = js_number(&w);
             self.page.mark_tools();
@@ -3015,6 +3101,33 @@ fn wire(page: &Page) {
             a.page.style.d = d;
             a.page.open_menu(None);
             a.page.mark_tools();
+        });
+    });
+    // hover a swatch (mouse or pen, not touch) to open its colour menu; leaving closes it
+    let inside = |t: Option<EventTarget>| {
+        t.and_then(|t| t.dyn_into::<Element>().ok()).is_some_and(|el| el.closest("#swatches, #colorMenu").ok().flatten().is_some())
+    };
+    listen_id("swatches", "pointerover", move |e| {
+        let Some(p) = e.dyn_ref::<PointerEvent>() else { return };
+        if p.pointer_type() == "touch" {
+            return;
+        }
+        let c = closest(&e, "button[data-c]").and_then(|b| b.get_attribute("data-c"));
+        with(|a| a.page.hover_on(c));
+    });
+    for id in ["swatches", "colorMenu"] {
+        listen_id(id, "pointerout", move |e| {
+            let Some(p) = e.dyn_ref::<PointerEvent>() else { return };
+            if p.pointer_type() == "touch" || inside(p.related_target()) {
+                return;
+            }
+            with(|a| a.page.hover_off());
+        });
+    }
+    listen_id("colorMenu", "pointerover", |_| {
+        with(|a| {
+            clear_timeout(a.page.hover_timer);
+            a.page.hover_timer = 0;
         });
     });
     // the colour menu: drag on the shade area or hue strip; letting go keeps a recent colour

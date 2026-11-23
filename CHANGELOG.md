@@ -29,7 +29,9 @@ itself. A v0.2.0 page does not know `x`, so upgrade the relay and the page toget
 - **Bold and italic text:** B and I beside Text, or Ctrl/Cmd+B and Ctrl/Cmd+I. They style the text
   being typed, your selected text (one change, one undo), or else the next text you place.
 - **More colours:** eight swatches (black, grey, red, orange, green, blue, purple, white) after
-  your own colour, and a "More colours" menu with a shade area and a hue strip. The last three
+  your own colour. Click a swatch, or rest the mouse on it, and a shade area and hue strip open
+  under it, seeded with its colour; drag in them to pick any colour ("More colours" opens the same
+  picker for the current colour). The last three
   colours picked there stay in the toolbar as swatches. White is drawn as `#fdfdfd`, so it is never
   mistaken for the eraser.
 - **Grid:** one button for Whiteboard, Show grid or Snap to grid, just for you and never synced.
