@@ -32,7 +32,8 @@ use web_sys::{
 };
 
 use crate::fx::{Fx, Paper};
-use crate::geom::{self, FIXED_COLORS, FONT, LINE_HEIGHT, PING_COLOR, PING_MS};
+use crate::colour;
+use crate::geom::{self, FONT, LINE_HEIGHT, PING_COLOR, PING_MS};
 use crate::input::{self, Editor, Input, Kind, Key, Net, Overlay, Pen, Ptr, Tool, Wheel};
 use crate::local::{self, Local, Route, Save, LOCAL_KEY, SHARING_KEY};
 use crate::model::Board;
@@ -360,6 +361,9 @@ pub struct Page {
     tool: Tool,
     color: Option<String>,
     my_color: Option<String>,
+    /// Colours picked from the colour menu, newest first (not swatches, not mine).
+    recent: Vec<String>,
+    picker: colour::Picker,
     width: f64,
     fill: bool,
     heads: Heads,
@@ -472,6 +476,8 @@ impl Page {
             tool: Tool::Pen,
             color: None,
             my_color: None,
+            recent: vec![],
+            picker: colour::Picker::default(),
             width: 0.004,
             fill: false,
             heads: Heads::End,
@@ -1131,7 +1137,13 @@ impl Page {
 
     /// Shows one of the toolbar's menus under its button, or none.
     fn open_menu(&mut self, m: Option<&str>) {
-        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu"), ("dashBtn", "dashMenu"), ("gridBtn", "gridMenu")] {
+        if m == Some("colorMenu") {
+            if let Some(c) = self.color.clone() {
+                self.picker.seed(&c);
+            }
+            self.paint_picker();
+        }
+        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu"), ("dashBtn", "dashMenu"), ("gridBtn", "gridMenu"), ("colorBtn", "colorMenu")] {
             let on = m == Some(menu);
             if let Some(b) = html(btn) {
                 attr(&b, "aria-expanded", if on { "true" } else { "false" });
@@ -1467,20 +1479,61 @@ impl Page {
         clear(&sw);
         let Some(mine) = self.my_color.clone() else { return };
         let mut list = vec![mine.clone()];
-        list.extend(FIXED_COLORS.iter().filter(|c| !c.eq_ignore_ascii_case(&mine)).map(|c| c.to_string()));
+        list.extend(colour::SWATCHES.iter().map(|(c, _)| c.to_string()).filter(|c| !c.eq_ignore_ascii_case(&mine)));
+        list.extend(self.recent.iter().filter(|c| !list.contains(c)).cloned().collect::<Vec<_>>());
         for c in &list {
             let b = el("button", Some("sw"), None);
             attr(&b, "type", "button");
             attr(&b, "data-c", c);
             css(&b, "background", c);
-            let label = if *c == mine { "My colour".to_string() } else { geom::color_name(c).map_or(c.clone(), str::to_string) };
+            let label = if *c == mine { "My colour".to_string() } else { colour::name(c).map_or_else(|| format!("Recent colour {c}"), str::to_string) };
             attr(&b, "aria-label", &label);
+            attr(&b, "title", &label);
             let _ = sw.append_child(&b);
         }
         if !self.color.as_ref().is_some_and(|c| list.contains(c)) {
             self.color = Some(mine);
         }
         self.mark_tools();
+    }
+
+    /// The colour menu's shade area and hue strip, drawn for the picker's hue, with markers.
+    fn paint_picker(&self) {
+        let p = self.picker;
+        if let Some(a) = html("shadeArea") {
+            css(&a, "background", &format!("linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl({:.0} 100% 50%))", p.h));
+        }
+        if let Some(m) = html("shadeMark") {
+            css(&m, "left", &format!("{:.1}%", p.s * 100.0));
+            css(&m, "top", &format!("{:.1}%", (1.0 - p.v) * 100.0));
+            css(&m, "background", &p.hex());
+        }
+        if let Some(m) = html("hueMark") {
+            css(&m, "left", &format!("{:.1}%", p.h / 3.6));
+        }
+    }
+
+    /// A pointer at (`x`, `y`) on the shade area or hue strip: the pen takes the colour at once.
+    fn pick_at(&mut self, id: &str, x: f64, y: f64) {
+        let Some(a) = html(id) else { return };
+        let r = a.get_bounding_client_rect();
+        let fx = if r.width() > 0.0 { (x - r.left()) / r.width() } else { 0.0 };
+        let fy = if r.height() > 0.0 { (y - r.top()) / r.height() } else { 0.0 };
+        let c = if id == "hueStrip" { self.picker.hue_at(fx) } else { self.picker.shade_at(fx, fy) };
+        self.color = Some(c);
+        if !matches!(self.tool, Tool::Text | Tool::Bucket) {
+            self.tool = Tool::Pen;
+        }
+        self.paint_picker();
+        self.mark_tools();
+    }
+
+    /// The pointer let go of the picker: keep the colour among the recent ones.
+    fn pick_done(&mut self) {
+        if let Some(c) = self.color.clone() {
+            colour::remember(&mut self.recent, &c, self.my_color.as_deref());
+            self.build_swatches();
+        }
     }
 
     fn mark_tools(&self) {
@@ -2321,6 +2374,7 @@ impl App {
             "headBtn" => return self.page.toggle_menu("headMenu"),
             "gridBtn" => return self.page.toggle_menu("gridMenu"),
             "dashBtn" => return self.page.toggle_menu("dashMenu"),
+            "colorBtn" => return self.page.toggle_menu("colorMenu"),
             _ => self.page.open_menu(None),
         }
         if let Some(c) = b.get_attribute("data-c").filter(|c| !c.is_empty()) {
@@ -2563,7 +2617,7 @@ fn wire(page: &Page) {
         let ptr = ptr_of(p);
         if with(|a| {
             let App { inp, page, .. } = a;
-            if !(is_hidden("shapeMenu") && is_hidden("headMenu") && is_hidden("dashMenu") && is_hidden("gridMenu")) {
+            if !(is_hidden("shapeMenu") && is_hidden("headMenu") && is_hidden("dashMenu") && is_hidden("gridMenu") && is_hidden("colorMenu")) {
                 page.open_menu(None);
             }
             let r = inp.down(page, &ptr);
@@ -2963,6 +3017,34 @@ fn wire(page: &Page) {
             a.page.mark_tools();
         });
     });
+    // the colour menu: drag on the shade area or hue strip; letting go keeps a recent colour
+    for id in ["shadeArea", "hueStrip"] {
+        listen_id(id, "pointerdown", move |e| {
+            let Some(p) = e.dyn_ref::<PointerEvent>() else { return };
+            e.prevent_default();
+            if let Some(t) = html(id) {
+                let _ = t.set_pointer_capture(p.pointer_id());
+            }
+            let (x, y) = (p.client_x() as f64, p.client_y() as f64);
+            with(|a| a.page.pick_at(id, x, y));
+        });
+        listen_id(id, "pointermove", move |e| {
+            let Some(p) = e.dyn_ref::<PointerEvent>() else { return };
+            if !html(id).is_some_and(|t| t.has_pointer_capture(p.pointer_id())) {
+                return;
+            }
+            let (x, y) = (p.client_x() as f64, p.client_y() as f64);
+            with(|a| a.page.pick_at(id, x, y));
+        });
+        for ev in ["pointerup", "pointercancel"] {
+            listen_id(id, ev, move |e| {
+                let Some(p) = e.dyn_ref::<PointerEvent>() else { return };
+                if html(id).is_some_and(|t| t.has_pointer_capture(p.pointer_id())) {
+                    with(|a| a.page.pick_done());
+                }
+            });
+        }
+    }
     listen_id("gridMenu", "click", |e| {
         let Some(b) = closest(&e, "button[data-grid]") else { return };
         let Some(g) = b.get_attribute("data-grid").as_deref().and_then(Grid::from_key) else { return };

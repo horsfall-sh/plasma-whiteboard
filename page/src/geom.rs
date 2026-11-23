@@ -10,7 +10,6 @@ use crate::view::js_round;
 pub const EPS: f64 = 0.00025;
 pub const ERASER_SCALE: f64 = 6.0;
 pub const ERASER_COLOR: &str = "#ffffff";
-pub const FIXED_COLORS: [&str; 4] = ["#111111", "#d63031", "#0a66d8", "#1e9e4a"];
 /// Font size of a text item = its width times this.
 pub const TEXT_SCALE: f64 = 5.0;
 pub const LINE_HEIGHT: f64 = 1.25;
@@ -19,17 +18,6 @@ pub const FONT: &str = "-apple-system, \"Segoe UI\", Roboto, Helvetica, Arial, s
 pub const CORNER_COS: f64 = 0.35;
 /// A ping with no layer colour.
 pub const PING_COLOR: &str = "#e67e22";
-
-/// The name of a fixed colour, for its button.
-pub fn color_name(c: &str) -> Option<&'static str> {
-    match c {
-        "#111111" => Some("Black"),
-        "#d63031" => Some("Red"),
-        "#0a66d8" => Some("Blue"),
-        "#1e9e4a" => Some("Green"),
-        _ => None,
-    }
-}
 
 /// `r5`: round to 5 decimals so points stay short on the wire.
 pub fn r5(v: f64) -> f64 {
@@ -633,6 +621,5 @@ mod tests {
             })
             .collect();
         assert!(ping_points(&ring, false, 1000.0).unwrap().len() <= 600);
-        assert_eq!(color_name("#0a66d8"), Some("Blue"));
     }
 }

@@ -245,6 +245,12 @@ body.local #bar #pingBtn { display: none; }
 .menu button svg { flex: none; pointer-events: none; }
 .menu button[aria-checked="true"] { border-color: #fff; }
 #fillBtn { margin-top: 4px; }
+#colorMenu { gap: 8px; padding: 8px; }
+#colorMenu .shade, #colorMenu .hue { position: relative; width: 200px; border-radius: 6px; touch-action: none; cursor: crosshair; }
+#colorMenu .shade { height: 140px; }
+#colorMenu .hue { height: 16px; background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); }
+#colorMenu .mark { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px rgba(0,0,0,.6); pointer-events: none; }
+#colorMenu .hue .mark { top: 50%; background: transparent; }
 
 /* ---- the share question ---- */
 .modal {
