@@ -76,6 +76,8 @@ pub enum Op {
     Alpha(f64),
     /// Fill the path with this colour (0xrrggbb), not the item's: a bucket fill.
     FillColor(u32),
+    /// `setLineDash([dash, gap])` in board px; (0, 0) is solid again.
+    Dash(f64, f64),
 }
 
 /// `dot`: a one-point stroke.

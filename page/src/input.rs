@@ -971,7 +971,7 @@ impl Input {
             Gest::NewBox { kind, x0, y0, x1, y1, .. } => {
                 (*x1, *y1) = Self::snap(h, x, y);
                 let bb = [x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)];
-                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, None, w, bw))], ..Overlay::default() }
+                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, None, pen.style.d, w, bw))], ..Overlay::default() }
             }
             Gest::MoveBox { old, sx, sy, dx, dy, .. } => {
                 (*dx, *dy) = (x - *sx, y - *sy);
@@ -984,7 +984,7 @@ impl Input {
                 let except = a.at.as_ref().map(|e| e.n.clone());
                 let (end, dots) = self.end_at(h, x, y, except.as_deref());
                 *b = Self::snap_end(h, end);
-                let ops = shape::line_ops(&[a.x, a.y, b.x, b.y], w, pen.heads, &[], bw);
+                let ops = shape::line_ops(&[a.x, a.y, b.x, b.y], w, pen.heads, &[], pen.style.d, bw);
                 Overlay { ghosts: vec![(c, ops)], dots, ..Overlay::default() }
             }
             Gest::Marquee { .. } | Gest::MoveSel { .. } => Overlay::default(),
@@ -999,7 +999,7 @@ impl Input {
         let Some(Shape::Box { kind, fill, n }) = &old.sh else { return Overlay::default() };
         let Some([x0, y0, x1, y1]) = shape::norm_box(&old.pts) else { return Overlay::default() };
         let nd = Node { kind: *kind, bb: [x0 + dx, y0 + dy, x1 + dx, y1 + dy] };
-        let mut ghosts = vec![(old.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, old.st.fc.as_deref(), old.w, bw))];
+        let mut ghosts = vec![(old.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, old.st.fc.as_deref(), old.st.d, old.w, bw))];
         let lines: Vec<Item> = h
             .board()
             .strokes
@@ -1012,7 +1012,7 @@ impl Input {
                 continue;
             }
             if let Some(seg) = h.scene().resolve_with(&it, Some((n, &nd))) {
-                ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], bw)));
+                ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], it.st.d, bw)));
             }
         }
         Overlay { ghosts, ..Overlay::default() }
@@ -1445,13 +1445,13 @@ impl Input {
                 Some(Shape::Box { kind, fill, n }) => {
                     let Some([x0, y0, x1, y1]) = shape::norm_box(&s.pts) else { continue };
                     let nd = Node { kind: *kind, bb: [x0 + dx, y0 + dy, x1 + dx, y1 + dy] };
-                    ghosts.push((s.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, s.st.fc.as_deref(), s.w, bw)));
+                    ghosts.push((s.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, s.st.fc.as_deref(), s.st.d, s.w, bw)));
                     moved.insert(n.clone(), nd);
                 }
                 Some(Shape::Line { .. }) => {}
                 None if s.txt.is_some() => {
                     let b = h.bbox(s);
-                    ghosts.push((s.c.clone(), shape::box_ops(BoxKind::Rect, &[b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy], false, None, 0.001, bw)));
+                    ghosts.push((s.c.clone(), shape::box_ops(BoxKind::Rect, &[b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy], false, None, shape::Dash::Solid, 0.001, bw)));
                 }
                 None => ghosts.push((s.c.clone(), geom::full(&shifted(&s.pts, dx, dy), s.w, bw))),
             }
@@ -1469,7 +1469,7 @@ impl Input {
             }
             let it = if self.sel.contains(&it.id) { Item { pts: shifted(&it.pts, dx, dy), ..it } } else { it };
             if let Some(seg) = h.scene().resolve_in(&it, |n| moved.get(n).copied()) {
-                ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], bw)));
+                ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], it.st.d, bw)));
             }
         }
         Overlay { ghosts, ..Overlay::default() }

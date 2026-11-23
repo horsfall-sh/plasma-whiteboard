@@ -141,7 +141,33 @@ pub enum Dash {
     Dot,
 }
 
+/// A dash and the gap after it, board units, as they look on the board.
+pub const DASH_LEN: f64 = 0.014;
+pub const DASH_GAP: f64 = 0.008;
+/// The gap between dots, board units.
+pub const DOT_GAP: f64 = 0.006;
+
 impl Dash {
+    /// The `setLineDash` pattern (board px) for a stroke `lw` board px thick with round caps:
+    /// a cap adds lw/2 at each end of a dash, so the pattern takes it back off the dash and
+    /// gives it to the gap. What shows is a DASH_LEN dash (never shorter than a dot) and a
+    /// DASH_GAP gap at any thickness; a dot is a zero-length dash, a round cap of diameter lw.
+    pub fn pattern(self, lw: f64, bw: f64) -> Option<(f64, f64)> {
+        match self {
+            Dash::Solid => None,
+            Dash::Dash => Some(((DASH_LEN * bw - lw).max(0.0), DASH_GAP * bw + lw)),
+            Dash::Dot => Some((0.0, DOT_GAP * bw + lw)),
+        }
+    }
+
+    /// The menu's name for it.
+    pub fn menu_key(self) -> &'static str {
+        self.key().unwrap_or("solid")
+    }
+    pub fn from_menu_key(k: &str) -> Option<Dash> {
+        [Dash::Solid, Dash::Dash, Dash::Dot].into_iter().find(|d| d.menu_key() == k)
+    }
+
     pub fn key(self) -> Option<&'static str> {
         match self {
             Dash::Solid => None,
@@ -554,9 +580,10 @@ pub fn rgb(c: &str) -> Option<u32> {
 
 /// A shape: its outline, filled with its own colour when `fill`, or with `fc` (a bucket fill,
 /// which wins) under the outline.
-pub fn box_ops(kind: BoxKind, bb: &[f64; 4], fill: bool, fc: Option<&str>, w: f64, bw: f64) -> Vec<Op> {
+pub fn box_ops(kind: BoxKind, bb: &[f64; 4], fill: bool, fc: Option<&str>, d: Dash, w: f64, bw: f64) -> Vec<Op> {
     let [x0, y0, x1, y1] = bb.map(|v| v * bw);
-    let mut o = vec![Op::LineWidth(line_w(w, bw, 0.5)), Op::Begin];
+    let lw = line_w(w, bw, 0.5);
+    let mut o = vec![Op::LineWidth(lw), Op::Begin];
     match kind {
         BoxKind::Rect => o.extend([Op::MoveTo(x0, y0), Op::LineTo(x1, y0), Op::LineTo(x1, y1), Op::LineTo(x0, y1), Op::Close]),
         BoxKind::Ellipse => o.push(Op::Ellipse((x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0, (y1 - y0) / 2.0)),
@@ -567,13 +594,21 @@ pub fn box_ops(kind: BoxKind, bb: &[f64; 4], fill: bool, fc: Option<&str>, w: f6
         None if fill => o.push(Op::Fill),
         None => {}
     }
-    o.push(Op::Stroke);
+    dashed(&mut o, d, lw, bw);
     o
+}
+
+/// The stroke, dashed as `d` asks and solid again after it.
+fn dashed(o: &mut Vec<Op>, d: Dash, lw: f64, bw: f64) {
+    match d.pattern(lw, bw) {
+        Some((a, b)) => o.extend([Op::Dash(a, b), Op::Stroke, Op::Dash(0.0, 0.0)]),
+        None => o.push(Op::Stroke),
+    }
 }
 
 /// A line: its stroke with a hop at each of `hops` (distances from its start, board units),
 /// then its heads.
-pub fn line_ops(p: &[f64; 4], w: f64, h: Heads, hops: &[f64], bw: f64) -> Vec<Op> {
+pub fn line_ops(p: &[f64; 4], w: f64, h: Heads, hops: &[f64], d: Dash, bw: f64) -> Vec<Op> {
     let [ax, ay, bx, by] = p.map(|v| v * bw);
     let len = (bx - ax).hypot(by - ay);
     let lw = line_w(w, bw, 0.5);
@@ -600,7 +635,7 @@ pub fn line_ops(p: &[f64; 4], w: f64, h: Heads, hops: &[f64], bw: f64) -> Vec<Op
     }
     let (x, y) = at(s1);
     o.push(Op::LineTo(x, y));
-    o.push(Op::Stroke);
+    dashed(&mut o, d, lw, bw);
     let head = |o: &mut Vec<Op>, tx: f64, ty: f64, ux: f64, uy: f64| {
         let (bx, by) = (tx - ux * hl, ty - uy * hl);
         let hw = hl * 0.45;
@@ -626,10 +661,10 @@ pub fn line_ops(p: &[f64; 4], w: f64, h: Heads, hops: &[f64], bw: f64) -> Vec<Op
 /// the scene does not show (an end on a hidden shape). `bb` is where it is, board units.
 pub fn item_ops(it: &Item, scene: &Scene, bw: f64) -> Option<(Vec<Op>, Option<[f64; 4]>)> {
     match it.sh.as_ref()? {
-        Shape::Box { kind, fill, .. } => Some((box_ops(*kind, &norm_box(&it.pts)?, *fill, it.st.fc.as_deref(), it.w, bw), None)),
+        Shape::Box { kind, fill, .. } => Some((box_ops(*kind, &norm_box(&it.pts)?, *fill, it.st.fc.as_deref(), it.st.d, it.w, bw), None)),
         Shape::Line { .. } => {
             let s = scene.seg(&it.id)?;
-            Some((line_ops(&s.p, s.w, s.h, &scene.hops(&it.id, bw), bw), scene.bbox(&it.id, bw)))
+            Some((line_ops(&s.p, s.w, s.h, &scene.hops(&it.id, bw), it.st.d, bw), scene.bbox(&it.id, bw)))
         }
     }
 }
@@ -831,7 +866,7 @@ mod tests {
         assert_eq!(sc.hops("v", bw), vec![0.5]);
         let arcs = |id: &str| {
             let s = sc.seg(id).unwrap();
-            line_ops(&s.p, s.w, s.h, &sc.hops(id, bw), bw).iter().filter(|o| matches!(o, Op::Arc(..))).count()
+            line_ops(&s.p, s.w, s.h, &sc.hops(id, bw), Dash::Solid, bw).iter().filter(|o| matches!(o, Op::Arc(..))).count()
         };
         assert_eq!(arcs("h") + arcs("v"), 1);
         // lines that meet at a shared anchor do not hop
@@ -861,4 +896,38 @@ mod tests {
         h.step(None, None, 2900.0);
         assert_eq!(h, Hover::default());
     }
+    #[test]
+    fn dashes_and_dots_keep_the_same_gap_at_any_thickness() {
+        let bw = 1000.0;
+        let pat = |ops: &[Op]| {
+            let lw = ops.iter().find_map(|o| if let Op::LineWidth(w) = o { Some(*w) } else { None }).unwrap();
+            let d = ops.iter().find_map(|o| if let Op::Dash(a, g) = o { Some((*a, *g)) } else { None });
+            (lw, d)
+        };
+        let p = [0.1, 0.1, 0.5, 0.1];
+        let mut gaps = vec![];
+        for w in [0.002, 0.009] { // the small and large pens
+            let (lw, d) = pat(&line_ops(&p, w, Heads::None, &[], Dash::Dash, bw));
+            let (a, g) = d.unwrap();
+            // a round cap adds lw/2 at each end: what shows is dash a + lw, gap g - lw
+            assert!((a + lw - DASH_LEN * bw).abs() < 1e-9, "dash {a} at lw {lw}");
+            gaps.push(g - lw);
+            let (lw, d) = pat(&line_ops(&p, w, Heads::None, &[], Dash::Dot, bw));
+            let (a, g) = d.unwrap();
+            assert_eq!(a, 0.0, "a dot is a round cap");
+            assert!((g - lw - DOT_GAP * bw).abs() < 1e-9);
+            // a dashed box: dashed outline, solid again after it
+            let ops = box_ops(BoxKind::Rect, &[0.1, 0.1, 0.3, 0.3], false, None, Dash::Dash, w, bw);
+            let n = ops.len();
+            let (a, g) = Dash::Dash.pattern(lw, bw).unwrap();
+            assert_eq!(&ops[n - 3..], &[Op::Dash(a, g), Op::Stroke, Op::Dash(0.0, 0.0)][..]);
+        }
+        assert!((gaps[0] - gaps[1]).abs() < 1e-9 && (gaps[0] - DASH_GAP * bw).abs() < 1e-9, "{gaps:?}");
+        assert!(pat(&line_ops(&p, 0.004, Heads::End, &[], Dash::Solid, bw)).1.is_none(), "solid sets no dash");
+        // the heads are drawn after the dash is cleared
+        let ops = line_ops(&p, 0.004, Heads::End, &[], Dash::Dot, bw);
+        let clear = ops.iter().position(|o| *o == Op::Dash(0.0, 0.0)).unwrap();
+        assert!(ops.iter().rposition(|o| *o == Op::Fill).unwrap() > clear);
+    }
+
 }
