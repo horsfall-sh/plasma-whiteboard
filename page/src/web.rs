@@ -972,6 +972,8 @@ impl Page {
         css(ta, "top", &format!("{top}px"));
         css(ta, "font-size", &format!("{px}px"));
         css(ta, "color", &ed.c);
+        css(ta, "font-weight", if ed.b { "700" } else { "400" });
+        css(ta, "font-style", if ed.i { "italic" } else { "normal" });
         css(ta, "width", &format!("{width}px"));
         css(ta, "height", "auto");
         let h = (self.d.ta.scroll_height() as f64).max(px * LINE_HEIGHT);
@@ -1507,6 +1509,13 @@ impl Page {
                 pressed(&b, self.tool == t);
             }
         }
+        // the open text box's bold/italic, else the next new text's
+        let (tb, ti) = self.editor.as_ref().map_or((self.style.b, self.style.i), |e| (e.b, e.i));
+        for (id, on) in [("boldBtn", tb), ("italicBtn", ti)] {
+            if let Some(b) = html(id) {
+                pressed(&b, on);
+            }
+        }
         let on_shape = matches!(self.tool, Tool::Shape(_) | Tool::Line);
         if let Some(b) = html("shapeBtn") {
             pressed(&b, on_shape);
@@ -2008,6 +2017,18 @@ impl input::Host for Page {
         self.d.ta.value()
     }
 
+    fn editor_style(&mut self, ed: &Editor) {
+        self.editor = Some(ed.clone());
+        self.place_editor();
+        self.mark_tools();
+    }
+
+    fn set_text_style(&mut self, b: bool, i: bool) {
+        self.style.b = b;
+        self.style.i = i;
+        self.mark_tools();
+    }
+
     fn editor_hide(&mut self) {
         self.editor = None;
         self.d.ta.set_hidden(true);
@@ -2330,6 +2351,11 @@ impl App {
             "moveBtn" => flip(&mut self.page, Tool::Move),
             "selectBtn" => flip(&mut self.page, Tool::Select),
             "bucketBtn" => flip(&mut self.page, Tool::Bucket),
+            "boldBtn" | "italicBtn" => {
+                let App { inp, page, .. } = self;
+                inp.text_style(page, b.id() == "boldBtn");
+                page.mark_tools();
+            }
             "crumpleBtn" => self.crumple(),
             "shelfBtn" => self.page.toggle_panel("shelfPanel"),
             "layersBtn" => self.page.toggle_panel("layersPanel"),
@@ -2616,7 +2642,7 @@ fn wire(page: &Page) {
         }
         with(|a| match key {
             Key::None => {}
-            Key::Undo | Key::Space | Key::Delete | Key::Group | Key::Ungroup => {
+            Key::Undo | Key::Space | Key::Delete | Key::Group | Key::Ungroup | Key::Bold | Key::Italic => {
                 let App { inp, page, .. } = a;
                 inp.key(page, key);
                 mark_pan(inp, page);
@@ -2674,6 +2700,15 @@ fn wire(page: &Page) {
     listen(ta, "keydown", |e| {
         e.stop_propagation();
         let Some(k) = e.dyn_ref::<KeyboardEvent>() else { return };
+        // Ctrl/Cmd+B/I style the text being typed
+        if let Key::Bold | Key::Italic = input::key(&k.key(), k.ctrl_key(), k.meta_key(), k.shift_key(), k.alt_key(), false) {
+            e.prevent_default();
+            with(|a| {
+                let App { inp, page, .. } = a;
+                inp.text_style(page, k.key().eq_ignore_ascii_case("b"));
+            });
+            return;
+        }
         if let Some(save) = input::editor_key(&k.key(), k.shift_key(), k.is_composing()) {
             e.prevent_default();
             with(|a| {
@@ -2686,6 +2721,13 @@ fn wire(page: &Page) {
         listen(&vv, "resize", |_| {
             with(|a| a.page.place_editor());
         });
+    }
+
+    // pressing B or I must not take the focus from the open text box (its blur saves it)
+    for id in ["boldBtn", "italicBtn"] {
+        for ev in ["pointerdown", "mousedown"] {
+            listen_id(id, ev, |e| e.prevent_default());
+        }
     }
 
     // the toolbar, the page arrows and the map

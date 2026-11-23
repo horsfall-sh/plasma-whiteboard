@@ -57,7 +57,7 @@ impl Bounds {
         if let Some(b) = self.0.get(&s.id) {
             return *b;
         }
-        let font = geom::measure_font();
+        let font = geom::measure_font(s.st.b, s.st.i);
         let b = geom::bbox(&s.pts, s.w, s.txt.as_deref(), |line| ctx.measure(&font, line));
         self.0.insert(s.id.clone(), b);
         b
@@ -119,7 +119,7 @@ pub fn draw_full(ctx: &mut impl Surface, s: &Item, view: &View, cull: Option<V>,
         }
     }
     if let Some(t) = &s.txt {
-        let (font, lines) = geom::text_layout(t, &s.pts, s.w, view.bw);
+        let (font, lines) = geom::text_layout(t, &s.pts, s.w, view.bw, s.st.b, s.st.i);
         ctx.text(&font, &s.c, &lines);
         return;
     }
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(measured, 2, "two lines, measured on the first draw only");
         let texts: Vec<&String> = r.0.iter().filter(|c| c.starts_with("text")).collect();
         assert_eq!(texts.len(), 2);
-        let (font, lines) = geom::text_layout("ab\nc", &t.pts, t.w, v.bw);
+        let (font, lines) = geom::text_layout("ab\nc", &t.pts, t.w, v.bw, t.st.b, t.st.i);
         assert_eq!(*texts[0], format!("text {font} #d63031 {lines:?}"));
         assert_eq!(b.len(), 2, "far and t");
         b.forget("far");

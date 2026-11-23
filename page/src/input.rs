@@ -134,6 +134,10 @@ pub trait Host {
     fn editor_text(&self) -> String;
     /// Hide, empty and blur the text box.
     fn editor_hide(&mut self);
+    /// The open text box's bold/italic changed: restyle it.
+    fn editor_style(&mut self, ed: &Editor);
+    /// Bold/italic for the next new text.
+    fn set_text_style(&mut self, b: bool, i: bool);
     /// Where every visible shape and line is (rebuilt when the board changes).
     fn scene(&mut self) -> &Scene;
     /// Show `o` over the live canvas until the next call; `None` clears it.
@@ -225,6 +229,9 @@ pub struct Editor {
     pub y: f64,
     pub c: String,
     pub w: f64,
+    /// Bold and italic, as the item will carry them in its `sh`.
+    pub b: bool,
+    pub i: bool,
     pub old: Option<Item>,
 }
 
@@ -693,6 +700,8 @@ impl Input {
             y,
             c: old.as_ref().map_or_else(|| pen.color.clone().unwrap_or_default(), |o| o.c.clone()),
             w: old.as_ref().map_or(pen.width * TEXT_SCALE, |o| o.w),
+            b: old.as_ref().map_or(pen.style.b, |o| o.st.b),
+            i: old.as_ref().map_or(pen.style.i, |o| o.st.i),
             old,
         };
         if let Some(o) = &ed.old {
@@ -709,7 +718,7 @@ impl Input {
         let txt = clean_text(&h.editor_text());
         h.editor_hide();
         if let Some(old) = &ed.old {
-            if !save || old.txt.as_deref() == Some(txt.as_str()) {
+            if !save || (old.txt.as_deref() == Some(txt.as_str()) && old.st.b == ed.b && old.st.i == ed.i) {
                 h.insert_stroke(old.clone()); // unchanged: put it back
                 return;
             }
@@ -729,12 +738,14 @@ impl Input {
             return;
         }
         let id = h.new_id();
-        let f = Item { id: id.clone(), l: me, q: None, c: ed.c, w: r5(ed.w), pts: vec![r5(ed.x), r5(ed.y), 0.5], txt: Some(txt), sh: None, st: Default::default() };
+        // a re-edited text keeps its groups
+        let st = Style { b: ed.b, i: ed.i, g: ed.old.map(|o| o.st.g).unwrap_or_default(), ..Style::default() };
+        let f = Item { id: id.clone(), l: me, q: None, c: ed.c, w: r5(ed.w), pts: vec![r5(ed.x), r5(ed.y), 0.5], txt: Some(txt), sh: None, st };
         h.insert_stroke(f.clone());
         h.board().pending.insert(id.clone(), f.clone());
         h.mine().push(id.clone());
         if online_ready(h) {
-            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: f.txt, sh: None, st: Default::default() });
+            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: f.txt, sh: None, st: f.st });
         }
     }
 
@@ -807,8 +818,46 @@ impl Input {
             Key::Delete => self.delete_sel(h),
             Key::Group => self.group_sel(h),
             Key::Ungroup => self.ungroup_sel(h),
+            Key::Bold => self.text_style(h, true),
+            Key::Italic => self.text_style(h, false),
             _ => {}
         }
+    }
+
+    /// Bold (`bold`) or italic flipped by its button or Ctrl/Cmd+B/I: the open text box, else
+    /// my selected text items as ONE edit (all on unless all are on already), else the style
+    /// of the next new text.
+    pub fn text_style(&mut self, h: &mut impl Host, bold: bool) {
+        let flip = |b: &mut bool, i: &mut bool| if bold { *b = !*b } else { *i = !*i };
+        if let Some(ed) = self.editor.as_mut() {
+            flip(&mut ed.b, &mut ed.i);
+            let ed = ed.clone();
+            h.editor_style(&ed);
+            return;
+        }
+        let me = h.pen().me;
+        let texts: Vec<Item> = self.sel_items(h).into_iter().filter(|s| s.txt.is_some() && s.l == me).collect();
+        if !texts.is_empty() && self.gest.is_none() {
+            let get = |s: &Item| if bold { s.st.b } else { s.st.i };
+            let on = !texts.iter().all(get);
+            let new: Vec<Item> = texts
+                .iter()
+                .filter(|s| get(s) != on)
+                .map(|s| {
+                    let mut st = s.st.clone();
+                    if bold { st.b = on } else { st.i = on }
+                    Item { id: h.new_id(), q: None, st, ..s.clone() }
+                })
+                .collect();
+            let old: Vec<Item> = texts.into_iter().filter(|s| get(s) != on).collect();
+            self.replace_sel(h, old, new);
+            self.sel_redraw(h);
+            return;
+        }
+        let s = h.pen().style;
+        let (mut b, mut i) = (s.b, s.i);
+        flip(&mut b, &mut i);
+        h.set_text_style(b, i);
     }
 
     /// `keyup` of Space, or the window losing focus.
@@ -1605,12 +1654,15 @@ pub enum Key {
     Group,
     /// Shift+Ctrl/Cmd+G: take the selection out of its group.
     Ungroup,
+    /// Ctrl/Cmd+B and Ctrl/Cmd+I: bold and italic text.
+    Bold,
+    Italic,
 }
 
 impl Key {
     /// Whether the handler calls `preventDefault`.
     pub fn prevents(self) -> bool {
-        matches!(self, Key::Undo | Key::Space | Key::Group | Key::Ungroup)
+        matches!(self, Key::Undo | Key::Space | Key::Group | Key::Ungroup | Key::Bold | Key::Italic)
     }
 }
 
@@ -1625,6 +1677,13 @@ pub fn key(key: &str, ctrl: bool, meta: bool, shift: bool, alt: bool, in_input: 
             (false, false) => Key::Group,
             (false, true) => Key::Ungroup,
         };
+    }
+    if (ctrl || meta) && !shift && !alt && !in_input {
+        match key.to_lowercase().as_str() {
+            "b" => return Key::Bold,
+            "i" => return Key::Italic,
+            _ => {}
+        }
     }
     if key == "Escape" {
         return Key::ClosePanel;
@@ -1825,6 +1884,13 @@ mod tests {
         fn editor_hide(&mut self) {
             self.text.clear();
             self.log.push("editor_hide".into());
+        }
+        fn editor_style(&mut self, ed: &Editor) {
+            self.log.push(format!("editor_style {} {}", ed.b, ed.i));
+        }
+        fn set_text_style(&mut self, b: bool, i: bool) {
+            self.pen.style.b = b;
+            self.pen.style.i = i;
         }
         fn scene(&mut self) -> &Scene {
             let hidden = self.hidden.clone();
@@ -2229,10 +2295,47 @@ mod tests {
     }
 
     #[test]
+    fn bold_and_italic_style_the_text_box_my_selection_or_the_next_text() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        // in the text box: Ctrl+B flips it, and the saved item carries sh b
+        i.open_editor(&mut h, x, y, None);
+        h.text = "hi".into();
+        i.key(&mut h, key("b", true, false, false, false, false));
+        assert!(i.editor.as_ref().unwrap().b && h.log.last().unwrap() == "editor_style true false");
+        i.close_editor(&mut h, true);
+        let Some(Out::Stroke { id, st, .. }) = h.sent.last().cloned() else { panic!("{:?}", h.sent) };
+        assert!(st.b && !st.i);
+        assert!(h.sent.last().unwrap().frame().contains(r#""sh":{"k":"text","b":true}"#), "{}", h.sent.last().unwrap().frame());
+        assert!(!h.pen.style.b, "the box's style is not the next text's");
+        // selected: italic goes on as ONE edit (an x), bold kept, one undo step
+        i.sel = vec![id.clone()];
+        let (n, steps) = (h.sent.len(), i.steps.len());
+        i.text_style(&mut h, false);
+        assert_eq!(h.sent.len(), n + 1);
+        let Some(Out::Batch(parts)) = h.sent.last().cloned() else { panic!("{:?}", h.sent.last()) };
+        assert!(matches!(&parts[..], [Out::Undo { id: u }, Out::Stroke { st, txt: Some(t), .. }] if *u == id && st.b && st.i && t == "hi"));
+        assert_eq!(i.steps.len(), steps + 1);
+        assert_eq!(i.sel.len(), 1);
+        assert_ne!(i.sel[0], id);
+        // nothing open or selected: it sets the next text's style
+        i.sel.clear();
+        i.text_style(&mut h, true);
+        assert!(h.pen.style.b && !h.pen.style.i);
+        i.open_editor(&mut h, x + 0.1, y, None);
+        assert!(i.editor.as_ref().unwrap().b);
+        // the keys
+        assert_eq!(key("I", false, true, false, false, false), Key::Italic);
+        assert_eq!(key("b", true, false, true, false, false), Key::None);
+        assert_eq!(key("b", true, false, false, false, true), Key::None);
+        assert!(Key::Bold.prevents());
+    }
+
+    #[test]
     fn editor_box_matches_place_editor() {
         let mut v = View::default();
         v.layout(1300.0, 800.0, 1.0);
-        let ed = Editor { x: 0.5, y: 0.1, c: "#111111".into(), w: 0.02, old: None };
+        let ed = Editor { x: 0.5, y: 0.1, c: "#111111".into(), w: 0.02, b: false, i: false, old: None };
         let (l, t, px, w) = editor_box(&ed, &v);
         let k = v.bw * v.zoom;
         assert_eq!((l, t, px), ((0.5 - v.pan_x) * k, (0.1 - v.pan_y) * k, 0.02 * k));

@@ -209,11 +209,21 @@ pub fn text_lines(txt: &str) -> std::str::Split<'_, char> {
 }
 
 /// `drawText`: the font, and each line's baseline point (textBaseline middle, align left).
-pub fn text_layout(txt: &str, pts: &[f64], w: f64, bw: f64) -> (String, Vec<(String, f64, f64)>) {
+/// The CSS font shorthand's style and weight for bold/italic text ("" for plain).
+pub fn font_style(b: bool, i: bool) -> &'static str {
+    match (b, i) {
+        (false, false) => "",
+        (true, false) => "700 ",
+        (false, true) => "italic ",
+        (true, true) => "italic 700 ",
+    }
+}
+
+pub fn text_layout(txt: &str, pts: &[f64], w: f64, bw: f64, b: bool, i: bool) -> (String, Vec<(String, f64, f64)>) {
     let px = w * bw;
     let lh = px * LINE_HEIGHT;
     let (x, y) = (pts.first().copied().unwrap_or(0.0), pts.get(1).copied().unwrap_or(0.0));
-    let font = format!("{}px {}", crate::json::num_to_string(px), FONT);
+    let font = format!("{}{}px {}", font_style(b, i), crate::json::num_to_string(px), FONT);
     let lines = text_lines(txt)
         .enumerate()
         .map(|(i, line)| (line.to_string(), x * bw, y * bw + (i as f64 + 0.5) * lh))
@@ -222,8 +232,8 @@ pub fn text_layout(txt: &str, pts: &[f64], w: f64, bw: f64) -> (String, Vec<(Str
 }
 
 /// The font `bbox` measures text in: 100 px, then scaled.
-pub fn measure_font() -> String {
-    format!("100px {}", FONT)
+pub fn measure_font(b: bool, i: bool) -> String {
+    format!("{}100px {}", font_style(b, i), FONT)
 }
 
 /// `bbox`, in board units [x0, y0, x1, y1]. A text item's width comes from `measure`, the
@@ -460,7 +470,7 @@ mod tests {
         for pts in [&[][..], &[0.5], &[0.5, 0.5], &[0.1, 0.2, 0.5, 0.3]] {
             let _ = dot(pts, 0.004, 1000.0);
             let _ = full(pts, 0.004, 1000.0);
-            let _ = text_layout("a\nb", pts, 0.02, 1000.0);
+            let _ = text_layout("a\nb", pts, 0.02, 1000.0, false, false);
             let _ = bbox(pts, 0.004, None, |_| 10.0);
             let _ = bbox(pts, 0.004, Some("ab"), |_| 10.0);
             for i in 0..4 {
@@ -555,8 +565,10 @@ mod tests {
 
     #[test]
     fn text_lines_are_spaced_by_line_height() {
-        let (font, lines) = text_layout("a\nbc", &[0.1, 0.2, 0.5], 0.02, 1000.0);
+        let (font, lines) = text_layout("a\nbc", &[0.1, 0.2, 0.5], 0.02, 1000.0, false, false);
         assert_eq!(font, format!("20px {}", FONT));
+        assert_eq!(text_layout("a", &[0.0, 0.0], 0.02, 1000.0, true, true).0, format!("italic 700 20px {}", FONT));
+        assert_eq!(measure_font(true, false), format!("700 100px {}", FONT));
         assert_eq!(lines[0], ("a".to_string(), 100.0, 200.0 + 12.5));
         assert_eq!(lines[1], ("bc".to_string(), 100.0, 200.0 + 37.5));
     }

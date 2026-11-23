@@ -1226,7 +1226,7 @@ mod tests {
         h.b.insert(it("m", 2, None));
         h.b.pending.insert("m".into(), it("m", 2, None));
         h.b.layers.get_mut(&2).unwrap().del = true;
-        inp.editor = Some(Editor { x: 0.0, y: 0.0, c: "#111111".into(), w: 0.02, old: Some(it("t", 2, Some(5.0))) });
+        inp.editor = Some(Editor { x: 0.0, y: 0.0, c: "#111111".into(), w: 0.02, b: false, i: false, old: Some(it("t", 2, Some(5.0))) });
         c.frame(&mut h, &mut inp, 1, r#"{"t":"cr","k":4,"by":2,"shelf":[{"k":4,"n":1}]}"#);
         assert!(inp.editor.as_ref().unwrap().old.is_none());
         assert!(!h.b.layers[&2].del);
