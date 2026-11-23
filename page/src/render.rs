@@ -14,6 +14,7 @@ use crate::geom::{self, Op};
 use crate::model::Live;
 use crate::proto::Item;
 use crate::view::{View, V};
+use crate::shape::{self, Scene};
 use std::collections::HashMap;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
@@ -85,7 +86,28 @@ impl Bounds {
 
 /// `drawFull(ctx, s, v)`: a finished item. With a view `cull`, an item wholly outside it is
 /// not drawn.
-pub fn draw_full(ctx: &mut impl Surface, s: &Item, view: &View, cull: Option<V>, bounds: &mut Bounds) {
+///
+/// A shape or line (A-166) is drawn from `scene`: a line's ends follow the shapes they are
+/// attached to, and it hops over the lines below it.
+pub fn draw_full(ctx: &mut impl Surface, s: &Item, view: &View, cull: Option<V>, bounds: &mut Bounds, scene: &Scene) {
+    if s.sh.is_some() {
+        let Some((ops, bb)) = shape::item_ops(s, scene, view.bw) else { return };
+        if let Some(v) = cull {
+            // a line moves with its shapes, so its box is the scene's, never cached
+            let bb = match bb {
+                Some(b) => b,
+                None => bounds.of(s, ctx),
+            };
+            if view.off_screen(&bb, v) {
+                return;
+            }
+        }
+        ctx.prep(&s.c);
+        for op in ops {
+            ctx.op(&op);
+        }
+        return;
+    }
     if s.pts.len() < 3 {
         // JS drew nothing visible for a stroke here (an empty path, or NaN widths). A text item
         // with 2 numbers would have drawn at pts[0], pts[1], but the page never makes one.
@@ -277,6 +299,16 @@ impl Surface for CanvasRenderingContext2d {
                 let _ = self.arc(x, y, r, 0.0, DOT_END);
                 self.fill();
             }
+            Op::LineTo(x, y) => self.line_to(x, y),
+            Op::Close => self.close_path(),
+            Op::Fill => self.fill(),
+            Op::Ellipse(x, y, rx, ry) => {
+                let _ = self.ellipse(x, y, rx, ry, 0.0, 0.0, std::f64::consts::TAU);
+            }
+            Op::Arc(x, y, r, a0, a1, ccw) => {
+                let _ = self.arc_with_anticlockwise(x, y, r, a0, a1, ccw);
+            }
+            Op::Alpha(a) => self.set_global_alpha(a),
         }
     }
 
@@ -347,7 +379,7 @@ mod tests {
     }
 
     fn stroke(id: &str, pts: Vec<f64>) -> Item {
-        Item { id: id.into(), l: Some(1), q: None, c: "#d63031".into(), w: 0.002, pts, txt: None }
+        Item { id: id.into(), l: Some(1), q: None, c: "#d63031".into(), w: 0.002, pts, txt: None, sh: None }
     }
 
     #[test]
@@ -355,7 +387,7 @@ mod tests {
         let v = view();
         let s = stroke("a", vec![0.1, 0.1, 0.5, 0.2, 0.15, 0.5, 0.3, 0.1, 0.5]);
         let mut r = Rec::default();
-        draw_full(&mut r, &s, &v, None, &mut Bounds::default());
+        draw_full(&mut r, &s, &v, None, &mut Bounds::default(), &Scene::default());
         assert_eq!(r.0[0], "prep #d63031");
         let want: Vec<String> = geom::full(&s.pts, s.w, v.bw).iter().map(|o| format!("{o:?}")).collect();
         assert_eq!(r.0[1..], want[..]);
@@ -365,7 +397,7 @@ mod tests {
     fn short_point_lists_draw_nothing() {
         let mut r = Rec::default();
         for pts in [vec![], vec![0.1, 0.2]] {
-            draw_full(&mut r, &stroke("a", pts), &view(), None, &mut Bounds::default());
+            draw_full(&mut r, &stroke("a", pts), &view(), None, &mut Bounds::default(), &Scene::default());
         }
         assert!(r.0.is_empty());
     }
@@ -377,15 +409,15 @@ mod tests {
         let mut b = Bounds::default();
         let mut r = Rec::default();
         let far = stroke("far", vec![1.9, 1.0, 0.5]);
-        draw_full(&mut r, &far, &v, Some(cur), &mut b);
+        draw_full(&mut r, &far, &v, Some(cur), &mut b, &Scene::default());
         assert!(r.0.is_empty(), "outside the view");
-        draw_full(&mut r, &far, &v, None, &mut b);
+        draw_full(&mut r, &far, &v, None, &mut b, &Scene::default());
         assert_eq!(r.0.len(), 2, "no view, no cull: prep and the dot");
 
         let t = Item { txt: Some("ab\nc".into()), w: 0.02, pts: vec![0.1, 0.1, 0.5], ..stroke("t", vec![]) };
         let mut r = Rec::default();
-        draw_full(&mut r, &t, &v, Some(cur), &mut b);
-        draw_full(&mut r, &t, &v, Some(cur), &mut b);
+        draw_full(&mut r, &t, &v, Some(cur), &mut b, &Scene::default());
+        draw_full(&mut r, &t, &v, Some(cur), &mut b, &Scene::default());
         let measured = r.0.iter().filter(|c| c.starts_with("measure")).count();
         assert_eq!(measured, 2, "two lines, measured on the first draw only");
         let texts: Vec<&String> = r.0.iter().filter(|c| c.starts_with("text")).collect();
@@ -397,10 +429,34 @@ mod tests {
         b.forget("gone");
         assert_eq!(b.len(), 1, "forget drops one box; an unknown id is a no-op");
         let mut r = Rec::default();
-        draw_full(&mut r, &t, &v, Some(cur), &mut b);
+        draw_full(&mut r, &t, &v, Some(cur), &mut b, &Scene::default());
         assert!(!r.0.iter().any(|c| c.starts_with("measure")), "t kept its box");
         b.clear();
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn two_crossing_connectors_draw_exactly_one_hop() {
+        use crate::shape::Shape;
+        let sh = |v: serde_json::Value| Shape::from_value(&v);
+        let mk = |id: &str, pts: Vec<f64>, v| Item { sh: sh(v), ..stroke(id, pts) };
+        let a = mk("A", vec![0.1, 0.1, 0.5, 0.2, 0.2, 0.5], serde_json::json!({"k": "rect", "n": "nA"}));
+        let b = mk("B", vec![0.8, 0.1, 0.5, 0.9, 0.2, 0.5], serde_json::json!({"k": "ellipse", "n": "nB"}));
+        let c = mk("C", vec![0.1, 0.4, 0.5, 0.2, 0.5, 0.5], serde_json::json!({"k": "tri", "n": "nC"}));
+        let d = mk("D", vec![0.8, 0.4, 0.5, 0.9, 0.5, 0.5], serde_json::json!({"k": "rect", "n": "nD", "f": true}));
+        // A's right to D's left, and C's right to B's left: an X between the four shapes
+        let ad = mk("ad", vec![0.0; 6], serde_json::json!({"k": "line", "a": {"n": "nA", "s": 1, "t": 0.5}, "b": {"n": "nD", "s": 3, "t": 0.5}}));
+        let cb = mk("cb", vec![0.0; 6], serde_json::json!({"k": "line", "a": {"n": "nC", "s": 1, "t": 0.5}, "b": {"n": "nB", "s": 3, "t": 0.5}}));
+        let items = [a, b, c, d, ad, cb];
+        let scene = Scene::build(&items, |_| false);
+        let v = view();
+        let mut r = Rec::default();
+        for it in &items {
+            draw_full(&mut r, it, &v, Some(v.cur()), &mut Bounds::default(), &scene);
+        }
+        assert_eq!(r.0.iter().filter(|c| c.starts_with("Arc")).count(), 1, "{:#?}", r.0);
+        assert_eq!(r.0.iter().filter(|c| c.starts_with("Ellipse")).count(), 1);
+        assert_eq!(r.0.iter().filter(|c| *c == "Fill").count(), 1 + 2, "the filled box and two heads");
     }
 
     #[test]

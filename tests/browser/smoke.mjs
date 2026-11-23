@@ -70,6 +70,7 @@ try {
   // share
   await p.click('#shareBtn'); await sleep(300);
   await p.click('#shareNow').catch(e => errs.push('shareNow click: ' + e.message));
+  await p.click('#shareGo').catch(e => errs.push('shareGo click: ' + e.message));
   await p.waitForURL(/\/b\//, { timeout: 8000 }).catch(() => {});
   const url = p.url();
   ok('share moves to /b/<key>', /\/b\/[A-Za-z0-9_-]{8,}/.test(url), url.replace(/\/b\/.*/, '/b/<key>'));

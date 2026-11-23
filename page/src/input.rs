@@ -11,7 +11,9 @@
 
 use crate::geom::{self, r5, ERASER_COLOR, ERASER_SCALE, EPS, LINE_HEIGHT, TEXT_SCALE};
 use crate::model::Board;
+use crate::geom::Op;
 use crate::proto::{Item, Layer, Out};
+use crate::shape::{self, Anchor, BoxKind, Heads, Hover, Node, Scene, Shape};
 use crate::view::{clamp, js_round, View, MAX_ZOOM, WH, WY};
 use indexmap::IndexMap;
 
@@ -34,6 +36,10 @@ pub enum Tool {
     Text,
     Move,
     Ping,
+    /// Drag out a shape; drag one of mine to move it.
+    Shape(BoxKind),
+    /// Drag a straight line; an end dropped on a shape attaches to it.
+    Line,
 }
 
 /// One pointer event, or one of its coalesced samples. `x`, `y` are client px.
@@ -59,6 +65,10 @@ pub struct Pen {
     pub color: Option<String>,
     pub my_color: Option<String>,
     pub width: f64,
+    /// New shapes are filled, not outlined.
+    pub fill: bool,
+    /// Which ends of a new line carry an arrowhead.
+    pub heads: Heads,
 }
 
 /// The socket as input sees it.
@@ -113,6 +123,44 @@ pub trait Host {
     fn editor_text(&self) -> String;
     /// Hide, empty and blur the text box.
     fn editor_hide(&mut self);
+    /// Where every visible shape and line is (rebuilt when the board changes).
+    fn scene(&mut self) -> &Scene;
+    /// Show `o` over the live canvas until the next call; `None` clears it.
+    fn overlay(&mut self, o: Option<Overlay>);
+}
+
+/// What the page draws over the live canvas during a shape gesture: ghosts of the result, and
+/// the anchors a line end can attach to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Overlay {
+    /// Each ghost's colour and ops (board px), drawn at half opacity.
+    pub ghosts: Vec<(String, Vec<Op>)>,
+    /// Anchor dots, board units; `true` for the one a release would attach to.
+    pub dots: Vec<(f64, f64, bool)>,
+}
+
+/// One end of a line being drawn: where it is, and the anchor it is on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct End {
+    pub x: f64,
+    pub y: f64,
+    pub at: Option<Anchor>,
+}
+
+/// A shape gesture in progress (board units).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Gest {
+    NewBox { pointer: i32, kind: BoxKind, x0: f64, y0: f64, x1: f64, y1: f64 },
+    MoveBox { pointer: i32, old: Item, sx: f64, sy: f64, dx: f64, dy: f64 },
+    Line { pointer: i32, a: End, b: End },
+}
+
+impl Gest {
+    fn pointer(&self) -> i32 {
+        match self {
+            Gest::NewBox { pointer, .. } | Gest::MoveBox { pointer, .. } | Gest::Line { pointer, .. } => *pointer,
+        }
+    }
 }
 
 /// The stroke being drawn here.
@@ -173,6 +221,11 @@ pub struct Input {
     gesture_zoom: f64,
     last_touch_at: f64,
     pub editor: Option<Editor>,
+    pub gest: Option<Gest>,
+    /// The progressive anchors under a line end.
+    pub hover: Hover,
+    /// An overlay is showing.
+    shown: bool,
 }
 
 impl Default for Input {
@@ -190,6 +243,9 @@ impl Default for Input {
             gesture_zoom: 1.0,
             last_touch_at: -1e9,
             editor: None,
+            gest: None,
+            hover: Hover::default(),
+            shown: false,
         }
     }
 }
@@ -346,6 +402,10 @@ impl Input {
             self.text_tap = Some(e.id);
             return true;
         }
+        if matches!(pen.tool, Tool::Shape(_) | Tool::Line) {
+            self.shape_down(h, e, &pen);
+            return true;
+        }
         // Button 5 / buttons bit 32 is the eraser end of a pen.
         let pen_eraser = t == Kind::Pen && (e.button == 5 || e.buttons & 32 != 0);
         let ping = pen.tool == Tool::Ping && !pen_eraser;
@@ -411,6 +471,13 @@ impl Input {
                 return;
             }
         }
+        if self.gest.as_ref().is_some_and(|g| g.pointer() == e.id) {
+            self.shape_move(h, e);
+            return;
+        }
+        if self.cur.is_none() && self.gest.is_none() {
+            self.line_hover(h, e);
+        }
         if self.cur.as_ref().is_none_or(|c| c.pointer != e.id) {
             return;
         }
@@ -458,7 +525,7 @@ impl Input {
         }
         // Zoomed in, detail is finer: tighten the tolerance to match.
         let pts = geom::simplify(&if touch { geom::steady(&s.pts, bw * zoom) } else { s.pts }, eps);
-        let f = Item { id: id.clone(), l: h.pen().me, q: None, c: s.c, w: s.w, pts, txt: None };
+        let f = Item { id: id.clone(), l: h.pen().me, q: None, c: s.c, w: s.w, pts, txt: None, sh: None };
         h.insert_stroke(f.clone());
         h.redraw_live();
         h.board().pending.insert(id.clone(), f.clone());
@@ -468,7 +535,7 @@ impl Input {
         if sent {
             h.send(Out::End { id, c: f.c, w: f.w, pts: f.pts });
         } else if online_ready(h) {
-            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: None });
+            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: None, sh: None });
         }
     }
 
@@ -493,6 +560,10 @@ impl Input {
             }
             return;
         }
+        if self.gest.as_ref().is_some_and(|g| g.pointer() == e.id) {
+            self.shape_end(h, up);
+            return;
+        }
         self.end_stroke(h, e.id);
     }
 
@@ -506,6 +577,7 @@ impl Input {
         self.pinch = None;
         self.drag = None;
         self.text_tap = None;
+        self.cancel_shape(h);
         h.settle_view();
     }
 
@@ -595,12 +667,12 @@ impl Input {
             return;
         }
         let id = h.new_id();
-        let f = Item { id: id.clone(), l: me, q: None, c: ed.c, w: r5(ed.w), pts: vec![r5(ed.x), r5(ed.y), 0.5], txt: Some(txt) };
+        let f = Item { id: id.clone(), l: me, q: None, c: ed.c, w: r5(ed.w), pts: vec![r5(ed.x), r5(ed.y), 0.5], txt: Some(txt), sh: None };
         h.insert_stroke(f.clone());
         h.board().pending.insert(id.clone(), f.clone());
         h.mine().push(id.clone());
         if online_ready(h) {
-            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: f.txt });
+            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: f.txt, sh: None });
         }
     }
 
@@ -667,6 +739,232 @@ impl Input {
     /// `keyup` of Space, or the window losing focus.
     pub fn space_up(&mut self) {
         self.space_down = false;
+    }
+}
+
+// ---- shapes and lines (A-166) --------------------------------------------------------------
+// A shape is an item whose two points are its box corners; a line is one whose two points are
+// its ends. Both go out as one `s` frame when the drag ends, like a text annotation.
+
+impl Input {
+    /// The pointer as a board point.
+    fn board_at(h: &impl Host, e: &Ptr) -> (f64, f64) {
+        let rect = h.rect();
+        h.view().board_point(e.x - rect.0, e.y - rect.1)
+    }
+
+    /// Board units per screen px.
+    fn per_px(h: &impl Host) -> f64 {
+        let v = h.view();
+        1.0 / (v.bw * v.zoom)
+    }
+
+    /// A line end at `(x, y)`: on the anchor it snaps to, if any (never on `except`, the
+    /// node the other end is on), with the dots of the shape it is near.
+    fn end_at(&mut self, h: &mut impl Host, x: f64, y: f64, except: Option<&str>) -> (End, Vec<(f64, f64, bool)>) {
+        let (px, now) = (Self::per_px(h), h.now());
+        let Some((n, nd)) = h.scene().top_node(x, y, shape::NEAR_PX * px, except).map(|(n, nd)| (n.to_string(), *nd)) else {
+            self.hover.step(None, None, now);
+            return (End { x, y, at: None }, vec![]);
+        };
+        let (sp, ssp) = (shape::SNAP_PX * px, shape::SUB_SNAP_PX * px);
+        let resting = shape::snap(&nd, self.hover.side_of(&n), x, y, sp, ssp, false);
+        self.hover.step(Some(&n), resting, now);
+        let exp = self.hover.side_of(&n);
+        let on = shape::snap(&nd, exp, x, y, sp, ssp, true);
+        let dots = shape::anchors(&nd, exp).into_iter().map(|(s, t, (ax, ay))| (ax, ay, on == Some((s, t)))).collect();
+        let end = match on {
+            Some((s, t)) => {
+                let (ax, ay) = shape::anchor_point(nd.kind, &nd.bb, s, t);
+                End { x: ax, y: ay, at: Some(Anchor { n, s, t: shape::round_t(t) }) }
+            }
+            None => End { x, y, at: None },
+        };
+        (end, dots)
+    }
+
+    fn show(&mut self, h: &mut impl Host, o: Option<Overlay>) {
+        if o.is_none() && !self.shown {
+            return;
+        }
+        self.shown = o.is_some();
+        h.overlay(o);
+    }
+
+    /// The line tool over the board with nothing pressed: the anchors of the shape it is near.
+    fn line_hover(&mut self, h: &mut impl Host, e: &Ptr) {
+        let pen = h.pen();
+        if pen.tool != Tool::Line || viewer(&pen) || e.kind == Kind::Touch {
+            return self.show(h, None);
+        }
+        let (x, y) = Self::board_at(h, e);
+        let (_, dots) = self.end_at(h, x, y, None);
+        self.show(h, (!dots.is_empty()).then(|| Overlay { ghosts: vec![], dots }));
+    }
+
+    fn shape_down(&mut self, h: &mut impl Host, e: &Ptr, pen: &Pen) {
+        let (x, y) = Self::board_at(h, e);
+        let pointer = e.id;
+        match pen.tool {
+            Tool::Line => {
+                let (a, dots) = self.end_at(h, x, y, None);
+                self.gest = Some(Gest::Line { pointer, a: a.clone(), b: a });
+                self.show(h, Some(Overlay { ghosts: vec![], dots }));
+            }
+            Tool::Shape(kind) => {
+                let m = 4.0 * Self::per_px(h);
+                let me = pen.me;
+                let mut hit = None;
+                for s in h.board().strokes.iter().rev() {
+                    if s.l != me || !matches!(s.sh, Some(Shape::Box { .. })) {
+                        continue;
+                    }
+                    if let Some([x0, y0, x1, y1]) = shape::norm_box(&s.pts) {
+                        if x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m {
+                            hit = Some(s.clone());
+                            break;
+                        }
+                    }
+                }
+                self.gest = Some(match hit.filter(|s| !h.hidden(s.l)) {
+                    Some(old) => Gest::MoveBox { pointer, old, sx: x, sy: y, dx: 0.0, dy: 0.0 },
+                    None => Gest::NewBox { pointer, kind, x0: x, y0: y, x1: x, y1: y },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn shape_move(&mut self, h: &mut impl Host, e: &Ptr) {
+        let (x, y) = Self::board_at(h, e);
+        let Some(mut g) = self.gest.take() else { return };
+        let pen = h.pen();
+        let bw = h.view().bw;
+        let w = h.view().pen_w(pen.width);
+        let c = pen.color.clone().unwrap_or_default();
+        let o = match &mut g {
+            Gest::NewBox { kind, x0, y0, x1, y1, .. } => {
+                (*x1, *y1) = (x, y);
+                let bb = [x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)];
+                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, w, bw))], dots: vec![] }
+            }
+            Gest::MoveBox { old, sx, sy, dx, dy, .. } => {
+                (*dx, *dy) = (x - *sx, y - *sy);
+                self.move_ghost(h, old, *dx, *dy)
+            }
+            Gest::Line { a, b, .. } => {
+                let except = a.at.as_ref().map(|e| e.n.clone());
+                let (end, dots) = self.end_at(h, x, y, except.as_deref());
+                *b = end;
+                let ops = shape::line_ops(&[a.x, a.y, b.x, b.y], w, pen.heads, &[], bw);
+                Overlay { ghosts: vec![(c, ops)], dots }
+            }
+        };
+        self.gest = Some(g);
+        self.show(h, Some(o));
+    }
+
+    /// The moved box and every line on it, where they would be.
+    fn move_ghost(&self, h: &mut impl Host, old: &Item, dx: f64, dy: f64) -> Overlay {
+        let bw = h.view().bw;
+        let Some(Shape::Box { kind, fill, n }) = &old.sh else { return Overlay::default() };
+        let Some([x0, y0, x1, y1]) = shape::norm_box(&old.pts) else { return Overlay::default() };
+        let nd = Node { kind: *kind, bb: [x0 + dx, y0 + dy, x1 + dx, y1 + dy] };
+        let mut ghosts = vec![(old.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, old.w, bw))];
+        let lines: Vec<Item> = h
+            .board()
+            .strokes
+            .iter()
+            .filter(|s| s.sh.as_ref().is_some_and(|sh| sh.touches(n)))
+            .cloned()
+            .collect();
+        for it in lines {
+            if h.hidden(it.l) {
+                continue;
+            }
+            if let Some(seg) = h.scene().resolve_with(&it, Some((n, &nd))) {
+                ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], bw)));
+            }
+        }
+        Overlay { ghosts, dots: vec![] }
+    }
+
+    fn shape_end(&mut self, h: &mut impl Host, up: bool) {
+        let g = self.gest.take();
+        self.hover = Hover::default();
+        self.show(h, None);
+        let (Some(g), true) = (g, up) else { return };
+        let pen = h.pen();
+        let px = Self::per_px(h);
+        let w = h.view().pen_w(pen.width);
+        let c = pen.color.clone().unwrap_or_default();
+        let pt = |x: f64, y: f64| [r5(x), r5(y), 0.5];
+        match g {
+            Gest::NewBox { kind, x0, y0, x1, y1, .. } => {
+                if (x1 - x0).abs().max((y1 - y0).abs()) < 4.0 * px {
+                    return; // a click, not a drag
+                }
+                let n = h.new_id();
+                let pts = [pt(x0, y0), pt(x1, y1)].concat();
+                self.commit(h, c, w, pts, Shape::Box { kind, fill: pen.fill, n });
+            }
+            Gest::MoveBox { old, dx, dy, .. } => {
+                if dx.abs().max(dy.abs()) < 2.0 * px || old.pts.len() < 6 {
+                    return;
+                }
+                let pts = [pt(old.pts[0] + dx, old.pts[1] + dy), pt(old.pts[3] + dx, old.pts[4] + dy)].concat();
+                let Some(sh) = old.sh.clone() else { return };
+                self.retire(h, &old.id);
+                self.commit(h, old.c.clone(), old.w, pts, sh);
+            }
+            Gest::Line { a, b, .. } => {
+                if (b.x - a.x).hypot(b.y - a.y) < 4.0 * px {
+                    return;
+                }
+                let pts = [pt(a.x, a.y), pt(b.x, b.y)].concat();
+                // the relay refuses a line with both ends on one shape (end_at never makes one)
+                let bt = b.at.filter(|bt| a.at.as_ref().is_none_or(|at| at.n != bt.n));
+                self.commit(h, c, w, pts, Shape::Line { h: pen.heads, a: a.at, b: bt });
+            }
+        }
+    }
+
+    /// My old item leaves the board, as an undo (a moved shape is replaced).
+    fn retire(&mut self, h: &mut impl Host, id: &str) {
+        if h.board().has(id) {
+            h.remove_stroke(id);
+        }
+        h.board().pending.shift_remove(id);
+        h.mine().retain(|m| m != id);
+        if online_ready(h) {
+            h.send(Out::Undo { id: id.to_string() });
+        } else if !h.net().local {
+            h.board().undo_queue.push(id.to_string());
+        }
+    }
+
+    /// A finished shape or line on my layer, sent as one `s`.
+    fn commit(&mut self, h: &mut impl Host, c: String, w: f64, pts: Vec<f64>, sh: Shape) {
+        let me = h.pen().me;
+        if me.is_none() {
+            return;
+        }
+        let id = h.new_id();
+        let f = Item { id: id.clone(), l: me, q: None, c, w, pts, txt: None, sh: Some(sh) };
+        h.insert_stroke(f.clone());
+        h.board().pending.insert(id.clone(), f.clone());
+        h.mine().push(id.clone());
+        if online_ready(h) {
+            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: None, sh: f.sh });
+        }
+        h.save_local();
+    }
+
+    /// Escape, a tool change or the page hiding: drop the gesture and its overlay.
+    pub fn cancel_shape(&mut self, h: &mut impl Host) {
+        self.gest = None;
+        self.hover = Hover::default();
+        self.show(h, None);
     }
 }
 
@@ -789,6 +1087,8 @@ mod tests {
         sent: Vec<Out>,
         text: String,
         hidden: Vec<Layer>,
+        scene: Scene,
+        over: Option<Overlay>,
     }
 
     impl Rec {
@@ -799,7 +1099,7 @@ mod tests {
                 board: Board::default(),
                 view,
                 mine: vec![],
-                pen: Pen { edit: true, me: Some(1), tool: Tool::Pen, color: Some("#111111".into()), my_color: Some("#abcdef".into()), width: 0.004 },
+                pen: Pen { edit: true, me: Some(1), tool: Tool::Pen, color: Some("#111111".into()), my_color: Some("#abcdef".into()), width: 0.004, fill: false, heads: Heads::End },
                 net: Net { online: true, ready: true, local: false },
                 now: 10_000.0,
                 ids: 0,
@@ -807,6 +1107,8 @@ mod tests {
                 sent: vec![],
                 text: String::new(),
                 hidden: vec![],
+                scene: Scene::default(),
+                over: None,
             }
         }
         fn frames(&self) -> Vec<String> {
@@ -903,6 +1205,15 @@ mod tests {
         fn editor_hide(&mut self) {
             self.text.clear();
             self.log.push("editor_hide".into());
+        }
+        fn scene(&mut self) -> &Scene {
+            let hidden = self.hidden.clone();
+            self.scene = Scene::build(&self.board.strokes, |s| s.l.is_some_and(|l| hidden.contains(&l)));
+            &self.scene
+        }
+        fn overlay(&mut self, o: Option<Overlay>) {
+            self.log.push(format!("overlay {}", o.as_ref().map_or("off".into(), |o| format!("{} ghosts {} dots", o.ghosts.len(), o.dots.len()))));
+            self.over = o;
         }
     }
 
@@ -1136,7 +1447,7 @@ mod tests {
         h.pen.tool = Tool::Text;
         let (x, y) = h.view.board_point(200.0, 200.0);
         for (id, l) in [("other", 2), ("mine", 1)] {
-            h.board.insert(Item { id: id.into(), l: Some(l), q: Some(1.0), c: "#111111".into(), w: 0.02, pts: vec![x - 0.001, y - 0.001, 0.5], txt: Some("t".into()) });
+            h.board.insert(Item { id: id.into(), l: Some(l), q: Some(1.0), c: "#111111".into(), w: 0.02, pts: vec![x - 0.001, y - 0.001, 0.5], txt: Some("t".into()), sh: None });
         }
         h.hidden = vec![1];
         i.down(&mut h, &mouse(200.0, 200.0));
@@ -1155,7 +1466,7 @@ mod tests {
         let (mut h, mut i) = (Rec::new(), Input::default());
         h.pen.tool = Tool::Text;
         let (x, _) = h.view.board_point(200.0, 200.0);
-        h.board.insert(Item { id: "short".into(), l: Some(1), q: Some(1.0), c: "#111111".into(), w: 10.0, pts: vec![x - 0.001], txt: Some("t".into()) });
+        h.board.insert(Item { id: "short".into(), l: Some(1), q: Some(1.0), c: "#111111".into(), w: 10.0, pts: vec![x - 0.001], txt: Some("t".into()), sh: None });
         i.down(&mut h, &mouse(200.0, 200.0));
         i.end(&mut h, &mouse(200.0, 200.0), true);
         let ed = i.editor.as_ref().unwrap();
@@ -1271,4 +1582,142 @@ mod tests {
         assert_eq!((l, t, px), ((0.5 - v.pan_x) * k, (0.1 - v.pan_y) * k, 0.02 * k));
         assert_eq!(w, 60f64.max((2.0 - v.pan_x) * k - l - 2.0));
     }
+
+    // ---- shapes and lines (A-166) ----
+
+    /// The pointer at board point `(bx, by)`.
+    fn at(h: &Rec, bx: f64, by: f64) -> Ptr {
+        let v = &h.view;
+        let k = v.bw * v.zoom;
+        mouse((bx - v.pan_x) * k, (by - v.pan_y) * k)
+    }
+
+    fn drag(h: &mut Rec, i: &mut Input, from: (f64, f64), to: (f64, f64)) {
+        let p = at(h, from.0, from.1);
+        i.down(h, &p);
+        let p = at(h, (from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+        i.moved(h, &p, &[]);
+        let p = at(h, to.0, to.1);
+        i.moved(h, &p, &[]);
+        i.end(h, &p, true);
+    }
+
+    fn sh_of(o: &Out) -> Option<Shape> {
+        match o {
+            Out::Stroke { sh, .. } => sh.clone(),
+            _ => None,
+        }
+    }
+
+    /// A board point well inside the visible paper.
+    fn mid(h: &Rec) -> (f64, f64) {
+        let v = &h.view;
+        (v.pan_x + v.vis_w(v.zoom) / 2.0, v.pan_y + v.vis_h(v.zoom) / 2.0)
+    }
+
+    #[test]
+    fn a_shape_is_dragged_out_and_sent_as_one_s() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.pen.tool = Tool::Shape(BoxKind::Ellipse);
+        h.pen.fill = true;
+        drag(&mut h, &mut i, (x, y), (x + 0.1, y + 0.05));
+        assert_eq!(h.sent.len(), 1, "{:?}", h.frames());
+        let Some(Shape::Box { kind: BoxKind::Ellipse, fill: true, n }) = sh_of(&h.sent[0]) else { panic!("{:?}", h.frames()) };
+        assert!(!n.is_empty());
+        assert!(h.log.iter().any(|l| l == "overlay 1 ghosts 0 dots"), "a ghost while dragging");
+        assert_eq!(h.log.last().map(String::as_str), Some("save_local"));
+        assert_eq!(h.over, None, "the ghost goes on release");
+        assert_eq!(h.mine.len(), 1);
+        // a click without a drag makes nothing
+        drag(&mut h, &mut i, (x + 0.3, y), (x + 0.3, y));
+        assert_eq!(h.sent.len(), 1);
+    }
+
+    #[test]
+    fn my_shape_moves_as_an_undo_and_a_new_item_with_the_same_node() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        drag(&mut h, &mut i, (x, y), (x + 0.1, y + 0.1));
+        let first = h.mine[0].clone();
+        let Some(Shape::Box { n, .. }) = sh_of(&h.sent[0]) else { panic!() };
+        // a line from it to free space, then drag the shape (any shape tool grabs mine)
+        h.pen.tool = Tool::Line;
+        drag(&mut h, &mut i, (x + 0.05, y + 0.05), (x + 0.4, y + 0.05));
+        let Some(Shape::Line { a: Some(a), b: None, .. }) = sh_of(&h.sent[1]) else { panic!("{:?}", h.frames()) };
+        assert_eq!(a.n, n);
+        h.pen.tool = Tool::Shape(BoxKind::Tri);
+        let p = at(&h, x + 0.05, y + 0.05);
+        i.down(&mut h, &p);
+        let p = at(&h, x + 0.15, y + 0.25);
+        i.moved(&mut h, &p, &[]);
+        assert_eq!(h.over.as_ref().map(|o| o.ghosts.len()), Some(2), "the shape and its line");
+        i.end(&mut h, &p, true);
+        assert_eq!(h.sent[2], Out::Undo { id: first.clone() });
+        let Some(Shape::Box { kind: BoxKind::Rect, n: n2, .. }) = sh_of(&h.sent[3]) else { panic!("{:?}", h.frames()) };
+        assert_eq!(n2, n, "same node, so the line follows");
+        assert!(!h.board.has(&first) && !h.mine.contains(&first));
+        let line = h.mine[0].clone();
+        let seg = h.scene().seg(&line).unwrap().clone();
+        assert!((seg.p[1] - (y + 0.25)).abs() < 1e-4, "the attached end moved down 0.2: {:?}", seg.p);
+        assert!((seg.p[2] - (x + 0.4)).abs() < 1e-4, "the free end stayed");
+    }
+
+    #[test]
+    fn a_line_attaches_both_ends_and_a_dropped_end_in_space_is_free() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        drag(&mut h, &mut i, (x, y), (x + 0.1, y + 0.1));
+        drag(&mut h, &mut i, (x + 0.3, y), (x + 0.4, y + 0.1));
+        let nodes: Vec<String> = h.sent.iter().filter_map(sh_of).filter_map(|s| s.node().map(String::from)).collect();
+        h.pen.tool = Tool::Line;
+        h.pen.heads = Heads::Both;
+        // inside each shape, nearer the facing sides
+        drag(&mut h, &mut i, (x + 0.09, y + 0.05), (x + 0.31, y + 0.05));
+        let Some(Shape::Line { h: Heads::Both, a: Some(a), b: Some(b) }) = sh_of(&h.sent[2]) else { panic!("{:?}", h.frames()) };
+        assert_eq!((a.n.as_str(), a.s, a.t), (nodes[0].as_str(), 1, 0.5));
+        assert_eq!((b.n.as_str(), b.s, b.t), (nodes[1].as_str(), 3, 0.5));
+        // detached: an end dropped away from any shape keeps its drawn point
+        drag(&mut h, &mut i, (x + 0.05, y + 0.09), (x + 0.05, y + 0.4));
+        let Some(Shape::Line { a: Some(_), b: None, .. }) = sh_of(&h.sent[3]) else { panic!("{:?}", h.frames()) };
+        // both ends on one shape is never made: the second end stays free
+        drag(&mut h, &mut i, (x + 0.01, y + 0.05), (x + 0.099, y + 0.05));
+        let Some(Shape::Line { a: Some(_), b: None, .. }) = sh_of(&h.sent[4]) else { panic!("{:?}", h.frames()) };
+    }
+
+    #[test]
+    fn resting_on_an_anchor_expands_the_side_and_a_sub_anchor_survives_the_wire() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        drag(&mut h, &mut i, (x, y), (x + 0.2, y + 0.2));
+        drag(&mut h, &mut i, (x + 0.5, y), (x + 0.6, y + 0.2));
+        h.pen.tool = Tool::Line;
+        let p = at(&h, x + 0.02, y + 0.1);
+        i.down(&mut h, &p);
+        // rest on the second shape's left middle
+        let p = at(&h, x + 0.5, y + 0.1);
+        i.moved(&mut h, &p, &[]);
+        assert_eq!(h.over.as_ref().unwrap().dots.len(), 4);
+        h.now += 1700.0;
+        i.moved(&mut h, &p, &[]);
+        // move off it, along the edge: the side expands into 15 sub-anchors
+        h.now += 50.0;
+        let p = at(&h, x + 0.5, y + 0.0375); // t = 0.8125 on the left side (it runs bottom to top)
+        i.moved(&mut h, &p, &[]);
+        assert_eq!(h.over.as_ref().unwrap().dots.len(), 3 + 15);
+        i.end(&mut h, &p, true);
+        let Some(Shape::Line { b: Some(b), .. }) = sh_of(&h.sent[2]) else { panic!("{:?}", h.frames()) };
+        assert_eq!((b.s, b.t), (3, 0.8125));
+        // the frame as another browser gets it back from the relay
+        let f = h.sent[2].frame().replacen(r#""t":"s""#, r#""t":"e","q":3,"l":1"#, 1);
+        let Some(crate::proto::In::End(it)) = crate::proto::In::parse(&f) else { panic!("{f}") };
+        assert_eq!(it.sh, sh_of(&h.sent[2]));
+        let sc = Scene::build([&h.board.strokes[0], &h.board.strokes[1], &it], |_| false);
+        let seg = sc.seg(&it.id).unwrap();
+        assert!((seg.p[3] - (y + 0.0375)).abs() < 1e-9, "{:?}", seg.p);
+    }
+
 }

@@ -27,10 +27,12 @@
   <button type="button" id="eraser" class="tools" title="Eraser" aria-label="Eraser" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 19.5l-4.6-4.6a1.6 1.6 0 0 1 0-2.3l8.7-8.7a1.6 1.6 0 0 1 2.3 0l5.2 5.2a1.6 1.6 0 0 1 0 2.3L12 19.5H8.5z"/><path d="M8.3 8.2l7.5 7.5"/><path d="M12 19.5h8.5"/></svg></button>
   <button type="button" id="textBtn" class="tools" title="Text" aria-label="Text annotation" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6V4h14v2"/><path d="M12 4v16"/><path d="M9 20h6"/></svg></button>
   <button type="button" id="pingBtn" class="tools act-ping" title="Ping: circle something to point it out. It glows for everyone and is not kept." aria-label="Ping: circle an area to point it out" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2.5"/><path d="M6.3 6.3a8 8 0 0 0 0 11.4"/><path d="M17.7 6.3a8 8 0 0 1 0 11.4"/></svg></button>
+  <button type="button" id="shapeBtn" class="tools" title="Shapes" aria-label="Shapes: square, circle, triangle, arrow" aria-haspopup="menu" aria-expanded="false" aria-controls="shapeMenu" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="1"/></svg></button>
   <span class="sep tools"></span>
-  <button type="button" class="tools" data-w="0.002" aria-label="Small pen" aria-pressed="false">S</button>
-  <button type="button" class="tools on" data-w="0.004" aria-label="Medium pen" aria-pressed="true">M</button>
-  <button type="button" class="tools" data-w="0.009" aria-label="Large pen" aria-pressed="false">L</button>
+  <button type="button" class="tools" data-w="0.002" title="Small" aria-label="Small pen" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+  <button type="button" class="tools on" data-w="0.004" title="Medium" aria-label="Medium pen" aria-pressed="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+  <button type="button" class="tools" data-w="0.009" title="Large" aria-label="Large pen" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+  <button type="button" id="headBtn" class="tools" title="Arrowheads for lines and arrows" aria-label="Arrowheads" aria-haspopup="menu" aria-expanded="false" aria-controls="headMenu"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h16"/><path d="M15 7l5 5-5 5"/></svg></button>
   <span class="sep tools"></span>
   <button type="button" id="undo" class="tools act-undo" title="Undo" aria-label="Undo my last stroke"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg></button>
   <button type="button" id="crumpleBtn" class="tools act-bin" title="Crumple: wipe the board and keep it on the shelf" aria-label="Crumple this board: wipe it and put it on the shelf"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>
@@ -104,6 +106,25 @@
   </div>
   <ul id="whoList"></ul>
 </section>
+<div id="shapeMenu" class="menu" role="menu" aria-label="Shapes" hidden>
+  <button type="button" role="menuitemradio" data-shape="rect" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="1"/></svg><span>Square</span></button>
+  <button type="button" role="menuitemradio" data-shape="ellipse" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg><span>Circle</span></button>
+  <button type="button" role="menuitemradio" data-shape="tri" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l8 15H4z"/></svg><span>Triangle</span></button>
+  <button type="button" role="menuitemradio" data-shape="line" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19L19 5"/><path d="M11 5h8v8"/></svg><span>Arrow</span></button>
+  <button type="button" role="menuitemcheckbox" id="fillBtn" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg><span>Filled</span></button>
+</div>
+<div id="headMenu" class="menu" role="menu" aria-label="Arrowheads" hidden>
+  <button type="button" role="menuitemradio" data-head="none" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h16"/></svg><span>None</span></button>
+  <button type="button" role="menuitemradio" data-head="end" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h16"/><path d="M15 7l5 5-5 5"/></svg><span>End</span></button>
+  <button type="button" role="menuitemradio" data-head="start" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h16"/><path d="M9 7l-5 5 5 5"/></svg><span>Start</span></button>
+  <button type="button" role="menuitemradio" data-head="both" aria-checked="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h16"/><path d="M15 7l5 5-5 5"/><path d="M9 7l-5 5 5 5"/></svg><span>Both</span></button>
+</div>
+<div id="shareAsk" class="modal" hidden>
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="shareAskText">
+    <p id="shareAskText">Sharing connects this board to the relay server outside this browser, and anyone with the link can see and edit it.</p>
+    <div class="row"><button type="button" id="shareCancel">Cancel</button><button type="button" id="shareGo" class="act-share">Share</button></div>
+  </div>
+</div>
 <div id="nav" aria-label="Where you are on the board. Tap or drag to move." hidden><div id="navBox"></div></div>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 <div id="msg" role="alert" hidden></div>

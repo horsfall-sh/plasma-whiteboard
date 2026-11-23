@@ -6,6 +6,7 @@
 //! wrote them, and through [`crate::json`], so the bytes on the wire are unchanged.
 
 use crate::json::J;
+use crate::shape::Shape;
 use serde_json::Value;
 
 /// A layer number. The relay numbers layers from 1.
@@ -22,6 +23,8 @@ pub struct Item {
     pub w: f64,
     pub pts: Vec<f64>,
     pub txt: Option<String>,
+    /// A shape or line (A-166, `sh`); never with `txt`.
+    pub sh: Option<Shape>,
 }
 
 impl Item {
@@ -35,6 +38,7 @@ impl Item {
             w: m.get("w").and_then(Value::as_f64).unwrap_or(0.0),
             pts: nums(m.get("pts")).unwrap_or_default(),
             txt: str_of(m, "txt"),
+            sh: m.get("sh").and_then(Shape::from_value),
         })
     }
 
@@ -55,7 +59,15 @@ impl Item {
         if let Some(t) = &self.txt {
             f.push(("txt", J::str(t)));
         }
+        if let Some(sh) = &self.sh {
+            f.push(("sh", sh.to_json()));
+        }
         J::obj(f)
+    }
+
+    /// Whether this is a shape or a line.
+    pub fn is_shape(&self) -> bool {
+        self.sh.is_some()
     }
 }
 
@@ -201,7 +213,7 @@ pub enum Out {
     Begin { id: String, c: String, w: f64 },
     Points { id: String, pts: Vec<f64> },
     End { id: String, c: String, w: f64, pts: Vec<f64> },
-    Stroke { id: String, c: String, w: f64, pts: Vec<f64>, txt: Option<String> },
+    Stroke { id: String, c: String, w: f64, pts: Vec<f64>, txt: Option<String>, sh: Option<Shape> },
     Undo { id: String },
     LayerDelete { l: Layer },
     LayerRestore { l: Layer },
@@ -230,11 +242,14 @@ impl Out {
                 ("w", J::Num(*w)),
                 ("pts", J::nums(pts)),
             ]),
-            Out::Stroke { id, c, w, pts, txt } => {
+            Out::Stroke { id, c, w, pts, txt, sh } => {
                 let mut f =
                     vec![t("s"), ("id", J::str(id)), ("c", J::str(c)), ("w", J::Num(*w)), ("pts", J::nums(pts))];
                 if let Some(txt) = txt {
                     f.push(("txt", J::str(txt)));
+                }
+                if let Some(sh) = sh {
+                    f.push(("sh", sh.to_json()));
                 }
                 J::obj(f)
             }
@@ -316,11 +331,11 @@ mod tests {
                 r##"{"t":"e","id":"a1","c":"#111111","w":0.024,"pts":[0.12345,-0.5,0.5]}"##,
             ),
             (
-                Out::Stroke { id: s("a1"), c: s("#d63031"), w: 0.002, pts: vec![1.0, 1.0, 0.5], txt: None },
+                Out::Stroke { id: s("a1"), c: s("#d63031"), w: 0.002, pts: vec![1.0, 1.0, 0.5], txt: None, sh: None },
                 r##"{"t":"s","id":"a1","c":"#d63031","w":0.002,"pts":[1,1,0.5]}"##,
             ),
             (
-                Out::Stroke { id: s("t1"), c: s("#d63031"), w: 0.02, pts: vec![0.0, 0.0, 0.5], txt: Some(s("hi\nthere")) },
+                Out::Stroke { id: s("t1"), c: s("#d63031"), w: 0.02, pts: vec![0.0, 0.0, 0.5], txt: Some(s("hi\nthere")), sh: None },
                 r##"{"t":"s","id":"t1","c":"#d63031","w":0.02,"pts":[0,0,0.5],"txt":"hi\nthere"}"##,
             ),
             (Out::Undo { id: s("a1") }, r#"{"t":"u","id":"a1"}"#),
@@ -372,6 +387,7 @@ mod tests {
                 w: 0.004,
                 pts: vec![0.0, 0.0, 0.5, 1.0, 1.0, 0.5],
                 txt: None,
+                sh: None,
             }))
         );
         // a text annotation, and a missing `pts` read as empty
@@ -400,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_stored_item_is_on_layer_one_and_keeps_its_text_only_when_it_has_one() {
-        let mut it = Item { id: "a".into(), l: Some(4), q: Some(9.0), c: "#111111".into(), w: 0.004, pts: vec![0.0, 1.0, 0.5], txt: None };
+        let mut it = Item { id: "a".into(), l: Some(4), q: Some(9.0), c: "#111111".into(), w: 0.004, pts: vec![0.0, 1.0, 0.5], txt: None, sh: None };
         assert_eq!(it.stored().stringify(), r##"{"id":"a","l":1,"c":"#111111","w":0.004,"pts":[0,1,0.5]}"##);
         it.txt = Some("x".into());
         assert_eq!(it.stored().stringify(), r##"{"id":"a","l":1,"c":"#111111","w":0.004,"pts":[0,1,0.5],"txt":"x"}"##);

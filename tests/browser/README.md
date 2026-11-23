@@ -6,6 +6,7 @@ Each script drives the page in a headless browser against a local relay and prin
 - `smoke`: the private board, a share, a second person, crumple and unfold, zoom and undo (Chromium).
 - `panel`: the people panel typed into for real (Firefox).
 - `h2`: a share cut short to a board that has since gone returns to `/` (Firefox).
+- `share`: the share question: focus trapped, Esc and Cancel keep the board local with no relay request, Share connects (Chromium).
 - `g6`: a panic shows the "something broke" card with a Reload link (Firefox and Chromium).
   Remove `std::panic::set_hook` from `start()` in `page/src/web.rs` and it fails.
 

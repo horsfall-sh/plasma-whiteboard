@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0 (unreleased)
+
+Shapes and arrows. The wire protocol gains one optional field on items, `sh` (see PROTOCOL.md).
+Run the new relay with the new page: the relay checks `sh`, stores it, and adds its column to an
+existing database by itself.
+
+- **Shapes:** one toolbar menu holds Square, Circle, Triangle and Arrow. Drag to place a shape,
+  filled or outlined (Filled, in the same menu) in the current colour and thickness. Drag one of
+  your own shapes with the shape tool to move it. Shapes sync like strokes and undo the same way.
+- **Arrows** are straight lines. Drag an end near a shape to see its anchors, one per side; let go
+  on one to attach. Rest on a side for about a second and a half, then move, and it opens into
+  finer anchors along that side. An attached end stays on its spot when either shape moves.
+- **Arrowheads:** None, End, Start or Both, from their own toolbar menu.
+- **Line jumps:** where an arrow crosses an earlier one, it hops over it with a small semicircle
+  that scales with its thickness. Freehand strokes do not hop.
+- **Thickness** is three icons instead of S, M and L. The widths are the same.
+- **Share asks first.** "Share this board" opens a question saying that sharing connects the board
+  to the relay server outside this browser and that anyone with the link can see and edit it.
+  Cancel or Esc keeps the board local, and nothing is sent until Share is pressed.
+
 ## v0.2.0 (unreleased)
 
 The page is now Rust, built to WebAssembly (`page/`). `web/app.js` is gone: `web/boot.js`

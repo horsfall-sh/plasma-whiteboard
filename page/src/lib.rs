@@ -16,6 +16,8 @@ pub mod render;
 pub mod input;
 pub mod net;
 pub mod names;
+pub mod shape;
+pub mod ask;
 #[cfg(target_arch = "wasm32")]
 pub mod fx;
 #[cfg(target_arch = "wasm32")]

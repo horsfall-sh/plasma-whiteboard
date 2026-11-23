@@ -32,6 +32,8 @@ pub struct StrokeRow {
     pub pts: String,
     /// Set for a text annotation; None for a pen stroke.
     pub txt: Option<String>,
+    /// Set for a shape or an arrow: canonical JSON from `room::clean_shape`.
+    pub sh: Option<String>,
     pub state: u8,
     /// 0: the sheet being drawn on. Above 0: a crumpled sheet on the shelf.
     pub sheet: u32,
@@ -113,6 +115,7 @@ enum Cmd {
         width: f64,
         pts: String,
         txt: Option<String>,
+        sh: Option<String>,
     },
     StrokeState {
         board: i64,
@@ -202,6 +205,7 @@ CREATE TABLE IF NOT EXISTS strokes(
   state INTEGER NOT NULL DEFAULT 0,
   txt TEXT,
   sheet INTEGER NOT NULL DEFAULT 0,
+  sh TEXT,
   PRIMARY KEY(board, seq)) WITHOUT ROWID;
 CREATE UNIQUE INDEX IF NOT EXISTS strokes_id ON strokes(board, id);
 ";
@@ -235,6 +239,13 @@ impl Db {
             .exists([])?;
         if !has_sheet {
             conn.execute_batch("ALTER TABLE strokes ADD COLUMN sheet INTEGER NOT NULL DEFAULT 0")?;
+        }
+        // Databases made before shapes lack this one.
+        let has_sh: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('strokes') WHERE name = 'sh'")?
+            .exists([])?;
+        if !has_sh {
+            conn.execute_batch("ALTER TABLE strokes ADD COLUMN sh TEXT")?;
         }
         let page = conn.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))?.max(512) as u64;
         let max_pages = (max_bytes / page).max(1);
@@ -327,10 +338,11 @@ impl Db {
         width: f64,
         pts: String,
         txt: Option<String>,
+        sh: Option<String>,
         ack: Ack,
     ) {
         let board = link.board;
-        self.write(link, Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt }, Some(ack));
+        self.write(link, Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt, sh }, Some(ack));
     }
 
     pub fn stroke_state(&self, link: &Arc<Link>, id: String, state: u8) {
@@ -437,7 +449,7 @@ fn load(conn: &Connection, board: i64) -> rusqlite::Result<Loaded> {
         out.layers.push(row?);
     }
     let mut q = conn.prepare_cached(
-        "SELECT seq, id, layer, color, width, pts, state, txt, sheet FROM strokes WHERE board = ? ORDER BY seq",
+        "SELECT seq, id, layer, color, width, pts, state, txt, sheet, sh FROM strokes WHERE board = ? ORDER BY seq",
     )?;
     let rows = q.query_map(params![board], |r| {
         Ok(StrokeRow {
@@ -450,6 +462,7 @@ fn load(conn: &Connection, board: i64) -> rusqlite::Result<Loaded> {
             state: r.get(6)?,
             txt: r.get(7)?,
             sheet: r.get(8)?,
+            sh: r.get(9)?,
         })
     })?;
     for row in rows {
@@ -497,7 +510,7 @@ fn apply(
             // An undone stroke is held as its id alone.
             let r = conn
                 .prepare_cached(
-                    "SELECT COALESCE(SUM(length(pts) + 2 * COALESCE(length(txt), 0) + 96), 0) \
+                    "SELECT COALESCE(SUM(length(pts) + 2 * COALESCE(length(txt), 0) + COALESCE(length(sh), 0) + 96), 0) \
                      FROM strokes WHERE board = ? AND state != ?",
                 )?
                 .query_row(params![board, UNDONE], |r| r.get::<_, i64>(0));
@@ -518,18 +531,18 @@ fn apply(
             )?
                 .execute(params![board, n, who, color])?;
         }
-        Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt } => {
+        Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt, sh } => {
             conn.prepare_cached(
-                "INSERT INTO strokes(board, seq, id, layer, color, width, pts, txt) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO strokes(board, seq, id, layer, color, width, pts, txt, sh) VALUES(?,?,?,?,?,?,?,?,?)",
             )?
-            .execute(params![board, seq as i64, id, layer, color, width, pts, txt])?;
+            .execute(params![board, seq as i64, id, layer, color, width, pts, txt, sh])?;
         }
         Cmd::StrokeState { board, id, state } => {
             if state == UNDONE {
                 // An undone stroke is never drawn again: keep the row for its
                 // id, drop its points so undo can't be used to fill the disk.
                 conn.prepare_cached(
-                    "UPDATE strokes SET state = ?, pts = '[]', txt = NULL WHERE board = ? AND id = ?",
+                    "UPDATE strokes SET state = ?, pts = '[]', txt = NULL, sh = NULL WHERE board = ? AND id = ?",
                 )?
                 .execute(params![state, board, id])?;
             } else {

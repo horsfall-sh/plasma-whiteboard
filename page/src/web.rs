@@ -33,13 +33,15 @@ use web_sys::{
 
 use crate::fx::{Fx, Paper};
 use crate::geom::{self, FIXED_COLORS, FONT, LINE_HEIGHT, PING_COLOR, PING_MS};
-use crate::input::{self, Editor, Input, Kind, Key, Net, Pen, Ptr, Tool, Wheel};
+use crate::input::{self, Editor, Input, Kind, Key, Net, Overlay, Pen, Ptr, Tool, Wheel};
 use crate::local::{self, Local, Route, Save, LOCAL_KEY, SHARING_KEY};
 use crate::model::Board;
 use crate::names;
 use crate::net::{self, Conn, Made, Then, Timer};
 use crate::proto::{In, Item, Layer, LayerInfo, Out, ShelfEntry};
 use crate::render::{self, Bounds, Redraw, Step, BUDGET_MS};
+use crate::ask::{ask_key, Answer, AskKey, ShareGate};
+use crate::shape::{BoxKind, Heads, Scene, Shape};
 use crate::view::{View, WW, WX, WY};
 
 /// How long a ping from someone else lights the people button.
@@ -332,6 +334,11 @@ pub struct Page {
     local: Local,
     mine: Vec<String>,
     hidden: IndexSet<Layer>,
+    /// Where the shapes are, rebuilt from the board when `scene_dirty`.
+    scene: Scene,
+    scene_dirty: bool,
+    /// The shape tool's ghost and anchor dots, drawn on the live canvas.
+    over: Option<Overlay>,
 
     // copies of the connection's fields ([`App::sync`])
     edit: bool,
@@ -347,6 +354,12 @@ pub struct Page {
     color: Option<String>,
     my_color: Option<String>,
     width: f64,
+    fill: bool,
+    heads: Heads,
+    /// The shape menu's last pick, which the shape button shows and returns to.
+    shape_pick: Tool,
+    /// The share question; nothing reaches the relay until it is answered Share.
+    ask: ShareGate,
     my_name: String,
     my_hue: Option<f64>,
 
@@ -431,6 +444,9 @@ impl Page {
             local: Local::default(),
             mine: vec![],
             hidden: IndexSet::new(),
+            scene: Scene::default(),
+            scene_dirty: false,
+            over: None,
             edit: false,
             me: None,
             is_local: false,
@@ -443,6 +459,10 @@ impl Page {
             color: None,
             my_color: None,
             width: 0.004,
+            fill: false,
+            heads: Heads::End,
+            shape_pick: Tool::Shape(BoxKind::Rect),
+            ask: ShareGate::default(),
             my_name,
             my_hue,
             outbox: vec![],
@@ -542,6 +562,8 @@ impl Page {
 
     /// `redrawBase(direct)`.
     fn base_redraw(&mut self, direct: bool) {
+        self.scene_dirty = true;
+        self.fresh_scene();
         let gen = self.redraw.start(direct, self.view.cur());
         if direct {
             let rv = self.redraw.rv;
@@ -560,7 +582,8 @@ impl Page {
         let mut bctx = self.d.bctx.clone();
         let mut sctx = self.d.sctx.clone();
         let target = self.redraw.target;
-        let Page { redraw, board, view, bounds, hidden, .. } = self;
+        self.fresh_scene();
+        let Page { redraw, board, view, bounds, hidden, scene, .. } = self;
         let strokes = &board.strokes;
         let r = redraw.step(gen, strokes.len(), BUDGET_MS, now, |i, buf| {
             let s = &strokes[i];
@@ -568,7 +591,7 @@ impl Page {
                 return;
             }
             let ctx = if buf { &mut sctx } else { &mut bctx };
-            render::draw_full(ctx, s, view, Some(target), bounds);
+            render::draw_full(ctx, s, view, Some(target), bounds, scene);
         });
         match r {
             Step::More => raf(move || {
@@ -595,12 +618,28 @@ impl Page {
     fn insert(&mut self, s: Item, defer: bool) {
         let hidden = self.is_hidden_layer(s.l);
         let id = s.id.clone();
+        // A box with lines on it moves them; a line drawn under others may hop under theirs:
+        // either repaints more than the one item, so the whole base redraws.
+        let wide = match &s.sh {
+            Some(Shape::Box { n, .. }) => self.board.strokes.iter().any(|o| o.sh.as_ref().is_some_and(|x| x.is_line() && x.touches(n))),
+            Some(Shape::Line { .. }) => true,
+            None => false,
+        };
+        if s.sh.is_some() {
+            self.scene_dirty = true;
+        }
         if let Some(placed) = self.board.insert(s) {
             let plan = placed.plan(self.redraw.cursor, self.redraw.buffered, defer);
+            if wide && !hidden {
+                self.base_redraw(false);
+                self.changed_layers();
+                return;
+            }
             if plan.draw && !hidden {
                 if let Some(item) = self.board.get(&id).cloned() {
                     let rv = self.redraw.rv;
-                    render::draw_full(&mut self.d.bctx.clone(), &item, &self.view, Some(rv), &mut self.bounds);
+                    self.fresh_scene();
+                    render::draw_full(&mut self.d.bctx.clone(), &item, &self.view, Some(rv), &mut self.bounds, &self.scene);
                 }
             }
             if plan.advance {
@@ -625,6 +664,16 @@ impl Page {
         self.base_redraw(false);
         self.changed_layers();
         true
+    }
+
+    /// Rebuilds the scene if the board or the hidden layers changed since.
+    fn fresh_scene(&mut self) {
+        if !self.scene_dirty {
+            return;
+        }
+        let hidden = &self.hidden;
+        self.scene = Scene::build(self.board.strokes.iter(), |s| s.l.is_some_and(|l| hidden.contains(&l)));
+        self.scene_dirty = false;
     }
 
     fn stretch_base(&self) {
@@ -718,6 +767,34 @@ impl Page {
             s.l.is_some_and(|l| hidden.contains(&l))
         });
         self.draw_pings();
+        self.draw_overlay();
+    }
+
+    /// The shape tool's ghost at half opacity, then the anchor dots.
+    fn draw_overlay(&self) {
+        let Some(o) = &self.over else { return };
+        let mut ctx = self.d.lctx.clone();
+        ctx.save();
+        let _ = ctx.set_global_composite_operation("source-over");
+        for (c, ops) in &o.ghosts {
+            render::Surface::prep(&mut ctx, c);
+            ctx.set_global_alpha(0.5);
+            for op in ops {
+                render::Surface::op(&mut ctx, op);
+            }
+        }
+        ctx.set_global_alpha(1.0);
+        let (u, bw) = (1.0 / self.view.zoom, self.view.bw);
+        for &(x, y, hot) in &o.dots {
+            ctx.begin_path();
+            let _ = ctx.arc(x * bw, y * bw, if hot { 6.0 } else { 4.0 } * u, 0.0, std::f64::consts::TAU);
+            ctx.set_fill_style_str(if hot { "#2b7cff" } else { "#fff" });
+            ctx.fill();
+            ctx.set_line_width(1.5 * u);
+            ctx.set_stroke_style_str("#2b7cff");
+            ctx.stroke();
+        }
+        ctx.restore();
     }
 
     fn new_draw(&mut self, id: &str) {
@@ -988,6 +1065,7 @@ impl Page {
     // ---- panels ----
 
     fn open_panel(&mut self, p: Option<&str>) {
+        self.open_menu(None);
         for id in ["layersPanel", "sharePanel", "shelfPanel", "whoPanel"] {
             set_hidden(id, p != Some(id));
         }
@@ -1004,6 +1082,50 @@ impl Page {
             Some("sharePanel") => self.share_dirty = true,
             _ => {}
         }
+    }
+
+    /// Shows one of the toolbar's menus under its button, or none.
+    fn open_menu(&mut self, m: Option<&str>) {
+        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu")] {
+            let on = m == Some(menu);
+            if let Some(b) = html(btn) {
+                attr(&b, "aria-expanded", if on { "true" } else { "false" });
+                if let (true, Some(el)) = (on, html(menu)) {
+                    el.set_hidden(false);
+                    let r = b.get_bounding_client_rect();
+                    let vw = win().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(r.right());
+                    let left = r.left().min(vw - el.offset_width() as f64 - 8.0).max(8.0);
+                    css(&el, "left", &format!("{left}px"));
+                    css(&el, "top", &format!("{}px", r.bottom() + 6.0));
+                    continue;
+                }
+            }
+            set_hidden(menu, !on);
+        }
+    }
+
+    fn toggle_menu(&mut self, id: &str) {
+        self.open_menu(if is_hidden(id) { Some(id) } else { None });
+    }
+
+    /// The share question, opened by "Share this board". Cancel is focused, so Enter is safe.
+    fn ask_share(&mut self) {
+        if self.ask.ask() {
+            set_hidden("shareAsk", false);
+        }
+        if let Some(b) = html("shareCancel") {
+            let _ = b.focus();
+        }
+    }
+
+    /// Closes the share question; `true` only for Share, the one answer that contacts the relay.
+    fn answer_share(&mut self, a: Answer) -> bool {
+        set_hidden("shareAsk", true);
+        let go = self.ask.answer(a);
+        if let Some(b) = html("shareNow") {
+            let _ = b.focus();
+        }
+        go
     }
 
     fn toggle_panel(&mut self, id: &str) {
@@ -1156,8 +1278,9 @@ impl Page {
         let k2 = PV_W as f64 / (WW * bw);
         let _ = ctx.set_transform(k2, 0.0, 0.0, k2, -WX * bw * k2, -WY * bw * k2);
         let mut scratch = Bounds::default();
+        let sc = Scene::build(a.iter(), |_| false);
         for s in &a {
-            render::draw_full(&mut ctx, s, &self.view, None, &mut scratch);
+            render::draw_full(&mut ctx, s, &self.view, None, &mut scratch, &sc);
         }
         self.previews.insert(k, c);
         self.shelf_dirty = true;
@@ -1339,6 +1462,36 @@ impl Page {
                 pressed(&b, self.tool == t);
             }
         }
+        let on_shape = matches!(self.tool, Tool::Shape(_) | Tool::Line);
+        if let Some(b) = html("shapeBtn") {
+            pressed(&b, on_shape);
+            let pick = shape_key(if on_shape { self.tool } else { self.shape_pick });
+            if let Some(svg) = doc().query_selector(&format!("#shapeMenu [data-shape={pick}] svg")).ok().flatten() {
+                b.set_inner_html(&svg.outer_html());
+            }
+        }
+        let checked = |b: &Element, on: bool| attr(b, "aria-checked", if on { "true" } else { "false" });
+        for (sel, key, cur) in [
+            ("#shapeMenu [data-shape]", "data-shape", if on_shape { shape_key(self.tool) } else { "" }),
+            ("#headMenu [data-head]", "data-head", self.heads.key()),
+        ] {
+            if let Ok(all) = doc().query_selector_all(sel) {
+                for i in 0..all.length() {
+                    if let Some(b) = all.item(i).and_then(|n| n.dyn_into::<Element>().ok()) {
+                        checked(&b, b.get_attribute(key).as_deref() == Some(cur));
+                    }
+                }
+            }
+        }
+        if let Some(b) = html("fillBtn") {
+            checked(&b, self.fill);
+        }
+        if let (Some(b), Some(svg)) = (
+            html("headBtn"),
+            doc().query_selector(&format!("#headMenu [data-head={}] svg", self.heads.key())).ok().flatten(),
+        ) {
+            b.set_inner_html(&svg.outer_html());
+        }
         toggle(&self.d.body, "text", self.tool == Tool::Text);
         toggle(&self.d.body, "move", self.tool == Tool::Move);
         if let Ok(all) = doc().query_selector_all("#bar [data-w]") {
@@ -1360,10 +1513,12 @@ impl Page {
     }
 
     /// `paperOfStrokes`: the window's view of the board, drawn in one go.
-    fn paper_of_strokes(&self) -> Paper {
+    fn paper_of_strokes(&mut self) -> Paper {
+        self.fresh_scene();
         let view = &self.view;
         let strokes = &self.board.strokes;
         let hidden = &self.hidden;
+        let scene = &self.scene;
         self.fx.paper_of_strokes(&self.d.base, |ctx, w| {
             if strokes.len() > 1500 {
                 return;
@@ -1374,7 +1529,7 @@ impl Page {
             let mut scratch = Bounds::default();
             for s in strokes {
                 if !s.l.is_some_and(|l| hidden.contains(&l)) {
-                    render::draw_full(&mut c, s, view, Some(view.cur()), &mut scratch);
+                    render::draw_full(&mut c, s, view, Some(view.cur()), &mut scratch, scene);
                 }
             }
         })
@@ -1643,6 +1798,21 @@ impl input::Host for Page {
             color: self.color.clone(),
             my_color: self.my_color.clone(),
             width: self.width,
+            fill: self.fill,
+            heads: self.heads,
+        }
+    }
+
+    fn scene(&mut self) -> &Scene {
+        self.fresh_scene();
+        &self.scene
+    }
+
+    fn overlay(&mut self, o: Option<Overlay>) {
+        let had = self.over.is_some();
+        self.over = o;
+        if had || self.over.is_some() {
+            self.live_redraw();
         }
     }
 
@@ -2028,6 +2198,15 @@ impl App {
     }
 
     fn bar(&mut self, b: &Element) {
+        {
+            let App { inp, page, .. } = self;
+            inp.cancel_shape(page);
+        }
+        match b.id().as_str() {
+            "shapeBtn" => return self.page.toggle_menu("shapeMenu"),
+            "headBtn" => return self.page.toggle_menu("headMenu"),
+            _ => self.page.open_menu(None),
+        }
         if let Some(c) = b.get_attribute("data-c").filter(|c| !c.is_empty()) {
             self.page.color = Some(c);
             if self.page.tool != Tool::Text {
@@ -2131,6 +2310,15 @@ fn hold_lock(waited: bool) -> JsValue {
         }
     });
     p.into()
+}
+
+/// The shape menu's key for a tool (`data-shape`).
+fn shape_key(t: Tool) -> &'static str {
+    match t {
+        Tool::Shape(k) => k.key(),
+        Tool::Line => "line",
+        _ => "",
+    }
 }
 
 /// `shareNow`: make a board on the relay and move the private board to it.
@@ -2252,6 +2440,9 @@ fn wire(page: &Page) {
         let ptr = ptr_of(p);
         if with(|a| {
             let App { inp, page, .. } = a;
+            if !(is_hidden("shapeMenu") && is_hidden("headMenu")) {
+                page.open_menu(None);
+            }
             inp.down(page, &ptr)
         }) == Some(true)
         {
@@ -2329,7 +2520,11 @@ fn wire(page: &Page) {
                 let App { inp, page, .. } = a;
                 inp.key(page, key);
             }
-            Key::ClosePanel => a.page.open_panel(None),
+            Key::ClosePanel => {
+                let App { inp, page, .. } = a;
+                inp.cancel_shape(page);
+                page.open_panel(None);
+            }
             Key::ZoomStep(f) => a.zoom_step(f),
             Key::ZoomHome => a.zoom_home(),
             Key::PageStep(di, dj) => a.page_step(di, dj),
@@ -2536,7 +2731,79 @@ fn wire(page: &Page) {
             None => fallback(),
         }
     });
-    listen_id("shareNow", "click", |_| share_now());
+    listen_id("shareNow", "click", |_| {
+        with(|a| a.page.ask_share());
+    });
+    listen_id("shareGo", "click", |_| {
+        if with(|a| a.page.answer_share(Answer::Share)) == Some(true) {
+            share_now();
+        }
+    });
+    listen_id("shareCancel", "click", |_| {
+        with(|a| a.page.answer_share(Answer::Cancel));
+    });
+    // a click on the dimmed backdrop, outside the box, is a Cancel
+    listen_id("shareAsk", "click", |e| {
+        if e.target().and_then(|t| t.dyn_into::<Element>().ok()).is_some_and(|t| t.id() == "shareAsk") {
+            with(|a| a.page.answer_share(Answer::Cancel));
+        }
+    });
+    listen_id("shareAsk", "keydown", |e| {
+        let Some(k) = e.dyn_ref::<KeyboardEvent>() else { return };
+        // the window's handler (Esc closes panels, Space pans) never sees the dialog's keys
+        e.stop_propagation();
+        let btns = ["shareCancel", "shareGo"];
+        let focused = doc().active_element().map(|el| el.id());
+        let at = btns.iter().position(|b| focused.as_deref() == Some(*b));
+        match ask_key(&k.key(), k.shift_key(), at, btns.len()) {
+            AskKey::Cancel => {
+                e.prevent_default();
+                with(|a| a.page.answer_share(Answer::Cancel));
+            }
+            AskKey::Focus(i) => {
+                e.prevent_default();
+                if let Some(b) = html(btns[i]) {
+                    let _ = b.focus();
+                }
+            }
+            AskKey::None => {}
+        }
+    });
+    listen_id("shapeMenu", "click", |e| {
+        with(|a| {
+            let App { inp, page, .. } = a;
+            inp.cancel_shape(page);
+            if closest(&e, "#fillBtn").is_some() {
+                page.fill = !page.fill;
+                if !matches!(page.tool, Tool::Shape(_)) {
+                    page.tool = page.shape_pick;
+                }
+                page.mark_tools();
+                return;
+            }
+            let Some(b) = closest(&e, "button[data-shape]") else { return };
+            let t = match b.get_attribute("data-shape").as_deref() {
+                Some("rect") => Tool::Shape(BoxKind::Rect),
+                Some("ellipse") => Tool::Shape(BoxKind::Ellipse),
+                Some("tri") => Tool::Shape(BoxKind::Tri),
+                Some("line") => Tool::Line,
+                _ => return,
+            };
+            page.tool = t;
+            page.shape_pick = t;
+            page.open_menu(None);
+            page.mark_tools();
+        });
+    });
+    listen_id("headMenu", "click", |e| {
+        let Some(b) = closest(&e, "button[data-head]") else { return };
+        let Some(h) = b.get_attribute("data-head").as_deref().and_then(Heads::from_key) else { return };
+        with(|a| {
+            a.page.heads = h;
+            a.page.open_menu(None);
+            a.page.mark_tools();
+        });
+    });
 
     // people
     listen(&page.d.who, "click", |_| {

@@ -48,7 +48,7 @@ the connection. The key is sent in the first message, never in the URL.
 | `b` | `id`, `c`, `w` | Begin a live stroke. `id`: 1 to 40 characters of `[A-Za-z0-9_-]`, unique in the board. `c`: `#rrggbb`. `w`: width in board units, over 0 and at most 0.2. |
 | `p` | `id`, `pts` | More points for my live stroke. |
 | `e` | `id`, `c`, `w`, `pts` | End my live stroke. `pts` is the final simplified point list. If it is missing or empty the relay keeps the points it collected from `p`. `c` and `w` repeat the values from `b`, so that when the relay has no live stroke with this `id` (the stroke began while offline) it stores the stroke as if it were an `s`. |
-| `s` | `id`, `c`, `w`, `pts`, `txt`? | A whole finished stroke in one message. With `txt` it is a **text annotation**: `pts` is then exactly one point (the top left of the text), `w` is the font size in board units, and `txt` is 1 to 500 characters on at most 20 lines, with no control characters other than newline. Used to resend strokes that were not confirmed before a disconnect. Sending an `id` the relay already holds is not stored twice: if it is still that layer's stroke on the sheet in use it is confirmed again with `ok`; otherwise (crumpled, deleted with its layer, undone, or another layer's) the sender gets `u` for it. |
+| `s` | `id`, `c`, `w`, `pts`, `txt`?, `sh`? | A whole finished stroke in one message. With `txt` it is a **text annotation**: `pts` is then exactly one point (the top left of the text), `w` is the font size in board units, and `txt` is 1 to 500 characters on at most 20 lines, with no control characters other than newline. Used to resend strokes that were not confirmed before a disconnect. Sending an `id` the relay already holds is not stored twice: if it is still that layer's stroke on the sheet in use it is confirmed again with `ok`; otherwise (crumpled, deleted with its layer, undone, or another layer's) the sender gets `u` for it. With `sh` it is a **shape** or an **arrow** (see Shapes below), never text as well. |
 | `u` | `id` | Undo one of my own strokes. |
 | `ld` | `l` | Delete layer `l` for everyone (any editor). |
 | `lr` | `l` | Restore the deleted strokes of layer `l` (any editor). |
@@ -60,16 +60,35 @@ the connection. The key is sent in the first message, never in the URL.
 
 Messages from a viewer other than `join` are ignored.
 
+#### Shapes and arrows (`sh`)
+
+A shape or an arrow is an `s` item whose `pts` is exactly two points (6 numbers: x, y, pressure
+twice). Like every item it is immutable: moving one is an undo `u` plus a new `s` under a new `id`.
+
+- **Shape:** `{"k":"rect"|"ellipse"|"tri","n":<node>,"f":<bool>}`. `pts` holds two opposite corners
+  of its box. `n` names the shape (the same characters as an `id`) and is kept when it is moved, so
+  arrows attached to it follow. `f`: filled in `c`, else outlined at width `w`.
+- **Arrow (a straight line):** `{"k":"line","h":"none"|"end"|"start"|"both","a":<end>?,"b":<end>?}`.
+  `pts` holds where its start and end were drawn. `h` says which ends carry an arrowhead. An end
+  that is absent is free, at its drawn point; an attached end is `{"n":<node>,"s":<side>,"t":<t>}`:
+  side `s` 0 to 3 of shape `n`, and `t` 0 to 1 along that side, so it stays on the same spot of the
+  shape however the shape moves or resizes. The two ends never name the same shape. An end whose
+  shape is gone, or on a hidden layer, falls back to its drawn point.
+- The relay refuses any other key or value, and stores and sends `sh` in one canonical form
+  (`t` to 4 decimals).
+- Where one arrow crosses an earlier one (in `q` order), the later one is drawn with a small hop
+  over it. That is drawing only; nothing about it is sent.
+
 ### Relay to client
 
 | `t` | Fields | Meaning |
 | --- | --- | --- |
 | `hello` | `role`, `me`, `view`, `layers`, `shelf` | Sent after a good `join`. Each layer is `{l, c, del, n}` (`n`: name or null). `role` is `edit` or `view`. `me` is my layer number (null for viewers). `view` is the view key: sent to every edit-key holder, including one joined as a viewer because the board had no room for another contributor; null for view-key holders. `layers` is `[{l, c, del}]`: layer number, assigned colour, and whether it holds deleted strokes that can be restored. `shelf` is `[{k, n}]`: the crumpled sheets, oldest first, with their sheet number and item count. **The client drops all board state when it receives this**; the snapshot follows. |
-| `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`. |
+| `ss` | `a` | Snapshot chunk: an array of finished items `{id, l, q, c, w, pts}` in `q` order. A text annotation also has `txt`; a shape or an arrow also has `sh`. |
 | `ready` | | Snapshot complete. The client now resends unconfirmed strokes with `s`. |
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
 | `p` | `id`, `pts` | Points for a live stroke. |
-| `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`? | A stroke or text annotation was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
+| `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`?, `sh`? | A stroke, text annotation, shape or arrow was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
 | `ok` | `id`, `q` | To the author: the stroke is committed to storage, with sequence number `q`. It is sent only after the commit, so the page may forget its own copy. A stroke that fails to store gets no `ok`: the board ends every connection with `busy`, and the page resends it on reconnect. |
 | `no` | `id`, `m` | To the author: the stroke was refused (board full, server out of memory, storage full, bad data). The client removes it. |
 | `u` | `id` | A stroke was removed (undone, or a live stroke abandoned). Not sent to the author of an undo. |

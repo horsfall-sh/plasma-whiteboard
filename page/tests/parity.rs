@@ -38,6 +38,8 @@ fn ops(o: &[Op]) -> Value {
                 Op::Stroke => vec![json!(["s"])],
                 // app.js's dot: beginPath, arc, fill (the fill is not recorded)
                 Op::Disc(x, y, r) => vec![json!(["b"]), json!(["d", x, y, r])],
+                // shapes and lines are Rust-only (A-166): app.js never drew them
+                _ => unreachable!("not a stroke op"),
             })
             .collect(),
     )

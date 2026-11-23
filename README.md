@@ -25,7 +25,7 @@ on a phone the board starts at 100% so a finger has room to write. See "Tablet a
 ## How to use it
 
 1. **Create a board.** Open the site. You are on a new private board; the status line says "private · only on this device".
-2. **Draw.** Pick a colour, pen, eraser or text, and a size (S, M, L). Undo, zoom, pan, and move between the nine
+2. **Draw.** Pick a colour, pen, eraser or text, and a thickness (small, medium, large). Undo, zoom, pan, and move between the nine
    connected pages with the arrows. Crumple wipes the board onto a shelf of up to five.
 3. **Share.** Open the share panel (the share icon) and press **Share this board**. The board is created on the server and
    you get the edit link and the view-only link.
@@ -56,7 +56,11 @@ Open `http://127.0.0.1:8787/`. The status line at the bottom right shows the con
 - Hiding a layer affects only your browser. Deleting a layer affects everyone and can be undone.
 - Boards are stored in SQLite and survive a restart.
 - **Text annotations:** pick Text, tap the board, type. Enter finishes, Shift+Enter starts a new line, Escape
-  cancels. Tap your own text with the Text tool to edit it. Size follows S, M, L.
+  cancels. Tap your own text with the Text tool to edit it. Size follows the thickness.
+- **Shapes and arrows:** the shape menu holds Square, Circle, Triangle and Arrow, and Filled. Drag
+  to place one; drag your own shape to move it. An arrow's end snaps to a shape's anchors (rest on a
+  side to get finer ones) and stays attached when either shape moves. The arrowhead menu picks None,
+  End, Start or Both. Crossing arrows hop over each other.
 - **Crumple:** wipes the board for everyone and puts it on a shelf of up to five crumpled boards. **Shelf**
   shows them with a small preview; **Bring back** swaps one in and crumples the board in use in its place.
   A sixth crumple throws the oldest away. The toast after a crumple has an Undo.
@@ -79,7 +83,8 @@ on the server and no connection is opened; the page loads its own files and noth
 says "private · only on this device". The board is kept in the browser's storage, so a reload keeps it.
 Drawing, text, undo, erase, crumple and the shelf all work.
 
-**Share** (in the share panel) is the only way out: it creates the board on the server, uploads what is on
+**Share** (in the share panel) is the only way out. It asks first, and nothing is sent unless you answer
+Share; then it creates the board on the server, uploads what is on
 the sheet, and shows the edit and view links. Crumpled sheets on the private shelf are not uploaded. Once
 everything is confirmed the browser's private copy is removed, and opening the site again gives a new blank
 private board. One private board per browser for now.
@@ -98,7 +103,7 @@ private board. One private board per browser for now.
 - **Fast writing.** A finger moving fast is reported only about 60 times a second, so a quick cursive loop
   arrives as a few far-apart points. When the finger lifts, the gaps are filled along a curve through the
   points (centripetal Catmull-Rom) before smoothing.
-- **Pen thickness** is constant on the screen (S, M, L are about 2, 4 and 9 px) whatever the device or zoom.
+- **Pen thickness** is constant on the screen (small, medium and large are about 2, 4 and 9 px) whatever the device or zoom.
 
 - **Finger on a phone.** The board starts at 100%, so an upright phone shows about a third of a page and a
   finger has room to write. Finger strokes are smoothed when the finger lifts: re-sampled at even steps and averaged with

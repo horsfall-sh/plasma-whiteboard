@@ -1341,3 +1341,85 @@ async fn a_stalled_join_gives_its_charge_back_at_the_deadline_and_another_addres
     assert_eq!(m["t"], "hello", "X's charge was given back: {m}");
     s.stop().await;
 }
+
+#[tokio::test]
+async fn shapes_and_arrows() {
+    let s = start(&temp_db("shapes")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+
+    let bx = json!([0.1, 0.1, 0.5, 0.2, 0.15, 0.5]);
+    let cx = json!([0.4, 0.2, 0.5, 0.5, 0.3, 0.5]);
+    a.send(json!({"t": "s", "id": "r1", "c": "#0a66d8", "w": 0.004, "pts": bx, "sh": {"k": "rect", "n": "nA", "f": true}})).await;
+    a.expect("ok").await;
+    let e = v.expect("e").await;
+    assert_eq!(e["sh"], json!({"k": "rect", "n": "nA", "f": true}));
+    assert_eq!(e["pts"], bx);
+    // `f` left out means outlined, and is written back out.
+    a.send(json!({"t": "s", "id": "c1", "c": "#0a66d8", "w": 0.004, "pts": cx, "sh": {"k": "ellipse", "n": "nB"}})).await;
+    a.expect("ok").await;
+    assert_eq!(v.expect("e").await["sh"], json!({"k": "ellipse", "n": "nB", "f": false}));
+    let ar = json!([0.15, 0.125, 0.5, 0.45, 0.25, 0.5]);
+    a.send(json!({"t": "s", "id": "a1", "c": "#111111", "w": 0.004, "pts": ar, "sh": {"k": "line", "h": "both", "a": {"n": "nA", "s": 1, "t": 0.5}, "b": {"n": "nB", "s": 3, "t": 0.1875}}})).await;
+    a.expect("ok").await;
+    assert_eq!(v.expect("e").await["sh"], json!({"k": "line", "h": "both", "a": {"n": "nA", "s": 1, "t": 0.5}, "b": {"n": "nB", "s": 3, "t": 0.1875}}));
+    // A free line: no ends attached, the head defaults to the end and is written back.
+    a.send(json!({"t": "s", "id": "l2", "c": "#111111", "w": 0.004, "pts": ar, "sh": {"k": "line"}})).await;
+    a.expect("ok").await;
+    assert_eq!(v.expect("e").await["sh"], json!({"k": "line", "h": "end"}));
+
+    // Refused: wrong point count, unknown kind, extra keys, bad names, an arrow to itself,
+    // a fill that is not a boolean, text and shape together, not an object.
+    for (id, pts, sh, txt) in [
+        ("x1", json!([0.1, 0.1, 0.5]), json!({"k": "rect", "n": "n1"}), None),
+        ("x2", bx.clone(), json!({"k": "star", "n": "n1"}), None),
+        ("x3", bx.clone(), json!({"k": "rect", "n": "n1", "evil": "<script>"}), None),
+        ("x4", bx.clone(), json!({"k": "rect", "n": "bad name"}), None),
+        ("x5", bx.clone(), json!({"k": "line", "a": {"n": "nA", "s": 0, "t": 0.5}, "b": {"n": "nA", "s": 2, "t": 0.5}}), None),
+        ("x6", bx.clone(), json!({"k": "line", "n": "z"}), None),
+        ("x7", bx.clone(), json!({"k": "tri", "n": "n1", "f": "yes"}), None),
+        ("x8", json!([0.1, 0.1, 0.5]), json!({"k": "tri", "n": "n1"}), Some("hi")),
+        ("x9", bx.clone(), json!("rect"), None),
+        ("x10", bx.clone(), json!({"k": "line", "a": {"n": "nA", "s": 4, "t": 0.5}}), None),
+        ("x11", bx.clone(), json!({"k": "line", "a": {"n": "nA", "s": 0, "t": 1.5}}), None),
+        ("x12", bx.clone(), json!({"k": "line", "h": "sideways"}), None),
+        ("x13", bx.clone(), json!({"k": "line", "b": {"n": "nA", "s": 0, "t": 0.5, "x": 1}}), None),
+        ("x14", bx.clone(), json!({"k": "arrow", "a": "nA", "b": "nB"}), None),
+    ] {
+        let mut m = json!({"t": "s", "id": id, "c": "#0a66d8", "w": 0.004, "pts": pts, "sh": sh});
+        if let Some(t) = txt {
+            m["txt"] = json!(t);
+        }
+        a.send(m).await;
+        assert_eq!(a.expect("no").await["id"], id);
+    }
+    v.quiet().await;
+
+    // A move is an undo and a new shape with the same node name; the arrow is untouched.
+    a.send(json!({"t": "u", "id": "r1"})).await;
+    let moved = json!([0.1, 0.3, 0.5, 0.2, 0.35, 0.5]);
+    a.send(json!({"t": "s", "id": "r2", "c": "#0a66d8", "w": 0.004, "pts": moved, "sh": {"k": "rect", "n": "nA", "f": true}})).await;
+    a.expect("ok").await;
+    assert_eq!(v.expect("u").await["id"], "r1");
+    assert_eq!(v.expect("e").await["sh"]["n"], "nA");
+
+    // Shapes are part of the layer and survive a restart, in q order.
+    drop(a);
+    drop(v);
+    let db = s.stop().await;
+    let s = start(&db).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    let got: Vec<(&str, &serde_json::Value)> = strokes.iter().map(|s| (s["id"].as_str().unwrap(), &s["sh"])).collect();
+    assert_eq!(
+        got,
+        [
+            ("c1", &json!({"k": "ellipse", "n": "nB", "f": false})),
+            ("a1", &json!({"k": "line", "h": "both", "a": {"n": "nA", "s": 1, "t": 0.5}, "b": {"n": "nB", "s": 3, "t": 0.1875}})),
+            ("l2", &json!({"k": "line", "h": "end"})),
+            ("r2", &json!({"k": "rect", "n": "nA", "f": true})),
+        ]
+    );
+    assert_eq!(strokes[3]["pts"], moved);
+    s.stop().await;
+}

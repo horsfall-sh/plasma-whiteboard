@@ -78,6 +78,8 @@ pub enum In {
         /// Present for a text annotation: `pts` is then its one anchor point
         /// and `w` its font size.
         txt: Option<String>,
+        /// Present for a shape or an arrow: checked by [`clean_shape`].
+        sh: Option<serde_json::Value>,
     },
     #[serde(rename = "u")]
     Undo { id: String },
@@ -342,13 +344,82 @@ fn stroke_json(
     w: &str,
     pts: &str,
     txt: Option<&str>,
+    sh: Option<&str>,
 ) -> String {
-    match txt {
-        None => format!(r#"{{"id":"{id}","l":{layer},"q":{seq},"c":"{c}","w":{w},"pts":{pts}}}"#),
-        Some(t) => {
-            let t = serde_json::to_string(t).expect("a string always serialises");
-            format!(r#"{{"id":"{id}","l":{layer},"q":{seq},"c":"{c}","w":{w},"pts":{pts},"txt":{t}}}"#)
+    let mut s = format!(r#"{{"id":"{id}","l":{layer},"q":{seq},"c":"{c}","w":{w},"pts":{pts}"#);
+    if let Some(t) = txt {
+        s.push_str(r#","txt":"#);
+        s.push_str(&serde_json::to_string(t).expect("a string always serialises"));
+    }
+    if let Some(sh) = sh {
+        // Already canonical JSON, written by `clean_shape`.
+        s.push_str(r#","sh":"#);
+        s.push_str(sh);
+    }
+    s.push('}');
+    s
+}
+
+/// Check the `sh` of a shape or an arrow and write it back out in its one canonical form, or
+/// None to refuse it. A shape (`rect`, `ellipse`, `tri`) has its node name `n` and whether it is
+/// filled, `f`; an arrow has the node names of the shapes it joins, `a` to `b`. Both have
+/// exactly two points: a shape the corners of its box, an arrow where its ends were drawn. No
+/// other keys are allowed, so nothing unchecked is stored or sent on.
+pub(crate) fn clean_shape(v: &serde_json::Value, pts: &[f32]) -> Option<String> {
+    let m = v.as_object()?;
+    if pts.len() != 6 {
+        return None;
+    }
+    let name = |k: &str| m.get(k).and_then(|x| x.as_str()).filter(|s| valid_id(s));
+    match m.get("k")?.as_str()? {
+        k @ ("rect" | "ellipse" | "tri") => {
+            if m.keys().any(|key| !matches!(key.as_str(), "k" | "n" | "f")) {
+                return None;
+            }
+            let n = name("n")?;
+            let f = match m.get("f") {
+                None => false,
+                Some(f) => f.as_bool()?,
+            };
+            Some(format!(r#"{{"k":"{k}","n":"{n}","f":{f}}}"#))
         }
+        "line" => {
+            if m.keys().any(|key| !matches!(key.as_str(), "k" | "h" | "a" | "b")) {
+                return None;
+            }
+            let h = match m.get("h") {
+                None => "end",
+                Some(h) => h.as_str().filter(|h| matches!(*h, "none" | "end" | "start" | "both"))?,
+            };
+            // An end is free (absent: the drawn point in pts) or attached to a node at an
+            // anchor: side s (0..=3) and t (0..=1) along it, both relative to the shape.
+            let end = |k: &str| -> Option<Option<(String, String)>> {
+                let Some(e) = m.get(k) else { return Some(None) };
+                let e = e.as_object()?;
+                if e.keys().any(|key| !matches!(key.as_str(), "n" | "s" | "t")) {
+                    return None;
+                }
+                let n = e.get("n")?.as_str().filter(|n| valid_id(n))?;
+                let side = e.get("s")?.as_u64().filter(|s| *s <= 3)?;
+                let t = e.get("t")?.as_f64().filter(|t| t.is_finite() && (0.0..=1.0).contains(t))?;
+                let t = (t * 10000.0).round() / 10000.0;
+                Some(Some((n.to_string(), format!(r#"{{"n":"{n}","s":{side},"t":{t}}}"#))))
+            };
+            let (a, b) = (end("a")?, end("b")?);
+            if let (Some((na, _)), Some((nb, _))) = (&a, &b) {
+                if na == nb {
+                    return None;
+                }
+            }
+            let mut out = format!(r#"{{"k":"line","h":"{h}""#);
+            for (k, e) in [("a", a), ("b", b)] {
+                if let Some((_, j)) = e {
+                    out += &format!(r#","{k}":{j}"#);
+                }
+            }
+            Some(out + "}")
+        }
+        _ => None,
     }
 }
 
@@ -469,7 +540,7 @@ impl Room {
                     seq: r.seq,
                     layer: r.layer,
                     state: r.state,
-                    json: stroke_json(&r.id, r.layer, r.seq, &r.color, &w, &r.pts, r.txt.as_deref()),
+                    json: stroke_json(&r.id, r.layer, r.seq, &r.color, &w, &r.pts, r.txt.as_deref(), r.sh.as_deref()),
                     id: r.id.clone(),
                 });
             }
@@ -834,9 +905,9 @@ impl Room {
                         }
                     },
                 };
-                self.commit(&mut st, peer, id, c, w, pts, None, was_live, db, &budget.store);
+                self.commit(&mut st, peer, id, c, w, pts, None, None, was_live, db, &budget.store);
             }
-            In::Stroke { id, c, w, pts, txt } => {
+            In::Stroke { id, c, w, pts, txt, sh } => {
                 if !valid_id(&id) {
                     return;
                 }
@@ -857,9 +928,15 @@ impl Room {
                         _ => Err(()),
                     },
                 };
-                match (pts, txt) {
-                    (Some(pts), Ok(txt)) if valid_color(&c) && valid_width(w) => {
-                        self.commit(&mut st, peer, id, c, w, pts, txt, was_live, db, &budget.store);
+                // A shape or an arrow: never text as well.
+                let sh = match (sh, &pts, &txt) {
+                    (None, _, _) => Ok(None),
+                    (Some(v), Some(p), Ok(None)) => clean_shape(&v, p).map(Some).ok_or(()),
+                    _ => Err(()),
+                };
+                match (pts, txt, sh) {
+                    (Some(pts), Ok(txt), Ok(sh)) if valid_color(&c) && valid_width(w) => {
+                        self.commit(&mut st, peer, id, c, w, pts, txt, sh, was_live, db, &budget.store);
                     }
                     _ => {
                         if was_live {
@@ -1022,6 +1099,7 @@ impl Room {
         w: f32,
         pts: Vec<f32>,
         txt: Option<String>,
+        sh: Option<String>,
         was_live: bool,
         db: &Db,
         store: &Mutex<Bucket>,
@@ -1059,7 +1137,7 @@ impl Room {
             return;
         }
         let (wj, pj) = (width_json(w), pts_json(&pts));
-        let size = pj.len() + txt.as_ref().map_or(0, |t| t.len() * 2) + 96;
+        let size = pj.len() + txt.as_ref().map_or(0, |t| t.len() * 2) + sh.as_ref().map_or(0, String::len) + 96;
         if st.strokes.len() + st.shelf.iter().map(|s| s.strokes.len()).sum::<usize>() >= MAX_STROKES
             || st.bytes + size > MAX_BOARD_BYTES
             || st.ids.len() >= MAX_IDS
@@ -1076,7 +1154,7 @@ impl Room {
         }
         let seq = st.next_seq;
         st.next_seq += 1;
-        let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref());
+        let json = stroke_json(&id, peer.layer, seq, &c, &wj, &pj, txt.as_deref(), sh.as_deref());
         let more = st.bytes + json.len();
         if !self.resize(st, more) {
             store.lock().unwrap().give(size as f64);
@@ -1086,7 +1164,7 @@ impl Room {
         }
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
         let ok = self.ok_once_stored(conn, &id, seq);
-        db.add_stroke(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, ok);
+        db.add_stroke(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, sh, ok);
         st.ids.insert(id.clone());
         st.snap = None;
         st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
@@ -1238,7 +1316,7 @@ mod tests {
         assert!(clean_name(&"x".repeat(25)).is_none());
         assert!(clean_name(&format!("{}\u{200B}", "x".repeat(24))).is_some(), "invisibles do not count");
         assert_eq!(clean_name("👨\u{200D}👩\u{200D}👧").unwrap(), "👨\u{200D}👩\u{200D}👧");
-        let j = stroke_json("a", 1, 2, "#111111", "0.02", "[0.1,0.2,0.5]", Some("say \"hi\"\n</script>"));
+        let j = stroke_json("a", 1, 2, "#111111", "0.02", "[0.1,0.2,0.5]", Some("say \"hi\"\n</script>"), None);
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["txt"], "say \"hi\"\n</script>");
     }

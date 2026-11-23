@@ -1,11 +1,11 @@
 #!/bin/bash
 # Run one browser check against a local relay on a throwaway database.
-#   tests/browser/run.sh smoke|panel|h2|g6
+#   tests/browser/run.sh smoke|panel|h2|g6|share
 # Needs node with playwright-core (set NODE_PATH to its node_modules if it is not
 # installed here) and Playwright's Chromium and Firefox. The relay serves web/ from
 # disk, so run `make wasm` first. WB_TEST_PORT picks the port (default 8799).
 set -u
-name=${1:?usage: run.sh smoke|panel|h2|g6}
+name=${1:?usage: run.sh smoke|panel|h2|g6|share}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 test -f "$here/$name.mjs" || { echo "no such check: $name" >&2; exit 2; }

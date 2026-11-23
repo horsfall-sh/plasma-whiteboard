@@ -374,7 +374,7 @@ impl Local {
 
 /// `itemOf`: an item as the private board keeps it, in layer 1 with no `q`.
 pub fn item_of(s: &Item) -> Item {
-    Item { id: s.id.clone(), l: Some(1), q: None, c: s.c.clone(), w: s.w, pts: s.pts.clone(), txt: s.txt.clone() }
+    Item { id: s.id.clone(), l: Some(1), q: None, c: s.c.clone(), w: s.w, pts: s.pts.clone(), txt: s.txt.clone(), sh: s.sh.clone() }
 }
 
 /// The step an `un` owes once its frame is handled: every item on the board is unconfirmed
@@ -423,7 +423,7 @@ mod tests {
     use super::*;
 
     fn it(id: &str) -> Item {
-        Item { id: id.into(), l: Some(1), q: None, c: "#111111".into(), w: 3.0, pts: vec![0.1, 0.2, 0.5], txt: None }
+        Item { id: id.into(), l: Some(1), q: None, c: "#111111".into(), w: 3.0, pts: vec![0.1, 0.2, 0.5], txt: None, sh: None }
     }
 
     fn board(ids: &[&str]) -> Board {
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(mine, ["d"]);
         assert_eq!(b.strokes[0].pts, [1.0]);
         assert_eq!(b.strokes[0].txt, None, "a txt that is not a string is dropped");
-        let y = Item { id: "y".into(), l: None, q: None, c: String::new(), w: 0.0, pts: vec![], txt: None };
+        let y = Item { id: "y".into(), l: None, q: None, c: String::new(), w: 0.0, pts: vec![], txt: None, sh: None };
         assert_eq!(st.shelf, [Sheet { k: 2, a: vec![y] }]);
         assert_eq!(st.next_k, 3, "Rust reads a string k as 0, where JS would coerce '9' to 9; the page never writes one");
     }
@@ -488,7 +488,7 @@ mod tests {
             let (mut st, mine) = Local::load(Some(s), &mut b);
             assert!(st.damaged(), "{s}");
             assert_eq!((mine.len(), b.strokes.len(), st.shelf.len()), (0, 0, 0), "{s}");
-            b.insert(Item { id: "new".into(), l: Some(1), q: None, c: String::new(), w: 1.0, pts: vec![], txt: None });
+            b.insert(Item { id: "new".into(), l: Some(1), q: None, c: String::new(), w: 1.0, pts: vec![], txt: None, sh: None });
             assert_eq!(st.save(&b, Some(s)), Save::Damaged, "{s}: never written over");
             st.discard_damaged();
             assert!(matches!(st.save(&b, Some(s)), Save::Write { .. }), "{s}: the user chose to start over");

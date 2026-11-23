@@ -64,6 +64,16 @@ pub enum Op {
     Stroke,
     /// A filled disc: centre and radius.
     Disc(f64, f64, f64),
+    /// Shapes and lines (A-166).
+    LineTo(f64, f64),
+    Close,
+    Fill,
+    /// A whole ellipse path: centre and radii.
+    Ellipse(f64, f64, f64, f64),
+    /// An arc on the path: centre, radius, start and end angle, anticlockwise.
+    Arc(f64, f64, f64, f64, f64, bool),
+    /// `globalAlpha`, for ghosts on the live canvas.
+    Alpha(f64),
 }
 
 /// `dot`: a one-point stroke.
