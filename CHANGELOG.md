@@ -1,6 +1,18 @@
 # Changelog
 
-## v0.3.0 (unreleased)
+## v0.3.1 (unreleased)
+
+The line section of the toolbar is three buttons, each with its own menu. Page only: the wire
+protocol and the relay are unchanged.
+
+- **Thickness** is one button (three lines, thin to thick) that opens Small, Medium and Large,
+  each drawn at its width; the current one is marked. It replaces the three S/M/L buttons.
+- **Arrowheads** shows the current choice and opens None, End, Start and Both. New arrows start
+  with a head at the end.
+- **Line style** is one button (a solid, a dashed and a dotted line) that opens Solid, Dashed and
+  Dotted; the current one is marked.
+
+## v0.3.0
 
 Shapes and arrows, selection and groups, and richer styling. The wire protocol gains one
 optional field on items, `sh`, and one new message, `x` (see PROTOCOL.md). Run the new relay with

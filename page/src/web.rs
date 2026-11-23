@@ -493,7 +493,7 @@ impl Page {
             hover_timer: 0,
             width: 0.004,
             fill: false,
-            heads: Heads::End,
+            heads: Heads::default(),
             grid: Grid::Board,
             style: Style::default(),
             shape_pick: Tool::Shape(BoxKind::Rect),
@@ -1161,7 +1161,7 @@ impl Page {
             self.color_at = None;
             self.color_hover = false;
         }
-        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu"), ("dashBtn", "dashMenu"), ("gridBtn", "gridMenu"), ("colorBtn", "colorMenu")] {
+        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("widthBtn", "widthMenu"), ("headBtn", "headMenu"), ("dashBtn", "dashMenu"), ("gridBtn", "gridMenu"), ("colorBtn", "colorMenu")] {
             let on = m == Some(menu);
             if let Some(b) = html(btn) {
                 attr(&b, "aria-expanded", if on { "true" } else { "false" });
@@ -1680,12 +1680,6 @@ impl Page {
             b.set_inner_html(&svg.outer_html());
         }
         if let (Some(b), Some(svg)) = (
-            html("dashBtn"),
-            doc().query_selector(&format!("#dashMenu [data-dash={}] svg", self.style.d.menu_key())).ok().flatten(),
-        ) {
-            b.set_inner_html(&svg.outer_html());
-        }
-        if let (Some(b), Some(svg)) = (
             html("gridBtn"),
             doc().query_selector(&format!("#gridMenu [data-grid={}] svg", self.grid.key())).ok().flatten(),
         ) {
@@ -1701,11 +1695,11 @@ impl Page {
                 let _ = b.remove_attribute("hidden");
             }
         }
-        if let Ok(all) = doc().query_selector_all("#bar [data-w]") {
+        if let Ok(all) = doc().query_selector_all("#widthMenu [data-w]") {
             for i in 0..all.length() {
                 if let Some(b) = all.item(i).and_then(|n| n.dyn_into::<Element>().ok()) {
                     let on = b.get_attribute("data-w").is_some_and(|w: String| js_number(&w) == self.width);
-                    pressed(&b, on);
+                    checked(&b, on);
                 }
             }
         }
@@ -2449,6 +2443,7 @@ impl App {
         }
         match b.id().as_str() {
             "shapeBtn" => return self.page.toggle_menu("shapeMenu"),
+            "widthBtn" => return self.page.toggle_menu("widthMenu"),
             "headBtn" => return self.page.toggle_menu("headMenu"),
             "gridBtn" => return self.page.toggle_menu("gridMenu"),
             "dashBtn" => return self.page.toggle_menu("dashMenu"),
@@ -2471,11 +2466,6 @@ impl App {
             return;
         }
         self.page.open_menu(None);
-        if let Some(w) = b.get_attribute("data-w").filter(|w| !w.is_empty()) {
-            self.page.width = js_number(&w);
-            self.page.mark_tools();
-            return;
-        }
         let flip = |p: &mut Page, t: Tool| {
             p.tool = if p.tool == t { Tool::Pen } else { t };
             p.mark_tools();
@@ -2703,7 +2693,7 @@ fn wire(page: &Page) {
         let ptr = ptr_of(p);
         if with(|a| {
             let App { inp, page, .. } = a;
-            if !(is_hidden("shapeMenu") && is_hidden("headMenu") && is_hidden("dashMenu") && is_hidden("gridMenu") && is_hidden("colorMenu")) {
+            if !(is_hidden("shapeMenu") && is_hidden("widthMenu") && is_hidden("headMenu") && is_hidden("dashMenu") && is_hidden("gridMenu") && is_hidden("colorMenu")) {
                 page.open_menu(None);
             }
             let r = inp.down(page, &ptr);
@@ -3165,6 +3155,15 @@ fn wire(page: &Page) {
             a.page.grid = g;
             a.page.open_menu(None);
             a.page.place_paper();
+            a.page.mark_tools();
+        });
+    });
+    listen_id("widthMenu", "click", |e| {
+        let Some(b) = closest(&e, "button[data-w]") else { return };
+        let Some(w) = b.get_attribute("data-w").filter(|w| !w.is_empty()) else { return };
+        with(|a| {
+            a.page.width = js_number(&w);
+            a.page.open_menu(None);
             a.page.mark_tools();
         });
     });
