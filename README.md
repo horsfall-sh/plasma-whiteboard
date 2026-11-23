@@ -61,6 +61,11 @@ Open `http://127.0.0.1:8787/`. The status line at the bottom right shows the con
   to place one; drag your own shape to move it. An arrow's end snaps to a shape's anchors (rest on a
   side to get finer ones) and stays attached when either shape moves. The arrowhead menu picks None,
   End, Start or Both. Crossing arrows hop over each other.
+- **Select and group:** the Select tool picks by box or Shift-click; move or delete the selection as
+  one step. Ctrl/Cmd+G groups, Shift+Ctrl/Cmd+G ungroups; groups nest.
+- **Style:** a paint bucket for the inside of a shape, Solid/Dashed/Dotted lines, bold and italic
+  text (Ctrl/Cmd+B, Ctrl/Cmd+I), eight swatches plus a "More colours" picker that remembers the
+  last three, and a Grid button (show or snap, just for you).
 - **Crumple:** wipes the board for everyone and puts it on a shelf of up to five crumpled boards. **Shelf**
   shows them with a small preview; **Bring back** swaps one in and crumples the board in use in its place.
   A sixth crumple throws the oldest away. The toast after a crumple has an Undo.
@@ -73,7 +78,7 @@ Open `http://127.0.0.1:8787/`. The status line at the bottom right shows the con
   drawn the toolbar, page arrows and map fade and let the pen pass through them.
 - **Zoom** up to 8x, local to your browser. Two-finger pinch, trackpad pinch, Ctrl or Cmd + wheel, the
   toolbar buttons, or the `+`, `-` and `0` keys. Scrolling pans; so does a middle-button drag or Space + drag.
-  The **Move** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom
+  The **Hand** tool makes any drag (pen, finger or mouse) pan. Whenever part of the board is off screen, a small map at the bottom
   left shows where you are; tap or drag on it to go there. On a view link one finger or the mouse pans.
 
 ### Private until shared
@@ -196,6 +201,7 @@ stroke, 200 contributors per board, 100 connections per board.
 Next, in order: end-to-end encryption with boards kept only in the browsers, TLS in the relay itself, and saved
 boards as an opt-in build feature. By default the server becomes a single binary with no database. See
 [`ROADMAP.md`](ROADMAP.md). The whole client in Rust is done in v0.2.0.
+Also planned: importing an image onto the board.
 
 ## Licence
 

@@ -57,25 +57,38 @@ the connection. The key is sent in the first message, never in the URL.
 | `sv` | `k` | Ask for the strokes of crumpled sheet `k`, to draw a preview. |
 | `nm` | `n`, `c` | My label: a display name (1 to 24 characters) and my colour `#rrggbb`. Kept in memory only while the board is open; the browser sends it after every `hello`. |
 | `pg` | `pts` | An attention ping: a shape (2 to 300 points) shown to everyone for a few seconds. Never stored. One every two seconds per contributor; extra ones are dropped. |
+| `x` | `a` | One change made of several parts: `a` is 1 to 256 `s` and `u` messages of my own layer (a move, restyle, fill, group or ungroup of a selection), applied together or not at all. If any part is refused, none is applied: I get `no` for each new item and an `e` with my own copy of each item I meant to remove, so my board matches the relay again. |
 
 Messages from a viewer other than `join` are ignored.
 
 #### Shapes and arrows (`sh`)
 
 A shape or an arrow is an `s` item whose `pts` is exactly two points (6 numbers: x, y, pressure
-twice). Like every item it is immutable: moving one is an undo `u` plus a new `s` under a new `id`.
+twice). Like every item it is immutable: moving or restyling one is an undo `u` plus a new `s`
+under a new `id`, sent together in one `x`.
 
-- **Shape:** `{"k":"rect"|"ellipse"|"tri","n":<node>,"f":<bool>}`. `pts` holds two opposite corners
-  of its box. `n` names the shape (the same characters as an `id`) and is kept when it is moved, so
-  arrows attached to it follow. `f`: filled in `c`, else outlined at width `w`.
-- **Arrow (a straight line):** `{"k":"line","h":"none"|"end"|"start"|"both","a":<end>?,"b":<end>?}`.
+- **Shape:** `{"k":"rect"|"ellipse"|"tri","n":<node>,"f":<bool>,"fc"?,"d"?,"g"?}`. `pts` holds two
+  opposite corners of its box. `n` names the shape (the same characters as an `id`) and is kept when
+  it is moved, so arrows attached to it follow. Only one layer may hold a node name: an item whose
+  `n` is held by a live shape of another layer is refused. `f`: filled in `c`, else outlined at
+  width `w`. `fc` (`#rrggbb`, from the paint bucket) fills the inside in that colour while the
+  outline stays `c`.
+- **Arrow (a straight line):** `{"k":"line","h":"none"|"end"|"start"|"both","a":<end>?,"b":<end>?,"d"?,"g"?}`.
   `pts` holds where its start and end were drawn. `h` says which ends carry an arrowhead. An end
   that is absent is free, at its drawn point; an attached end is `{"n":<node>,"s":<side>,"t":<t>}`:
   side `s` 0 to 3 of shape `n`, and `t` 0 to 1 along that side, so it stays on the same spot of the
   shape however the shape moves or resizes. The two ends never name the same shape. An end whose
   shape is gone, or on a hidden layer, falls back to its drawn point.
+- **Text style:** a text annotation may carry `{"k":"text","b"?:true,"i"?:true,"g"?}`: bold and
+  italic. It has `txt` and one point, as without `sh`.
+- **Freehand groups:** a freehand stroke carries `{"k":"ink","g":[..]}` only to say which groups
+  it is in.
+- `d` is the line style of a shape's outline or an arrow: `"dash"` or `"dot"`; absent is solid.
+- `g` is the groups an item is in, outermost first: 1 to 8 distinct ids. Selecting one item of a
+  group selects the whole outermost group. Grouping and ungrouping rewrite `g` on every member, in
+  one `x`.
 - The relay refuses any other key or value, and stores and sends `sh` in one canonical form
-  (`t` to 4 decimals).
+  (`t` to 4 decimals, `fc` in lower case, `false` flags left out of text).
 - Where one arrow crosses an earlier one (in `q` order), the later one is drawn with a small hop
   over it. That is drawing only; nothing about it is sent.
 
@@ -89,6 +102,7 @@ twice). Like every item it is immutable: moving one is an undo `u` plus a new `s
 | `b` | `id`, `l`, `c`, `w` | Someone began a live stroke. |
 | `p` | `id`, `pts` | Points for a live stroke. |
 | `e` | `id`, `l`, `q`, `c`, `w`, `pts`, `txt`?, `sh`? | A stroke, text annotation, shape or arrow was committed. If a live stroke with this `id` exists it is replaced. Not sent to the author. |
+| `x` | `a` | Someone's `x` was applied: `a` holds its parts in order, `u` for each item taken away and then `e` for each new one. Apply them as one change. Not sent to the author, who gets `ok` for each new item. |
 | `ok` | `id`, `q` | To the author: the stroke is committed to storage, with sequence number `q`. It is sent only after the commit, so the page may forget its own copy. A stroke that fails to store gets no `ok`: the board ends every connection with `busy`, and the page resends it on reconnect. |
 | `no` | `id`, `m` | To the author: the stroke was refused (board full, server out of memory, storage full, bad data). The client removes it. |
 | `u` | `id` | A stroke was removed (undone, or a live stroke abandoned). Not sent to the author of an undo. |
@@ -117,6 +131,8 @@ same sequence. What is broadcast while a joining client's snapshot is still bein
 | --- | --- |
 | Message size | 1 MiB |
 | Points per stroke | 20,000 |
+| Parts in one change (`x`) | 256 |
+| Item ids a board has used, undone ones included | 50,000; only a sheet falling off the shelf gives back the ids of the items on it |
 | Text annotation | 500 characters, 20 lines |
 | Strokes kept per board (sheet in use plus shelf, visible plus restorable) | 10,000 |
 | Crumpled sheets on the shelf | 5 |
@@ -131,5 +147,9 @@ same sequence. What is broadcast while a joining client's snapshot is still bein
 | Connections per board / per address | 100 / 40; viewers may hold at most 80 of a board's 100 |
 | Messages per connection | 300 per second sustained, burst 600 |
 | New boards per address | burst 10, then one per 10 s |
+
+Every move, restyle, fill, group or ungroup spends one new id per item it touches, because the
+item is replaced. A board where the same few shapes are moved thousands of times reaches the id
+limit long before the stroke limit; it is then full until a crumple pushes a sheet off the shelf.
 
 An "address" is one IPv4 address, or one IPv6 /56 (all of a home's networks share it).

@@ -13,6 +13,7 @@ feature (item 4). Today's relay keeps boards in SQLite; items 1 and 4 together r
 | 2 | [TLS in the relay](#2-tls-in-the-relay) | — |
 | 3 | [The whole client in Rust](#3-the-whole-client-in-rust) (done in v0.2.0) | — |
 | 4 | [Saved boards (opt-in)](#4-saved-boards-opt-in) | 1 |
+| 5 | [Image import](#5-image-import) | — |
 | later | [Scene model and export, agent collaboration, voice input](#later) | 1 |
 
 ## 1. End-to-end encryption
@@ -117,6 +118,17 @@ read what it saves.
 - **A lost link means a lost board.** The server cannot recover it, by design.
 
 Depends on item 1: there is nothing safe to store until the content is encrypted in the browser.
+
+## 5. Image import
+
+**Today:** a board holds strokes, text, shapes and arrows. There is no way to put a picture on it.
+
+**Goal:** drop, paste or pick an image and place it on the board like a shape: moved, selected,
+grouped and undone the same way.
+
+- The image is scaled down in the browser before it is sent, and counts toward the board's stored
+  data limit.
+- With end-to-end encryption (item 1) the image is encrypted like every other item.
 
 ## Later
 

@@ -2,9 +2,10 @@
 
 ## v0.3.0 (unreleased)
 
-Shapes and arrows. The wire protocol gains one optional field on items, `sh` (see PROTOCOL.md).
-Run the new relay with the new page: the relay checks `sh`, stores it, and adds its column to an
-existing database by itself.
+Shapes and arrows, selection and groups, and richer styling. The wire protocol gains one
+optional field on items, `sh`, and one new message, `x` (see PROTOCOL.md). Run the new relay with
+the new page: the relay checks `sh`, stores it, and adds its column to an existing database by
+itself. A v0.2.0 page does not know `x`, so upgrade the relay and the page together.
 
 - **Shapes:** one toolbar menu holds Square, Circle, Triangle and Arrow. Drag to place a shape,
   filled or outlined (Filled, in the same menu) in the current colour and thickness. Drag one of
@@ -16,6 +17,29 @@ existing database by itself.
 - **Line jumps:** where an arrow crosses an earlier one, it hops over it with a small semicircle
   that scales with its thickness. Freehand strokes do not hop.
 - **Thickness** is three icons instead of S, M and L. The widths are the same.
+- **Select:** the Select tool picks items by dragging a box around them or by Shift-click. A
+  selection moves or deletes as one change, synced in one `x` message and undone in one step.
+  Arrows attached to a moved shape follow it.
+- **Groups:** Ctrl/Cmd+G groups the selection, Shift+Ctrl/Cmd+G ungroups it. Groups nest up to
+  eight deep. A click selects the whole group; a double-click goes inside it.
+- **Paint bucket:** click one of your shapes to fill its inside with the current colour; the same
+  colour again clears it. The outline keeps its own colour.
+- **Line style:** Solid, Dashed or Dotted for shapes and arrows, from a menu beside the arrowheads.
+  The gaps look the same at every thickness.
+- **Bold and italic text:** B and I beside Text, or Ctrl/Cmd+B and Ctrl/Cmd+I. They style the text
+  being typed, your selected text (one change, one undo), or else the next text you place.
+- **More colours:** eight swatches (black, grey, red, orange, green, blue, purple, white) after
+  your own colour, and a "More colours" menu with a shade area and a hue strip. The last three
+  colours picked there stay in the toolbar as swatches. White is drawn as `#fdfdfd`, so it is never
+  mistaken for the eraser.
+- **Grid:** one button for Whiteboard, Show grid or Snap to grid, just for you and never synced.
+  Snap applies to placing and moving shapes and selections and to free arrow ends; an anchor wins
+  over the grid. The grid scales with zoom.
+- **Hand:** the Move tool is now the Hand, with a grab cursor (also while Space is held).
+- **Undo after a move** puts the shape back where it was with its arrows still attached (it used to
+  delete it).
+- **Shape names belong to one layer.** The relay refuses a shape whose name another layer's shape
+  already holds, so nobody can capture someone else's arrows.
 - **Share asks first.** "Share this board" opens a question saying that sharing connects the board
   to the relay server outside this browser and that anyone with the link can see and edit it.
   Cancel or Esc keeps the board local, and nothing is sent until Share is pressed.
