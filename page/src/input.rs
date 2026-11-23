@@ -1921,6 +1921,32 @@ mod tests {
     }
 
     #[test]
+    fn two_fingers_pan_and_zoom_together_for_this_viewer_only() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let a = ptr(Kind::Touch, 1, 100.0, 100.0);
+        let b = Ptr { primary: false, ..ptr(Kind::Touch, 2, 300.0, 100.0) };
+        i.down(&mut h, &a);
+        i.down(&mut h, &b);
+        let v0 = h.view.clone();
+        // both fingers slide 50px left at the same distance: a pure pan, zoom unchanged
+        i.moved(&mut h, &Ptr { x: 50.0, ..a }, &[]);
+        i.moved(&mut h, &Ptr { x: 250.0, ..b }, &[]);
+        let k = v0.bw * v0.zoom;
+        assert!((h.view.zoom - v0.zoom).abs() < 1e-12);
+        assert!((h.view.pan_x - (v0.pan_x + 50.0 / k)).abs() < 1e-9, "{} {}", h.view.pan_x, v0.pan_x);
+        // spreading while sliding: the board point under the midpoint stays under it
+        let r = h.rect();
+        let under = v0.board_point(200.0 - r.0, 100.0 - r.1);
+        i.moved(&mut h, &Ptr { x: 450.0, ..b }, &[]);
+        let (mx, my) = (250.0, 100.0);
+        let now = h.view.board_point(mx - r.0, my - r.1);
+        assert!((h.view.zoom - 2.0 * v0.zoom).abs() < 1e-9);
+        assert!((now.0 - under.0).abs() < 1e-9 && (now.1 - under.1).abs() < 1e-9, "{now:?} {under:?}");
+        // the view is this viewer's: only the first finger's begun-then-undone stroke went out
+        assert!(matches!(h.sent.as_slice(), [Out::Begin { .. }, Out::Undo { .. }]), "{:?}", h.sent);
+    }
+
+    #[test]
     fn second_finger_turns_the_stroke_into_a_pinch() {
         let (mut h, mut i) = (Rec::new(), Input::default());
         i.down(&mut h, &ptr(Kind::Touch, 1, 100.0, 100.0));

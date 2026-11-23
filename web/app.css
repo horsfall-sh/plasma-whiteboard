@@ -153,7 +153,8 @@ body.edit #bar #swatches { display: contents; }
 #status.ok b { background: #2ecc71; }
 
 /* ---- moving around ---- */
-body.edit.move #live, body:not(.edit) #live { cursor: grab; }
+body.edit.move #live, body:not(.edit) #live, body.space #live { cursor: grab; }
+body.panning #live { cursor: grabbing; }
 body.edit.select #live { cursor: default; }
 body.edit.bucket #live { cursor: cell; }
 #groupBtn[aria-disabled="true"] { opacity: .4; }

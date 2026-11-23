@@ -121,6 +121,12 @@ fn css(e: &HtmlElement, prop: &str, value: &str) {
     let _ = e.style().set_property(prop, value);
 }
 
+/// The hand's cursor: grab while Space is held, grabbing while a pan drag is live.
+fn mark_pan(inp: &Input, page: &Page) {
+    toggle(&page.d.body, "space", inp.space_down);
+    toggle(&page.d.body, "panning", inp.drag.is_some());
+}
+
 fn toggle(e: &Element, class: &str, on: bool) {
     let _ = e.class_list().toggle_with_force(class, on);
 }
@@ -2534,7 +2540,9 @@ fn wire(page: &Page) {
             if !(is_hidden("shapeMenu") && is_hidden("headMenu") && is_hidden("dashMenu") && is_hidden("gridMenu")) {
                 page.open_menu(None);
             }
-            inp.down(page, &ptr)
+            let r = inp.down(page, &ptr);
+            mark_pan(inp, page);
+            r
         }) == Some(true)
         {
             e.prevent_default();
@@ -2555,6 +2563,7 @@ fn wire(page: &Page) {
             with(|a| {
                 let App { inp, page, .. } = a;
                 inp.end(page, &ptr, up);
+                mark_pan(inp, page);
             });
         });
     }
@@ -2610,6 +2619,7 @@ fn wire(page: &Page) {
             Key::Undo | Key::Space | Key::Delete | Key::Group | Key::Ungroup => {
                 let App { inp, page, .. } = a;
                 inp.key(page, key);
+                mark_pan(inp, page);
             }
             Key::ClosePanel => {
                 let App { inp, page, .. } = a;
@@ -2624,11 +2634,17 @@ fn wire(page: &Page) {
     });
     listen(&w, "keyup", |e| {
         if e.dyn_ref::<KeyboardEvent>().is_some_and(|k| k.key() == " ") {
-            with(|a| a.inp.space_up());
+            with(|a| {
+                a.inp.space_up();
+                mark_pan(&a.inp, &a.page);
+            });
         }
     });
     listen(&w, "blur", |_| {
-        with(|a| a.inp.space_up());
+        with(|a| {
+            a.inp.space_up();
+            mark_pan(&a.inp, &a.page);
+        });
     });
     listen(&w, "resize", |_| {
         with(|a| a.page.layout());
