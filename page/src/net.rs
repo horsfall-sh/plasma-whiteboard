@@ -357,6 +357,12 @@ impl Conn {
                 }
                 self.upload_check(h);
             }
+            // Another contributor's change of several items: its parts, in order.
+            In::Batch(a) => {
+                for p in a {
+                    self.handle(h, inp, p);
+                }
+            }
             In::NewLayer { l, c } => {
                 if h.board().new_layer(l, &c) {
                     h.layers_changed();
@@ -900,7 +906,7 @@ mod tests {
     }
 
     fn it(id: &str, l: Layer, q: Option<f64>) -> Item {
-        Item { id: id.into(), l: Some(l), q, c: "#111111".into(), w: 0.004, pts: vec![0.1, 0.2, 0.5], txt: None, sh: None }
+        Item { id: id.into(), l: Some(l), q, c: "#111111".into(), w: 0.004, pts: vec![0.1, 0.2, 0.5], txt: None, sh: None, st: Default::default() }
     }
     fn cur(id: &str) -> Cur {
         Cur { id: id.into(), pointer: 1, out: vec![0.1, 0.2, 0.5], sent: true, pen: true, ping: false, touch: false }

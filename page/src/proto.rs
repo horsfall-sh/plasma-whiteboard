@@ -6,7 +6,7 @@
 //! wrote them, and through [`crate::json`], so the bytes on the wire are unchanged.
 
 use crate::json::J;
-use crate::shape::Shape;
+use crate::shape::{sh_json, Shape, Style};
 use serde_json::Value;
 
 /// A layer number. The relay numbers layers from 1.
@@ -14,7 +14,7 @@ pub type Layer = i64;
 
 /// A finished stroke or text annotation, as it arrives in `ss`, `e`, `lr`, `un` and `sv`, or as
 /// this browser keeps it. `q` is `None` until the relay has stored it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Item {
     pub id: String,
     pub l: Option<Layer>,
@@ -25,6 +25,8 @@ pub struct Item {
     pub txt: Option<String>,
     /// A shape or line (A-166, `sh`); never with `txt`.
     pub sh: Option<Shape>,
+    /// Groups, line style, fill colour, bold/italic: the rest of `sh`.
+    pub st: Style,
 }
 
 impl Item {
@@ -39,6 +41,7 @@ impl Item {
             pts: nums(m.get("pts")).unwrap_or_default(),
             txt: str_of(m, "txt"),
             sh: m.get("sh").and_then(Shape::from_value),
+            st: Style::from_value(m.get("sh")),
         })
     }
 
@@ -59,8 +62,8 @@ impl Item {
         if let Some(t) = &self.txt {
             f.push(("txt", J::str(t)));
         }
-        if let Some(sh) = &self.sh {
-            f.push(("sh", sh.to_json()));
+        if let Some(sh) = sh_json(self.sh.as_ref(), &self.st, self.txt.is_some()) {
+            f.push(("sh", sh));
         }
         J::obj(f)
     }
@@ -118,6 +121,8 @@ pub enum In {
     Ok { id: String, q: Option<f64> },
     No { id: String, m: Option<String> },
     Undo { id: String },
+    /// `x`: another contributor's change of several items at once, `u` and `e` parts in order.
+    Batch(Vec<In>),
     NewLayer { l: Layer, c: String },
     LayerDeleted { l: Layer },
     LayerRestored { l: Layer, a: Option<Vec<Item>> },
@@ -135,6 +140,11 @@ impl In {
     /// unknown `t`.
     pub fn parse(text: &str) -> Option<In> {
         let m: Value = serde_json::from_str(text).ok()?;
+        In::from_value(&m)
+    }
+
+    fn from_value(m: &Value) -> Option<In> {
+        let m = m;
         if !m.is_object() {
             return None;
         }
@@ -162,6 +172,15 @@ impl In {
             "ok" => In::Ok { id: id(), q: m.get("q").and_then(Value::as_f64) },
             "no" => In::No { id: id(), m: str_of(&m, "m").filter(|s| !s.is_empty()) },
             "u" => In::Undo { id: id() },
+            // Only removals and new items: a batch holds nothing else.
+            "x" => In::Batch(
+                m.get("a")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(In::from_value)
+                    .filter(|p| matches!(p, In::Undo { .. } | In::End(_)))
+                    .collect(),
+            ),
             "l" => In::NewLayer { l: l()?, c: str_of(&m, "c").unwrap_or_default() },
             "ld" => In::LayerDeleted { l: l()? },
             "lr" => In::LayerRestored { l: l()?, a: items(m.get("a")) },
@@ -213,7 +232,9 @@ pub enum Out {
     Begin { id: String, c: String, w: f64 },
     Points { id: String, pts: Vec<f64> },
     End { id: String, c: String, w: f64, pts: Vec<f64> },
-    Stroke { id: String, c: String, w: f64, pts: Vec<f64>, txt: Option<String>, sh: Option<Shape> },
+    Stroke { id: String, c: String, w: f64, pts: Vec<f64>, txt: Option<String>, sh: Option<Shape>, st: Style },
+    /// `x`: several `Stroke`/`Undo` frames the relay applies whole or not at all.
+    Batch(Vec<Out>),
     Undo { id: String },
     LayerDelete { l: Layer },
     LayerRestore { l: Layer },
@@ -242,14 +263,15 @@ impl Out {
                 ("w", J::Num(*w)),
                 ("pts", J::nums(pts)),
             ]),
-            Out::Stroke { id, c, w, pts, txt, sh } => {
+            Out::Batch(a) => J::obj([t("x"), ("a", J::Arr(a.iter().map(Out::to_json).collect()))]),
+            Out::Stroke { id, c, w, pts, txt, sh, st } => {
                 let mut f =
                     vec![t("s"), ("id", J::str(id)), ("c", J::str(c)), ("w", J::Num(*w)), ("pts", J::nums(pts))];
                 if let Some(txt) = txt {
                     f.push(("txt", J::str(txt)));
                 }
-                if let Some(sh) = sh {
-                    f.push(("sh", sh.to_json()));
+                if let Some(sh) = sh_json(sh.as_ref(), st, txt.is_some()) {
+                    f.push(("sh", sh));
                 }
                 J::obj(f)
             }
@@ -331,11 +353,11 @@ mod tests {
                 r##"{"t":"e","id":"a1","c":"#111111","w":0.024,"pts":[0.12345,-0.5,0.5]}"##,
             ),
             (
-                Out::Stroke { id: s("a1"), c: s("#d63031"), w: 0.002, pts: vec![1.0, 1.0, 0.5], txt: None, sh: None },
+                Out::Stroke { id: s("a1"), c: s("#d63031"), w: 0.002, pts: vec![1.0, 1.0, 0.5], txt: None, sh: None, st: Default::default() },
                 r##"{"t":"s","id":"a1","c":"#d63031","w":0.002,"pts":[1,1,0.5]}"##,
             ),
             (
-                Out::Stroke { id: s("t1"), c: s("#d63031"), w: 0.02, pts: vec![0.0, 0.0, 0.5], txt: Some(s("hi\nthere")), sh: None },
+                Out::Stroke { id: s("t1"), c: s("#d63031"), w: 0.02, pts: vec![0.0, 0.0, 0.5], txt: Some(s("hi\nthere")), sh: None, st: Default::default() },
                 r##"{"t":"s","id":"t1","c":"#d63031","w":0.02,"pts":[0,0,0.5],"txt":"hi\nthere"}"##,
             ),
             (Out::Undo { id: s("a1") }, r#"{"t":"u","id":"a1"}"#),
@@ -388,6 +410,7 @@ mod tests {
                 pts: vec![0.0, 0.0, 0.5, 1.0, 1.0, 0.5],
                 txt: None,
                 sh: None,
+                st: Default::default(),
             }))
         );
         // a text annotation, and a missing `pts` read as empty
@@ -416,7 +439,7 @@ mod tests {
 
     #[test]
     fn a_stored_item_is_on_layer_one_and_keeps_its_text_only_when_it_has_one() {
-        let mut it = Item { id: "a".into(), l: Some(4), q: Some(9.0), c: "#111111".into(), w: 0.004, pts: vec![0.0, 1.0, 0.5], txt: None, sh: None };
+        let mut it = Item { id: "a".into(), l: Some(4), q: Some(9.0), c: "#111111".into(), w: 0.004, pts: vec![0.0, 1.0, 0.5], txt: None, sh: None, st: Default::default() };
         assert_eq!(it.stored().stringify(), r##"{"id":"a","l":1,"c":"#111111","w":0.004,"pts":[0,1,0.5]}"##);
         it.txt = Some("x".into());
         assert_eq!(it.stored().stringify(), r##"{"id":"a","l":1,"c":"#111111","w":0.004,"pts":[0,1,0.5],"txt":"x"}"##);

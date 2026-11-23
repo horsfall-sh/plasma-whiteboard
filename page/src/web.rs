@@ -41,7 +41,7 @@ use crate::net::{self, Conn, Made, Then, Timer};
 use crate::proto::{In, Item, Layer, LayerInfo, Out, ShelfEntry};
 use crate::render::{self, Bounds, Redraw, Step, BUDGET_MS};
 use crate::ask::{ask_key, Answer, AskKey, ShareGate};
-use crate::shape::{BoxKind, Heads, Scene, Shape};
+use crate::shape::{BoxKind, Heads, Scene, Shape, Style};
 use crate::view::{View, WW, WX, WY};
 
 /// How long a ping from someone else lights the people button.
@@ -356,6 +356,8 @@ pub struct Page {
     width: f64,
     fill: bool,
     heads: Heads,
+    /// The style new items get (line style, fill colour, bold/italic).
+    style: Style,
     /// The shape menu's last pick, which the shape button shows and returns to.
     shape_pick: Tool,
     /// The share question; nothing reaches the relay until it is answered Share.
@@ -461,6 +463,7 @@ impl Page {
             width: 0.004,
             fill: false,
             heads: Heads::End,
+            style: Style::default(),
             shape_pick: Tool::Shape(BoxKind::Rect),
             ask: ShareGate::default(),
             my_name,
@@ -1800,6 +1803,7 @@ impl input::Host for Page {
             width: self.width,
             fill: self.fill,
             heads: self.heads,
+            style: self.style.clone(),
         }
     }
 

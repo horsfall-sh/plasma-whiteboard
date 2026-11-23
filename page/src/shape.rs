@@ -131,6 +131,125 @@ impl Anchor {
     }
 }
 
+/// How a line is drawn (`sh.d`): dashes and gaps keep a fixed length in canvas units at any
+/// thickness, and dots stay round.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Dash {
+    #[default]
+    Solid,
+    Dash,
+    Dot,
+}
+
+impl Dash {
+    pub fn key(self) -> Option<&'static str> {
+        match self {
+            Dash::Solid => None,
+            Dash::Dash => Some("dash"),
+            Dash::Dot => Some("dot"),
+        }
+    }
+}
+
+/// The style and grouping an item carries in its `sh`, apart from its shape: groups (outer
+/// first), the line style, a box's fill colour, and bold/italic text. The default is none.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Style {
+    pub g: Vec<String>,
+    pub d: Dash,
+    pub fc: Option<String>,
+    pub b: bool,
+    pub i: bool,
+}
+
+/// The deepest a group may nest, as the relay allows.
+pub const MAX_GROUP_DEPTH: usize = 8;
+
+impl Style {
+    /// Read leniently from an item's `sh`: what is not understood is left at its default.
+    pub fn from_value(v: Option<&Value>) -> Style {
+        let Some(v) = v else { return Style::default() };
+        let g: Vec<String> = v
+            .get("g")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).take(MAX_GROUP_DEPTH).collect())
+            .unwrap_or_default();
+        let d = match v.get("d").and_then(Value::as_str) {
+            Some("dash") => Dash::Dash,
+            Some("dot") => Dash::Dot,
+            _ => Dash::Solid,
+        };
+        let fc = v.get("fc").and_then(Value::as_str).filter(|c| is_colour(c)).map(str::to_ascii_lowercase);
+        let flag = |k| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Style { g, d, fc, b: flag("b"), i: flag("i") }
+    }
+
+    /// The outermost group, which a click selects.
+    pub fn top(&self) -> Option<&str> {
+        self.g.first().map(String::as_str)
+    }
+}
+
+/// `#rrggbb`.
+pub fn is_colour(c: &str) -> bool {
+    c.len() == 7 && c.starts_with('#') && c[1..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// An item's `sh` as the relay writes it back (the canonical form), so a round trip is
+/// unchanged: a shape or line with its style, text with b/i/g, or ink with groups. `None`
+/// when there is nothing to say (plain text or ink).
+pub fn sh_json(sh: Option<&Shape>, st: &Style, text: bool) -> Option<J> {
+    let g = || ("g", J::Arr(st.g.iter().map(J::str).collect()));
+    let mut f = match sh {
+        Some(Shape::Box { kind, fill, n }) => {
+            let mut f = vec![("k", J::str(kind.key())), ("n", J::str(n)), ("f", J::Bool(*fill))];
+            if let Some(fc) = &st.fc {
+                f.push(("fc", J::str(fc)));
+            }
+            f
+        }
+        Some(Shape::Line { h, a, b }) => {
+            let mut f = vec![("k", J::str("line")), ("h", J::str(h.key()))];
+            if let Some(a) = a {
+                f.push(("a", a.to_json()));
+            }
+            if let Some(b) = b {
+                f.push(("b", b.to_json()));
+            }
+            f
+        }
+        None if text => {
+            if !st.b && !st.i && st.g.is_empty() {
+                return None;
+            }
+            let mut f = vec![("k", J::str("text"))];
+            if st.b {
+                f.push(("b", J::Bool(true)));
+            }
+            if st.i {
+                f.push(("i", J::Bool(true)));
+            }
+            if !st.g.is_empty() {
+                f.push(g());
+            }
+            return Some(J::obj(f));
+        }
+        None => {
+            if st.g.is_empty() {
+                return None;
+            }
+            return Some(J::obj([("k", J::str("ink")), g()]));
+        }
+    };
+    if let Some(d) = st.d.key() {
+        f.push(("d", J::str(d)));
+    }
+    if !st.g.is_empty() {
+        f.push(g());
+    }
+    Some(J::obj(f))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     Box { kind: BoxKind, fill: bool, n: String },
@@ -161,23 +280,9 @@ impl Shape {
         }
     }
 
-    /// As the relay writes it back (the canonical form), so a round trip is unchanged.
+    /// As the relay writes it back (the canonical form), with no style.
     pub fn to_json(&self) -> J {
-        match self {
-            Shape::Box { kind, fill, n } => {
-                J::obj([("k", J::str(kind.key())), ("n", J::str(n)), ("f", J::Bool(*fill))])
-            }
-            Shape::Line { h, a, b } => {
-                let mut f = vec![("k", J::str("line")), ("h", J::str(h.key()))];
-                if let Some(a) = a {
-                    f.push(("a", a.to_json()));
-                }
-                if let Some(b) = b {
-                    f.push(("b", b.to_json()));
-                }
-                J::obj(f)
-            }
-        }
+        sh_json(Some(self), &Style::default(), false).expect("a shape always has an sh")
     }
 
     pub fn node(&self) -> Option<&str> {
@@ -284,8 +389,14 @@ impl Scene {
     /// `hidden(item)` says whether the item is on a hidden layer.
     pub fn build<'a>(items: impl IntoIterator<Item = &'a Item> + Clone, hidden: impl Fn(&Item) -> bool) -> Scene {
         let mut sc = Scene::default();
+        // A name belongs to the layer that used it first (S1): another layer's box with the
+        // same name is drawn but holds no arrows, so it cannot take over someone's lines.
+        let mut owner: HashMap<&str, Option<i64>> = HashMap::new();
         for (i, it) in items.clone().into_iter().enumerate() {
             if let (Some(Shape::Box { kind, n, .. }), Some(bb)) = (&it.sh, norm_box(&it.pts)) {
+                if *owner.entry(n.as_str()).or_insert(it.l) != it.l {
+                    continue;
+                }
                 if hidden(it) {
                     sc.hidden_nodes.insert(n.clone());
                 } else {
@@ -589,7 +700,7 @@ mod tests {
     use serde_json::json;
 
     fn item(id: &str, pts: Vec<f64>, sh: Value) -> Item {
-        Item { id: id.into(), l: Some(1), q: None, c: "#111111".into(), w: 0.004, pts, txt: None, sh: Shape::from_value(&sh) }
+        Item { id: id.into(), l: Some(1), q: None, c: "#111111".into(), w: 0.004, pts, txt: None, sh: Shape::from_value(&sh), st: Default::default() }
     }
 
     #[test]
@@ -610,6 +721,45 @@ mod tests {
         assert_eq!(Shape::from_value(&json!({"k": "line"})), Some(Shape::Line { h: Heads::End, a: None, b: None }));
         assert_eq!(Shape::from_value(&json!({"k": "star", "n": "a"})), None);
         assert_eq!(Shape::from_value(&json!({"k": "line", "a": {"n": "a", "s": 9, "t": 0.5}})), None);
+    }
+
+    #[test]
+    fn styles_and_groups_round_trip_in_the_relays_canonical_form() {
+        let st = |v: &Value| Style::from_value(Some(v));
+        for (v, text) in [
+            (json!({"k": "rect", "n": "nA", "f": true, "fc": "#aabbcc", "d": "dot", "g": ["G1", "G2"]}), false),
+            (json!({"k": "line", "h": "end", "a": {"n": "nA", "s": 0, "t": 0}, "d": "dash"}), false),
+            (json!({"k": "text", "b": true, "g": ["G1"]}), true),
+            (json!({"k": "text", "i": true}), true),
+            (json!({"k": "ink", "g": ["G1"]}), false),
+        ] {
+            let out = sh_json(Shape::from_value(&v).as_ref(), &st(&v), text).expect("has an sh");
+            assert_eq!(serde_json::from_str::<Value>(&out.stringify()).unwrap(), v);
+        }
+        // nothing to say: plain text and ink carry no sh
+        assert!(sh_json(None, &Style::default(), true).is_none());
+        assert!(sh_json(None, &Style::default(), false).is_none());
+        // read leniently: a bad colour or dash is left at the default
+        assert_eq!(st(&json!({"k": "rect", "n": "a", "fc": "red", "d": "wavy"})), Style::default());
+        assert_eq!(st(&json!({"fc": "#ABCDEF"})).fc.as_deref(), Some("#abcdef"));
+    }
+
+    #[test]
+    fn a_node_name_belongs_to_the_layer_that_used_it_first() {
+        let on = |l, it: Item| Item { l: Some(l), ..it };
+        let a = on(1, item("a1", vec![0.0, 0.0, 0.5, 1.0, 1.0, 0.5], json!({"k": "rect", "n": "A"})));
+        // another contributor's box with the same name, drawn later and elsewhere
+        let b = on(2, item("b1", vec![5.0, 5.0, 0.5, 6.0, 6.0, 0.5], json!({"k": "rect", "n": "A"})));
+        let l = on(2, item("l1", vec![0.0, 0.0, 0.5, 9.0, 9.0, 0.5], json!({"k": "line", "a": {"n": "A", "s": 1, "t": 0.5}})));
+        let sc = Scene::build([&a, &b, &l], |_| false);
+        assert_eq!(sc.seg("l1").unwrap().p[..2], [1.0, 0.5], "the line stays on the first layer's box");
+        // and while that layer is hidden, its name stays its own: the line hides with it
+        let sc = Scene::build([&a, &b, &l], |it| it.l == Some(1));
+        assert!(sc.seg("l1").is_none());
+        // the owner moving its box (a later item, same layer, same name) is followed
+        let a2 = on(1, item("a2", vec![2.0, 0.0, 0.5, 3.0, 1.0, 0.5], json!({"k": "rect", "n": "A"})));
+        let sc = Scene::build([&a, &b, &a2, &l], |_| false);
+        assert_eq!(sc.seg("l1").unwrap().p[..2], [3.0, 0.5]);
     }
 
     #[test]

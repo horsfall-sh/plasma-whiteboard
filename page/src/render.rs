@@ -379,7 +379,7 @@ mod tests {
     }
 
     fn stroke(id: &str, pts: Vec<f64>) -> Item {
-        Item { id: id.into(), l: Some(1), q: None, c: "#d63031".into(), w: 0.002, pts, txt: None, sh: None }
+        Item { id: id.into(), l: Some(1), q: None, c: "#d63031".into(), w: 0.002, pts, txt: None, sh: None, st: Default::default() }
     }
 
     #[test]

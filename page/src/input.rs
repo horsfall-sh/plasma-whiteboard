@@ -13,9 +13,10 @@ use crate::geom::{self, r5, ERASER_COLOR, ERASER_SCALE, EPS, LINE_HEIGHT, TEXT_S
 use crate::model::Board;
 use crate::geom::Op;
 use crate::proto::{Item, Layer, Out};
-use crate::shape::{self, Anchor, BoxKind, Heads, Hover, Node, Scene, Shape};
+use crate::shape::{self, Anchor, BoxKind, Heads, Hover, Node, Scene, Shape, Style};
 use crate::view::{clamp, js_round, View, MAX_ZOOM, WH, WY};
 use indexmap::IndexMap;
+use std::collections::HashMap;
 
 /// A stroke holds at most 20,000 points.
 pub const MAX_PTS: usize = 60_000;
@@ -69,6 +70,8 @@ pub struct Pen {
     pub fill: bool,
     /// Which ends of a new line carry an arrowhead.
     pub heads: Heads,
+    /// The line style, fill colour and bold/italic new items get (never groups).
+    pub style: Style,
 }
 
 /// The socket as input sees it.
@@ -226,6 +229,17 @@ pub struct Input {
     pub hover: Hover,
     /// An overlay is showing.
     shown: bool,
+    /// Edits that replace or remove items, by the id `mine` holds for them: what undo puts
+    /// back. A plain new item has none; undo just takes it away.
+    pub steps: HashMap<String, Step>,
+}
+
+/// One change of my items, undone as one: `gone` are the items it took away (put back with
+/// new ids by undo, so a moved box returns with its name and its arrows), `new` the ids it added.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Step {
+    pub gone: Vec<Item>,
+    pub new: Vec<String>,
 }
 
 impl Default for Input {
@@ -245,6 +259,7 @@ impl Default for Input {
             editor: None,
             gest: None,
             hover: Hover::default(),
+            steps: HashMap::new(),
             shown: false,
         }
     }
@@ -525,7 +540,7 @@ impl Input {
         }
         // Zoomed in, detail is finer: tighten the tolerance to match.
         let pts = geom::simplify(&if touch { geom::steady(&s.pts, bw * zoom) } else { s.pts }, eps);
-        let f = Item { id: id.clone(), l: h.pen().me, q: None, c: s.c, w: s.w, pts, txt: None, sh: None };
+        let f = Item { id: id.clone(), l: h.pen().me, q: None, c: s.c, w: s.w, pts, txt: None, sh: None, st: Default::default() };
         h.insert_stroke(f.clone());
         h.redraw_live();
         h.board().pending.insert(id.clone(), f.clone());
@@ -535,7 +550,7 @@ impl Input {
         if sent {
             h.send(Out::End { id, c: f.c, w: f.w, pts: f.pts });
         } else if online_ready(h) {
-            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: None, sh: None });
+            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: None, sh: None, st: Default::default() });
         }
     }
 
@@ -667,12 +682,12 @@ impl Input {
             return;
         }
         let id = h.new_id();
-        let f = Item { id: id.clone(), l: me, q: None, c: ed.c, w: r5(ed.w), pts: vec![r5(ed.x), r5(ed.y), 0.5], txt: Some(txt), sh: None };
+        let f = Item { id: id.clone(), l: me, q: None, c: ed.c, w: r5(ed.w), pts: vec![r5(ed.x), r5(ed.y), 0.5], txt: Some(txt), sh: None, st: Default::default() };
         h.insert_stroke(f.clone());
         h.board().pending.insert(id.clone(), f.clone());
         h.mine().push(id.clone());
         if online_ready(h) {
-            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: f.txt, sh: None });
+            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: f.txt, sh: None, st: Default::default() });
         }
     }
 
@@ -712,6 +727,12 @@ impl Input {
             return;
         }
         while let Some(id) = h.mine().pop() {
+            if let Some(step) = self.steps.remove(&id) {
+                if self.undo_step(h, step) {
+                    return;
+                }
+                continue;
+            }
             if !h.board().has(&id) {
                 continue; // already gone (layer deleted, refused)
             }
@@ -913,9 +934,9 @@ impl Input {
                     return;
                 }
                 let pts = [pt(old.pts[0] + dx, old.pts[1] + dy), pt(old.pts[3] + dx, old.pts[4] + dy)].concat();
-                let Some(sh) = old.sh.clone() else { return };
-                self.retire(h, &old.id);
-                self.commit(h, old.c.clone(), old.w, pts, sh);
+                let id = h.new_id();
+                let moved = Item { id, q: None, pts, ..old.clone() };
+                self.edit(h, vec![old], vec![moved]);
             }
             Gest::Line { a, b, .. } => {
                 if (b.x - a.x).hypot(b.y - a.y) < 4.0 * px {
@@ -929,35 +950,101 @@ impl Input {
         }
     }
 
-    /// My old item leaves the board, as an undo (a moved shape is replaced).
-    fn retire(&mut self, h: &mut impl Host, id: &str) {
-        if h.board().has(id) {
-            h.remove_stroke(id);
-        }
-        h.board().pending.shift_remove(id);
-        h.mine().retain(|m| m != id);
-        if online_ready(h) {
-            h.send(Out::Undo { id: id.to_string() });
-        } else if !h.net().local {
-            h.board().undo_queue.push(id.to_string());
-        }
-    }
-
     /// A finished shape or line on my layer, sent as one `s`.
     fn commit(&mut self, h: &mut impl Host, c: String, w: f64, pts: Vec<f64>, sh: Shape) {
         let me = h.pen().me;
         if me.is_none() {
             return;
         }
+        let st = h.pen().style.clone();
         let id = h.new_id();
-        let f = Item { id: id.clone(), l: me, q: None, c, w, pts, txt: None, sh: Some(sh) };
-        h.insert_stroke(f.clone());
-        h.board().pending.insert(id.clone(), f.clone());
-        h.mine().push(id.clone());
+        let f = Item { id: id.clone(), l: me, q: None, c, w, pts, txt: None, sh: Some(sh), st };
+        self.change(h, &[], vec![f]);
+        h.mine().push(id);
+    }
+
+    /// Replace my items `old` with `new` as ONE change: one `x` to the relay (applied whole or
+    /// not at all), one undo step. `new` items need fresh ids; a box keeps its name, so its
+    /// arrows stay on it. Nothing happens when `old` holds an item that is not mine.
+    pub fn edit(&mut self, h: &mut impl Host, old: Vec<Item>, new: Vec<Item>) {
+        let me = h.pen().me;
+        if me.is_none() || old.iter().any(|o| o.l != me) || (old.is_empty() && new.is_empty()) {
+            return;
+        }
+        let gone: Vec<String> = old.iter().map(|o| o.id.clone()).collect();
+        let ids: Vec<String> = new.iter().map(|n| n.id.clone()).collect();
+        self.change(h, &gone, new);
+        // the step goes under its last new id, or a fresh key when it only removes
+        let key = ids.last().cloned().unwrap_or_else(|| format!("~{}", h.new_id()));
+        // `mine` keeps the old ids below the step: undo renames them when it puts them back,
+        // and they stand for themselves again if the relay refuses the change
+        self.steps.insert(key.clone(), Step { gone: old, new: ids });
+        h.mine().push(key);
+    }
+
+    /// Take `gone` off the board and put `new` on, and tell the relay: one frame for one
+    /// part, an `x` for more. Offline, removals queue and new items wait in `pending` as usual.
+    fn change(&mut self, h: &mut impl Host, gone: &[String], new: Vec<Item>) {
+        for id in gone {
+            if h.board().has(id) {
+                h.remove_stroke(id);
+            }
+            h.board().pending.shift_remove(id);
+        }
+        for f in &new {
+            h.insert_stroke(f.clone());
+            h.board().pending.insert(f.id.clone(), f.clone());
+        }
         if online_ready(h) {
-            h.send(Out::Stroke { id, c: f.c, w: f.w, pts: f.pts, txt: None, sh: f.sh });
+            let mut parts: Vec<Out> = gone.iter().map(|id| Out::Undo { id: id.clone() }).collect();
+            parts.extend(new.iter().map(out_of));
+            if parts.len() == 1 {
+                h.send(parts.pop().expect("one part"));
+            } else if !parts.is_empty() {
+                h.send(Out::Batch(parts));
+            }
+        } else if !h.net().local {
+            h.board().undo_queue.extend(gone.iter().cloned());
         }
         h.save_local();
+    }
+
+    /// Undo one step: its new items go and its old ones come back, as one change. `false`
+    /// when there is nothing left of it to undo (its items were refused or deleted).
+    fn undo_step(&mut self, h: &mut impl Host, step: Step) -> bool {
+        let live: Vec<String> = step.new.iter().filter(|id| h.board().has(id)).cloned().collect();
+        // refused: the relay gave the old items back already
+        let refused = (!step.new.is_empty() && live.is_empty()) || step.gone.iter().any(|g| h.board().has(&g.id));
+        if refused {
+            return false;
+        }
+        let mut back = Vec::new();
+        for g in step.gone {
+            let id = h.new_id();
+            self.renamed(h, &g.id, &id);
+            back.push(Item { id, q: None, ..g });
+        }
+        self.change(h, &live, back);
+        true
+    }
+
+    /// An item came back under a new id: older undo entries for it now mean the new one.
+    fn renamed(&mut self, h: &mut impl Host, old: &str, new: &str) {
+        for m in h.mine().iter_mut() {
+            if m == old {
+                *m = new.to_string();
+            }
+        }
+        if let Some(st) = self.steps.remove(old) {
+            self.steps.insert(new.to_string(), st);
+        }
+        for st in self.steps.values_mut() {
+            for n in st.new.iter_mut() {
+                if n == old {
+                    *n = new.to_string();
+                }
+            }
+        }
     }
 
     /// Escape, a tool change or the page hiding: drop the gesture and its overlay.
@@ -966,6 +1053,11 @@ impl Input {
         self.hover = Hover::default();
         self.show(h, None);
     }
+}
+
+/// The `s` frame that sends item `f`.
+pub fn out_of(f: &Item) -> Out {
+    Out::Stroke { id: f.id.clone(), c: f.c.clone(), w: f.w, pts: f.pts.clone(), txt: f.txt.clone(), sh: f.sh.clone(), st: f.st.clone() }
 }
 
 /// A `wheel` event.
@@ -1099,7 +1191,7 @@ mod tests {
                 board: Board::default(),
                 view,
                 mine: vec![],
-                pen: Pen { edit: true, me: Some(1), tool: Tool::Pen, color: Some("#111111".into()), my_color: Some("#abcdef".into()), width: 0.004, fill: false, heads: Heads::End },
+                pen: Pen { edit: true, me: Some(1), tool: Tool::Pen, color: Some("#111111".into()), my_color: Some("#abcdef".into()), width: 0.004, fill: false, heads: Heads::End, style: Style::default() },
                 net: Net { online: true, ready: true, local: false },
                 now: 10_000.0,
                 ids: 0,
@@ -1447,7 +1539,7 @@ mod tests {
         h.pen.tool = Tool::Text;
         let (x, y) = h.view.board_point(200.0, 200.0);
         for (id, l) in [("other", 2), ("mine", 1)] {
-            h.board.insert(Item { id: id.into(), l: Some(l), q: Some(1.0), c: "#111111".into(), w: 0.02, pts: vec![x - 0.001, y - 0.001, 0.5], txt: Some("t".into()), sh: None });
+            h.board.insert(Item { id: id.into(), l: Some(l), q: Some(1.0), c: "#111111".into(), w: 0.02, pts: vec![x - 0.001, y - 0.001, 0.5], txt: Some("t".into()), sh: None, st: Default::default() });
         }
         h.hidden = vec![1];
         i.down(&mut h, &mouse(200.0, 200.0));
@@ -1466,7 +1558,7 @@ mod tests {
         let (mut h, mut i) = (Rec::new(), Input::default());
         h.pen.tool = Tool::Text;
         let (x, _) = h.view.board_point(200.0, 200.0);
-        h.board.insert(Item { id: "short".into(), l: Some(1), q: Some(1.0), c: "#111111".into(), w: 10.0, pts: vec![x - 0.001], txt: Some("t".into()), sh: None });
+        h.board.insert(Item { id: "short".into(), l: Some(1), q: Some(1.0), c: "#111111".into(), w: 10.0, pts: vec![x - 0.001], txt: Some("t".into()), sh: None, st: Default::default() });
         i.down(&mut h, &mouse(200.0, 200.0));
         i.end(&mut h, &mouse(200.0, 200.0), true);
         let ed = i.editor.as_ref().unwrap();
@@ -1654,14 +1746,57 @@ mod tests {
         i.moved(&mut h, &p, &[]);
         assert_eq!(h.over.as_ref().map(|o| o.ghosts.len()), Some(2), "the shape and its line");
         i.end(&mut h, &p, true);
-        assert_eq!(h.sent[2], Out::Undo { id: first.clone() });
-        let Some(Shape::Box { kind: BoxKind::Rect, n: n2, .. }) = sh_of(&h.sent[3]) else { panic!("{:?}", h.frames()) };
+        // one change: the old box goes and the moved one comes, applied whole by the relay
+        let Out::Batch(parts) = h.sent[2].clone() else { panic!("{:?}", h.frames()) };
+        assert_eq!(parts[0], Out::Undo { id: first.clone() });
+        let Some(Shape::Box { kind: BoxKind::Rect, n: n2, .. }) = sh_of(&parts[1]) else { panic!("{:?}", h.frames()) };
         assert_eq!(n2, n, "same node, so the line follows");
-        assert!(!h.board.has(&first) && !h.mine.contains(&first));
-        let line = h.mine[0].clone();
+        assert!(!h.board.has(&first));
+        let line = h.mine[1].clone();
         let seg = h.scene().seg(&line).unwrap().clone();
         assert!((seg.p[1] - (y + 0.25)).abs() < 1e-4, "the attached end moved down 0.2: {:?}", seg.p);
         assert!((seg.p[2] - (x + 0.4)).abs() < 1e-4, "the free end stayed");
+
+        // B1: undo puts the box back where it was, under its name, with the line still on it
+        let Out::Stroke { id: moved, .. } = parts[1].clone() else { panic!() };
+        i.undo(&mut h);
+        let Out::Batch(back) = h.sent[3].clone() else { panic!("{:?}", h.frames()) };
+        assert_eq!(back[0], Out::Undo { id: moved.clone() });
+        let Out::Stroke { id: again, pts, sh: Some(Shape::Box { n: n3, .. }), .. } = back[1].clone() else { panic!("{back:?}") };
+        assert_eq!(n3, n);
+        assert_ne!(again, first, "a new id: the relay never takes one twice");
+        assert!(!h.board.has(&moved) && h.board.has(&again));
+        assert!((pts[1] - h.board.strokes.iter().find(|s| s.id == again).unwrap().pts[1]).abs() < 1e-9);
+        let seg = h.scene().seg(&line).unwrap().clone();
+        assert!((seg.p[1] - (y + 0.05)).abs() < 1e-4, "the attached end is back: {:?}", seg.p);
+        // and the earlier steps still undo: the line, then the box
+        i.undo(&mut h);
+        assert_eq!(h.sent[4], Out::Undo { id: line.clone() });
+        i.undo(&mut h);
+        assert_eq!(h.sent[5], Out::Undo { id: again.clone() });
+        assert!(h.board.strokes.is_empty());
+        i.undo(&mut h);
+        assert_eq!(h.sent.len(), 6, "nothing left");
+    }
+
+    #[test]
+    fn a_refused_move_is_not_undone_twice() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        drag(&mut h, &mut i, (x, y), (x + 0.1, y + 0.1));
+        let first = h.mine[0].clone();
+        let old = Item { q: Some(1.0), ..h.board.strokes[0].clone() };
+        drag(&mut h, &mut i, (x + 0.05, y + 0.05), (x + 0.15, y + 0.25));
+        let Out::Batch(parts) = h.sent[1].clone() else { panic!("{:?}", h.frames()) };
+        let Out::Stroke { id: moved, .. } = parts[1].clone() else { panic!() };
+        // the relay refuses the change: `no` for the new box, the old one back
+        h.board.refused(&moved);
+        h.remove_stroke(&moved);
+        h.insert_stroke(old);
+        i.undo(&mut h);
+        assert_eq!(h.sent.last(), Some(&Out::Undo { id: first.clone() }), "undo takes the box away, once");
+        assert!(h.board.strokes.is_empty());
     }
 
     #[test]

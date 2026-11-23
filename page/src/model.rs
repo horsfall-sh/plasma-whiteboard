@@ -341,7 +341,7 @@ impl Board {
         while out.len() < 100 && bytes < 120_000 {
             let Some(id) = todo.pop_front() else { break };
             let Some(s) = self.pending.get(&id) else { continue };
-            let text = Out::Stroke { id: s.id.clone(), c: s.c.clone(), w: s.w, pts: s.pts.clone(), txt: s.txt.clone(), sh: s.sh.clone() }.frame();
+            let text = Out::Stroke { id: s.id.clone(), c: s.c.clone(), w: s.w, pts: s.pts.clone(), txt: s.txt.clone(), sh: s.sh.clone(), st: s.st.clone() }.frame();
             bytes += text.encode_utf16().count();
             out.push(text);
         }
@@ -361,7 +361,7 @@ mod tests {
     use super::*;
 
     fn it(id: &str, l: Layer, q: Option<f64>) -> Item {
-        Item { id: id.into(), l: Some(l), q, c: "#111111".into(), w: 0.004, pts: vec![0.0, 0.0, 0.5], txt: None, sh: None }
+        Item { id: id.into(), l: Some(l), q, c: "#111111".into(), w: 0.004, pts: vec![0.0, 0.0, 0.5], txt: None, sh: None, st: Default::default() }
     }
     fn order(b: &Board) -> Vec<&str> {
         b.strokes.iter().map(|s| s.id.as_str()).collect()
