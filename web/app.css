@@ -15,6 +15,16 @@ html, body {
     #fff;
 }
 #paper { position: absolute; box-shadow: 0 2px 16px rgba(0,0,0,.4); }
+body.grid #paper {
+  background:
+    linear-gradient(#cfd5dd, #cfd5dd) 33.333% 0 / 1px 100% no-repeat,
+    linear-gradient(#cfd5dd, #cfd5dd) 66.667% 0 / 1px 100% no-repeat,
+    linear-gradient(#cfd5dd, #cfd5dd) 0 33.333% / 100% 1px no-repeat,
+    linear-gradient(#cfd5dd, #cfd5dd) 0 66.667% / 100% 1px no-repeat,
+    linear-gradient(to right, #e4e8ed 1px, transparent 1px) var(--gp, 0 0) / var(--gs, 20px) var(--gs, 20px),
+    linear-gradient(to bottom, #e4e8ed 1px, transparent 1px) var(--gp, 0 0) / var(--gs, 20px) var(--gs, 20px),
+    #fff;
+}
 .pg {
   position: fixed; z-index: 3; width: 34px; height: 64px; padding: 0; border: 0; border-radius: 8px;
   background: rgba(35,38,43,.72); color: #e8eaed; font: 28px/1 system-ui, sans-serif; cursor: pointer;

@@ -42,7 +42,7 @@ use crate::proto::{In, Item, Layer, LayerInfo, Out, ShelfEntry};
 use crate::render::{self, Bounds, Redraw, Step, BUDGET_MS};
 use crate::ask::{ask_key, Answer, AskKey, ShareGate};
 use crate::shape::{BoxKind, Heads, Scene, Shape, Style};
-use crate::view::{View, WW, WX, WY};
+use crate::view::{Grid, View, WW, WX, WY};
 
 /// How long a ping from someone else lights the people button.
 const NUDGE_MS: i32 = 20_000;
@@ -357,6 +357,7 @@ pub struct Page {
     width: f64,
     fill: bool,
     heads: Heads,
+    grid: Grid,
     /// The style new items get (line style, fill colour, bold/italic).
     style: Style,
     /// The shape menu's last pick, which the shape button shows and returns to.
@@ -468,6 +469,7 @@ impl Page {
             width: 0.004,
             fill: false,
             heads: Heads::End,
+            grid: Grid::Board,
             style: Style::default(),
             shape_pick: Tool::Shape(BoxKind::Rect),
             can_group: false,
@@ -705,6 +707,12 @@ impl Page {
         css(p, "top", &format!("{}px", r.top));
         css(p, "width", &format!("{}px", r.width));
         css(p, "height", &format!("{}px", r.height));
+        toggle(&self.d.body, "grid", self.grid != Grid::Board);
+        if self.grid != Grid::Board {
+            let (g, x, y) = self.view.grid_css();
+            let _ = p.style().set_property("--gs", &format!("{g}px"));
+            let _ = p.style().set_property("--gp", &format!("{x}px {y}px"));
+        }
     }
 
     fn show_zoom(&self) {
@@ -1115,7 +1123,7 @@ impl Page {
 
     /// Shows one of the toolbar's menus under its button, or none.
     fn open_menu(&mut self, m: Option<&str>) {
-        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu")] {
+        for (btn, menu) in [("shapeBtn", "shapeMenu"), ("headBtn", "headMenu"), ("gridBtn", "gridMenu")] {
             let on = m == Some(menu);
             if let Some(b) = html(btn) {
                 attr(&b, "aria-expanded", if on { "true" } else { "false" });
@@ -1504,6 +1512,7 @@ impl Page {
         for (sel, key, cur) in [
             ("#shapeMenu [data-shape]", "data-shape", if on_shape { shape_key(self.tool) } else { "" }),
             ("#headMenu [data-head]", "data-head", self.heads.key()),
+            ("#gridMenu [data-grid]", "data-grid", self.grid.key()),
         ] {
             if let Ok(all) = doc().query_selector_all(sel) {
                 for i in 0..all.length() {
@@ -1519,6 +1528,12 @@ impl Page {
         if let (Some(b), Some(svg)) = (
             html("headBtn"),
             doc().query_selector(&format!("#headMenu [data-head={}] svg", self.heads.key())).ok().flatten(),
+        ) {
+            b.set_inner_html(&svg.outer_html());
+        }
+        if let (Some(b), Some(svg)) = (
+            html("gridBtn"),
+            doc().query_selector(&format!("#gridMenu [data-grid={}] svg", self.grid.key())).ok().flatten(),
         ) {
             b.set_inner_html(&svg.outer_html());
         }
@@ -1838,6 +1853,7 @@ impl input::Host for Page {
             fill: self.fill,
             heads: self.heads,
             style: self.style.clone(),
+            snap: self.grid == Grid::Snap,
         }
     }
 
@@ -2267,6 +2283,7 @@ impl App {
         match b.id().as_str() {
             "shapeBtn" => return self.page.toggle_menu("shapeMenu"),
             "headBtn" => return self.page.toggle_menu("headMenu"),
+            "gridBtn" => return self.page.toggle_menu("gridMenu"),
             _ => self.page.open_menu(None),
         }
         if let Some(c) = b.get_attribute("data-c").filter(|c| !c.is_empty()) {
@@ -2503,7 +2520,7 @@ fn wire(page: &Page) {
         let ptr = ptr_of(p);
         if with(|a| {
             let App { inp, page, .. } = a;
-            if !(is_hidden("shapeMenu") && is_hidden("headMenu")) {
+            if !(is_hidden("shapeMenu") && is_hidden("headMenu") && is_hidden("gridMenu")) {
                 page.open_menu(None);
             }
             inp.down(page, &ptr)
@@ -2866,6 +2883,16 @@ fn wire(page: &Page) {
             page.shape_pick = t;
             page.open_menu(None);
             page.mark_tools();
+        });
+    });
+    listen_id("gridMenu", "click", |e| {
+        let Some(b) = closest(&e, "button[data-grid]") else { return };
+        let Some(g) = b.get_attribute("data-grid").as_deref().and_then(Grid::from_key) else { return };
+        with(|a| {
+            a.page.grid = g;
+            a.page.open_menu(None);
+            a.page.place_paper();
+            a.page.mark_tools();
         });
     });
     listen_id("headMenu", "click", |e| {

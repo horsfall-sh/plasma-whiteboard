@@ -76,6 +76,8 @@ pub struct Pen {
     pub heads: Heads,
     /// The line style, fill colour and bold/italic new items get (never groups).
     pub style: Style,
+    /// Snap to grid is on (per viewer, never synced).
+    pub snap: bool,
 }
 
 /// The socket as input sees it.
@@ -169,7 +171,7 @@ pub enum Gest {
     /// A marquee from empty board; `base` is what was selected before (kept with Shift).
     Marquee { pointer: i32, base: Vec<String>, x0: f64, y0: f64, x1: f64, y1: f64 },
     /// The selection being dragged.
-    MoveSel { pointer: i32, sx: f64, sy: f64, dx: f64, dy: f64 },
+    MoveSel { pointer: i32, sx: f64, sy: f64, dx: f64, dy: f64, ox: f64, oy: f64 },
 }
 
 impl Gest {
@@ -858,6 +860,31 @@ impl Input {
         h.overlay(o);
     }
 
+    /// (x, y) on the nearest grid point when snap to grid is on.
+    fn snap(h: &mut impl Host, x: f64, y: f64) -> (f64, f64) {
+        if !h.pen().snap {
+            return (x, y);
+        }
+        let s = h.view().grid_step();
+        ((x / s).round() * s, (y / s).round() * s)
+    }
+
+    /// A move by (dx, dy) of something whose corner is (x0, y0), adjusted so the corner lands
+    /// on the grid when snap is on.
+    fn snap_by(h: &mut impl Host, x0: f64, y0: f64, dx: f64, dy: f64) -> (f64, f64) {
+        let (x, y) = Self::snap(h, x0 + dx, y0 + dy);
+        (x - x0, y - y0)
+    }
+
+    /// A line end: an anchor wins, a free end snaps.
+    fn snap_end(h: &mut impl Host, e: End) -> End {
+        if e.at.is_some() {
+            return e;
+        }
+        let (x, y) = Self::snap(h, e.x, e.y);
+        End { x, y, at: None }
+    }
+
     /// The line tool over the board with nothing pressed: the anchors of the shape it is near.
     fn line_hover(&mut self, h: &mut impl Host, e: &Ptr) {
         let pen = h.pen();
@@ -875,6 +902,7 @@ impl Input {
         match pen.tool {
             Tool::Line => {
                 let (a, dots) = self.end_at(h, x, y, None);
+                let a = Self::snap_end(h, a);
                 self.gest = Some(Gest::Line { pointer, a: a.clone(), b: a });
                 self.show(h, Some(Overlay { ghosts: vec![], dots, ..Overlay::default() }));
             }
@@ -895,7 +923,10 @@ impl Input {
                 }
                 self.gest = Some(match hit.filter(|s| !h.hidden(s.l)) {
                     Some(old) => Gest::MoveBox { pointer, old, sx: x, sy: y, dx: 0.0, dy: 0.0 },
-                    None => Gest::NewBox { pointer, kind, x0: x, y0: y, x1: x, y1: y },
+                    None => {
+                        let (x, y) = Self::snap(h, x, y);
+                        Gest::NewBox { pointer, kind, x0: x, y0: y, x1: x, y1: y }
+                    }
                 });
             }
             _ => {}
@@ -911,18 +942,21 @@ impl Input {
         let c = pen.color.clone().unwrap_or_default();
         let o = match &mut g {
             Gest::NewBox { kind, x0, y0, x1, y1, .. } => {
-                (*x1, *y1) = (x, y);
+                (*x1, *y1) = Self::snap(h, x, y);
                 let bb = [x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)];
                 Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, w, bw))], ..Overlay::default() }
             }
             Gest::MoveBox { old, sx, sy, dx, dy, .. } => {
                 (*dx, *dy) = (x - *sx, y - *sy);
+                if let Some([x0, y0, ..]) = shape::norm_box(&old.pts) {
+                    (*dx, *dy) = Self::snap_by(h, x0, y0, *dx, *dy);
+                }
                 self.move_ghost(h, old, *dx, *dy)
             }
             Gest::Line { a, b, .. } => {
                 let except = a.at.as_ref().map(|e| e.n.clone());
                 let (end, dots) = self.end_at(h, x, y, except.as_deref());
-                *b = end;
+                *b = Self::snap_end(h, end);
                 let ops = shape::line_ops(&[a.x, a.y, b.x, b.y], w, pen.heads, &[], bw);
                 Overlay { ghosts: vec![(c, ops)], dots, ..Overlay::default() }
             }
@@ -1199,6 +1233,29 @@ impl Input {
     }
 
     /// Show the selection's box (and `extra`), and tell the toolbar what Group can do.
+    /// The top-left of the selection: box corners and line ends, else outline boxes.
+    fn sel_corner(&self, h: &mut impl Host) -> Option<(f64, f64)> {
+        let mut c: Option<(f64, f64)> = None;
+        for s in self.sel_items(h) {
+            let (x, y) = match &s.sh {
+                Some(Shape::Box { .. }) => match shape::norm_box(&s.pts) {
+                    Some(b) => (b[0], b[1]),
+                    None => continue,
+                },
+                Some(Shape::Line { .. }) => match h.scene().seg(&s.id).map(|sg| sg.p) {
+                    Some(p) => (p[0].min(p[2]), p[1].min(p[3])),
+                    None => continue,
+                },
+                _ => {
+                    let b = h.bbox(&s);
+                    (b[0], b[1])
+                }
+            };
+            c = Some(c.map_or((x, y), |(a, b)| (a.min(x), b.min(y))));
+        }
+        c
+    }
+
     fn show_sel(&mut self, h: &mut impl Host, extra: Overlay) {
         let items = self.sel_items(h);
         self.sel.retain(|id| items.iter().any(|s| &s.id == id));
@@ -1286,7 +1343,8 @@ impl Input {
         } else if !self.sel.contains(&hit.id) {
             self.sel = Self::members(h, &unit);
         }
-        self.gest = Some(Gest::MoveSel { pointer, sx: x, sy: y, dx: 0.0, dy: 0.0 });
+        let (ox, oy) = self.sel_corner(h).unwrap_or((x, y));
+        self.gest = Some(Gest::MoveSel { pointer, sx: x, sy: y, dx: 0.0, dy: 0.0, ox, oy });
         self.show_sel(h, Overlay::default());
     }
 
@@ -1305,8 +1363,8 @@ impl Input {
                 }
                 Overlay { marquee: Some(r), ..Overlay::default() }
             }
-            Gest::MoveSel { sx, sy, dx, dy, .. } => {
-                (*dx, *dy) = (x - *sx, y - *sy);
+            Gest::MoveSel { sx, sy, dx, dy, ox, oy, .. } => {
+                (*dx, *dy) = Self::snap_by(h, *ox, *oy, x - *sx, y - *sy);
                 self.sel_ghost(h, *dx, *dy)
             }
             _ => Overlay::default(),
@@ -1634,7 +1692,7 @@ mod tests {
                 board: Board::default(),
                 view,
                 mine: vec![],
-                pen: Pen { edit: true, me: Some(1), tool: Tool::Pen, color: Some("#111111".into()), my_color: Some("#abcdef".into()), width: 0.004, fill: false, heads: Heads::End, style: Style::default() },
+                pen: Pen { edit: true, me: Some(1), tool: Tool::Pen, color: Some("#111111".into()), my_color: Some("#abcdef".into()), width: 0.004, fill: false, heads: Heads::End, style: Style::default(), snap: false },
                 net: Net { online: true, ready: true, local: false },
                 now: 10_000.0,
                 ids: 0,
@@ -2346,6 +2404,40 @@ mod tests {
         // a click without a drag makes nothing
         drag(&mut h, &mut i, (x + 0.3, y), (x + 0.3, y));
         assert_eq!(h.sent.len(), 1);
+    }
+
+    #[test]
+    fn snap_to_grid_places_moves_and_frees_line_ends_but_anchors_win() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        h.pen.snap = true;
+        let s = h.view.grid_step();
+        let on = |v: f64| ((v / s).round() * s - v).abs() < 1e-4;
+        let (x, y) = mid(&h);
+        let (x, y) = (x + 0.37 * s, y + 0.41 * s); // off the grid
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        drag(&mut h, &mut i, (x, y), (x + 4.3 * s, y + 3.2 * s));
+        let b = h.board.strokes.last().unwrap().clone();
+        assert!([b.pts[0], b.pts[1], b.pts[3], b.pts[4]].into_iter().all(on), "placed on the grid: {:?}", b.pts);
+        let Some(Shape::Box { n, .. }) = b.sh.clone() else { panic!() };
+        // a line from the box (its anchor wins) to an off-grid point (snaps)
+        h.pen.tool = Tool::Line;
+        drag(&mut h, &mut i, (b.pts[0] + 0.5 * s, b.pts[1] + 0.33 * s), (x + 9.3 * s, y + 7.6 * s));
+        let l = h.board.strokes.last().unwrap().clone();
+        let Some(Shape::Line { a: Some(a), b: None, .. }) = l.sh.clone() else { panic!("{:?}", l.sh) };
+        assert_eq!(a.n, n);
+        assert!(on(l.pts[3]) && on(l.pts[4]), "the free end snapped: {:?}", l.pts);
+        // moving the box by an off-grid amount lands its corner on the grid
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        let (gx, gy) = (b.pts[0] + 0.5 * s, b.pts[1] + 0.5 * s);
+        drag(&mut h, &mut i, (gx, gy), (gx + 2.37 * s, gy + 1.21 * s));
+        let m = h.board.strokes.iter().find(|t| matches!(&t.sh, Some(Shape::Box { n: m, .. }) if *m == n)).unwrap().clone();
+        assert!(on(m.pts[0]) && on(m.pts[1]) && (m.pts[0] - b.pts[0]).abs() > s / 2.0, "moved on the grid: {:?}", m.pts);
+        // and so does a selection moved with the select tool
+        h.pen.tool = Tool::Select;
+        let (gx, gy) = (m.pts[0] + 0.5 * s, m.pts[1] + 0.5 * s);
+        drag(&mut h, &mut i, (gx, gy), (gx - 3.61 * s, gy + 2.18 * s));
+        let m2 = h.board.strokes.iter().find(|t| matches!(&t.sh, Some(Shape::Box { n: m, .. }) if *m == n)).unwrap().clone();
+        assert!(on(m2.pts[0]) && on(m2.pts[1]) && m2.id != m.id, "selection moved on the grid: {:?}", m2.pts);
     }
 
     #[test]

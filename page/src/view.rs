@@ -13,6 +13,8 @@ pub const WX: f64 = -1.0;
 pub const WY: f64 = -ASPECT;
 pub const WW: f64 = 3.0;
 pub const WH: f64 = 3.0 * ASPECT;
+/// The grid's finest step, board units.
+pub const GRID: f64 = 0.025;
 /// At 100% a page shows with a little of its neighbours.
 pub const OVERLAP: f64 = 1.08;
 pub const MAX_ZOOM: f64 = 8.0;
@@ -62,6 +64,29 @@ pub struct Chrome {
 }
 
 /// The window and the view on it.
+/// What the board shows behind the drawing, per viewer and never synced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Grid {
+    /// Plain paper: the default.
+    #[default]
+    Board,
+    Show,
+    Snap,
+}
+
+impl Grid {
+    pub fn key(self) -> &'static str {
+        match self {
+            Grid::Board => "board",
+            Grid::Show => "show",
+            Grid::Snap => "snap",
+        }
+    }
+    pub fn from_key(k: &str) -> Option<Grid> {
+        [Grid::Board, Grid::Show, Grid::Snap].into_iter().find(|g| g.key() == k)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
     /// The window, CSS px.
@@ -244,6 +269,20 @@ impl View {
     pub fn paper(&self) -> Rect {
         let k = self.bw * self.zoom;
         Rect { left: (WX - self.pan_x) * k, top: (WY - self.pan_y) * k, width: WW * k, height: WH * k }
+    }
+
+    /// The grid's step (board units) at this zoom: 1/40 of the board width, five times that
+    /// when it would be under 6 CSS px on screen. Grid lines fall on whole multiples from 0.
+    pub fn grid_step(&self) -> f64 {
+        let s = GRID;
+        if s * self.bw * self.zoom < 6.0 { s * 5.0 } else { s }
+    }
+
+    /// The grid as CSS: (step px, x offset px, y offset px) inside the paper element.
+    pub fn grid_css(&self) -> (f64, f64, f64) {
+        let k = self.bw * self.zoom;
+        let s = self.grid_step() * k;
+        ((s * 1000.0).round() / 1000.0, ((-WX * k) % s * 1000.0).round() / 1000.0, ((-WY * k) % s * 1000.0).round() / 1000.0)
     }
 
     /// `setCtxView`: the canvas transform (a, b, c, d, e, f) that draws board px (board units
@@ -489,4 +528,21 @@ mod tests {
         assert_eq!(v.pen_w(1.0), 0.05);
         assert_eq!(v.pen_w(0.0), 0.0004);
     }
+    #[test]
+    fn the_grid_scales_with_zoom_and_coarsens_when_dense() {
+        let mut v = View::default();
+        v.layout(1300.0, 800.0, 1.0);
+        assert_eq!(v.grid_step(), GRID);
+        let (g, ..) = v.grid_css();
+        v.set(v.zoom * 2.0, v.pan_x, v.pan_y);
+        let (g2, ..) = v.grid_css();
+        assert!((g2 - 2.0 * g).abs() < 0.01, "{g} -> {g2}");
+        v.set(v.min_zoom(), v.pan_x, v.pan_y);
+        if GRID * v.bw * v.zoom < 6.0 {
+            assert_eq!(v.grid_step(), GRID * 5.0);
+        }
+        assert_eq!(Grid::from_key("snap"), Some(Grid::Snap));
+        assert_eq!(Grid::default().key(), "board");
+    }
+
 }
