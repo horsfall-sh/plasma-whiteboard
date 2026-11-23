@@ -279,6 +279,7 @@ fn ptr_of(e: &PointerEvent) -> Ptr {
         x: num(e, "clientX"),
         y: num(e, "clientY"),
         primary: e.is_primary(),
+        shift: e.shift_key(),
     }
 }
 
@@ -360,6 +361,9 @@ pub struct Page {
     style: Style,
     /// The shape menu's last pick, which the shape button shows and returns to.
     shape_pick: Tool,
+    /// What the Group button does now (from the selection).
+    can_group: bool,
+    can_ungroup: bool,
     /// The share question; nothing reaches the relay until it is answered Share.
     ask: ShareGate,
     my_name: String,
@@ -427,6 +431,7 @@ impl Page {
                 if let Some(text) = e.dyn_ref::<MessageEvent>().and_then(|m| m.data().as_string()) {
                     let App { conn, inp, page } = a;
                     conn.frame(page, inp, n, &text);
+                    inp.sel_check(page);
                 }
             }),
             on_close: sock_handler(|a, n, _| {
@@ -465,6 +470,8 @@ impl Page {
             heads: Heads::End,
             style: Style::default(),
             shape_pick: Tool::Shape(BoxKind::Rect),
+            can_group: false,
+            can_ungroup: false,
             ask: ShareGate::default(),
             my_name,
             my_hue,
@@ -788,6 +795,25 @@ impl Page {
         }
         ctx.set_global_alpha(1.0);
         let (u, bw) = (1.0 / self.view.zoom, self.view.bw);
+        let px = |r: &[f64; 4]| (r[0] * bw, r[1] * bw, (r[2] - r[0]) * bw, (r[3] - r[1]) * bw);
+        if let Some(r) = &o.marquee {
+            let (x, y, w, h) = px(r);
+            ctx.set_fill_style_str("rgba(43,124,255,0.08)");
+            ctx.fill_rect(x, y, w, h);
+            ctx.set_line_width(1.0 * u);
+            ctx.set_stroke_style_str("#2b7cff");
+            ctx.stroke_rect(x, y, w, h);
+        }
+        if let Some(r) = &o.sel {
+            let (x, y, w, h) = px(r);
+            let pad = 4.0 * u;
+            let dash = js_sys::Array::of2(&JsValue::from_f64(4.0 * u), &JsValue::from_f64(3.0 * u));
+            let _ = ctx.set_line_dash(&dash);
+            ctx.set_line_width(1.5 * u);
+            ctx.set_stroke_style_str("#2b7cff");
+            ctx.stroke_rect(x - pad, y - pad, w + 2.0 * pad, h + 2.0 * pad);
+            let _ = ctx.set_line_dash(&js_sys::Array::new());
+        }
         for &(x, y, hot) in &o.dots {
             ctx.begin_path();
             let _ = ctx.arc(x * bw, y * bw, if hot { 6.0 } else { 4.0 } * u, 0.0, std::f64::consts::TAU);
@@ -1460,6 +1486,7 @@ impl Page {
             ("textBtn", Tool::Text),
             ("pingBtn", Tool::Ping),
             ("moveBtn", Tool::Move),
+            ("selectBtn", Tool::Select),
         ] {
             if let Some(b) = html(id) {
                 pressed(&b, self.tool == t);
@@ -1497,6 +1524,13 @@ impl Page {
         }
         toggle(&self.d.body, "text", self.tool == Tool::Text);
         toggle(&self.d.body, "move", self.tool == Tool::Move);
+        toggle(&self.d.body, "select", self.tool == Tool::Select);
+        if let Some(b) = html("groupBtn") {
+            attr(&b, "hidden", "");
+            if self.tool == Tool::Select {
+                let _ = b.remove_attribute("hidden");
+            }
+        }
         if let Ok(all) = doc().query_selector_all("#bar [data-w]") {
             for i in 0..all.length() {
                 if let Some(b) = all.item(i).and_then(|n| n.dyn_into::<Element>().ok()) {
@@ -1810,6 +1844,21 @@ impl input::Host for Page {
     fn scene(&mut self) -> &Scene {
         self.fresh_scene();
         &self.scene
+    }
+
+    fn sel_changed(&mut self, can_group: bool, can_ungroup: bool) {
+        (self.can_group, self.can_ungroup) = (can_group, can_ungroup);
+        if let Some(b) = html("groupBtn") {
+            let (t, on) = match (can_group, can_ungroup) {
+                (true, _) => ("Group the selection (Ctrl+G)", true),
+                (false, true) => ("Ungroup (Shift+Ctrl+G)", true),
+                _ => ("Group: select two or more things first", false),
+            };
+            attr(&b, "title", t);
+            attr(&b, "aria-label", t);
+            attr(&b, "aria-disabled", if on { "false" } else { "true" });
+            attr(&b, "aria-pressed", if !can_group && can_ungroup { "true" } else { "false" });
+        }
     }
 
     fn overlay(&mut self, o: Option<Overlay>) {
@@ -2202,6 +2251,15 @@ impl App {
     }
 
     fn bar(&mut self, b: &Element) {
+        if b.id() == "groupBtn" {
+            let App { inp, page, .. } = self;
+            if page.can_group {
+                inp.group_sel(page);
+            } else if page.can_ungroup {
+                inp.ungroup_sel(page);
+            }
+            return;
+        }
         {
             let App { inp, page, .. } = self;
             inp.cancel_shape(page);
@@ -2237,6 +2295,7 @@ impl App {
             "textBtn" => flip(&mut self.page, Tool::Text),
             "pingBtn" => flip(&mut self.page, Tool::Ping),
             "moveBtn" => flip(&mut self.page, Tool::Move),
+            "selectBtn" => flip(&mut self.page, Tool::Select),
             "crumpleBtn" => self.crumple(),
             "shelfBtn" => self.page.toggle_panel("shelfPanel"),
             "layersBtn" => self.page.toggle_panel("layersPanel"),
@@ -2520,13 +2579,14 @@ fn wire(page: &Page) {
         }
         with(|a| match key {
             Key::None => {}
-            Key::Undo | Key::Space => {
+            Key::Undo | Key::Space | Key::Delete | Key::Group | Key::Ungroup => {
                 let App { inp, page, .. } = a;
                 inp.key(page, key);
             }
             Key::ClosePanel => {
                 let App { inp, page, .. } = a;
                 inp.cancel_shape(page);
+                inp.deselect(page);
                 page.open_panel(None);
             }
             Key::ZoomStep(f) => a.zoom_step(f),
@@ -2587,7 +2647,16 @@ fn wire(page: &Page) {
     // the toolbar, the page arrows and the map
     listen_id("bar", "click", |e| {
         let Some(b) = closest(&e, "button") else { return };
-        with(|a| a.bar(&b));
+        with(|a| {
+            a.bar(&b);
+            // leaving the select tool drops the selection; staying keeps its box drawn
+            let App { inp, page, .. } = a;
+            if page.tool == Tool::Select {
+                inp.sel_redraw(page);
+            } else {
+                inp.deselect(page);
+            }
+        });
     });
     for (id, di, dj) in [("pgL", -1.0, 0.0), ("pgR", 1.0, 0.0), ("pgU", 0.0, -1.0), ("pgD", 0.0, 1.0)] {
         listen_id(id, "click", move |_| {

@@ -424,6 +424,12 @@ impl Scene {
 
     /// [`Scene::resolve`], as if node `moved.0` were at `moved.1` (a shape being dragged).
     pub fn resolve_with(&self, it: &Item, moved: Option<(&str, &Node)>) -> Option<Seg> {
+        self.resolve_in(it, |n| moved.filter(|m| m.0 == n).map(|m| *m.1))
+    }
+
+    /// [`Scene::resolve`], with the nodes `moved` gives standing where it says (a selection
+    /// being dragged).
+    pub fn resolve_in(&self, it: &Item, moved: impl Fn(&str) -> Option<Node>) -> Option<Seg> {
         let Some(Shape::Line { h, a, b }) = &it.sh else { return None };
         if it.pts.len() < 6 {
             return None;
@@ -431,7 +437,7 @@ impl Scene {
         let end = |e: &Option<Anchor>, x: f64, y: f64| -> Option<(f64, f64)> {
             match e {
                 None => Some((x, y)),
-                Some(e) => match moved.filter(|m| m.0 == e.n).map(|m| m.1).or_else(|| self.nodes.get(&e.n)) {
+                Some(e) => match moved(&e.n).or_else(|| self.nodes.get(&e.n).copied()) {
                     Some(nd) => Some(anchor_point(nd.kind, &nd.bb, e.s, e.t)),
                     None if self.hidden_nodes.contains(&e.n) => None,
                     // the shape is gone (erased by its owner): the end stays where it was drawn

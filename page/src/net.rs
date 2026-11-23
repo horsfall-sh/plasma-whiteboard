@@ -993,6 +993,34 @@ mod tests {
     }
 
     #[test]
+    fn another_clients_batch_moves_three_shapes_and_their_connector_in_one_frame() {
+        // what the relay sends the second client when the first moves a selection: one x of u + e
+        let (mut h, mut inp) = (Rec::default(), Input::default());
+        let mut c = online(&mut h, &mut inp, true);
+        let bx = |id: &str, n: &str, x: f64| {
+            format!(r##"{{"t":"e","id":"{id}","l":2,"c":"#111111","w":0.004,"pts":[{x},0.1,0.5,{},0.2,0.5],"sh":{{"k":"rect","n":"{n}","f":false,"g":["G"]}}}}"##, x + 0.1)
+        };
+        let ln = |id: &str, y: f64| {
+            format!(r##"{{"t":"e","id":"{id}","l":2,"c":"#111111","w":0.004,"pts":[0.15,{y},0.5,0.35,{y},0.5],"sh":{{"k":"line","h":"end","a":{{"n":"A","s":1,"t":0.5}},"b":{{"n":"B","s":3,"t":0.5}},"g":["G"]}}}}"##)
+        };
+        for f in [bx("a1", "A", 0.1), bx("b1", "B", 0.3), bx("c1", "C", 0.5), ln("l1", 0.15)] {
+            c.frame(&mut h, &mut inp, 1, &f);
+        }
+        assert_eq!(h.b.strokes.len(), 4);
+        h.take();
+        let mut parts: Vec<String> = ["a1", "b1", "c1", "l1"].iter().map(|id| format!(r#"{{"t":"u","id":"{id}"}}"#)).collect();
+        let down = |f: String| f.replace(",0.1,0.5,", ",0.3,0.5,").replace(",0.2,0.5]", ",0.4,0.5]");
+        parts.extend([down(bx("a2", "A", 0.1)), down(bx("b2", "B", 0.3)), down(bx("c2", "C", 0.5)), ln("l2", 0.35)]);
+        c.frame(&mut h, &mut inp, 1, &format!(r#"{{"t":"x","a":[{}]}}"#, parts.join(",")));
+        let ids: Vec<&str> = h.b.strokes.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a2", "b2", "c2", "l2"]);
+        assert!(h.b.strokes.iter().all(|s| s.st.g == ["G"]), "the group survives the move");
+        let scene = crate::shape::Scene::build(&h.b.strokes, |_| false);
+        let seg = scene.seg("l2").unwrap();
+        assert!((seg.p[1] - 0.35).abs() < 1e-9 && (seg.p[3] - 0.35).abs() < 1e-9, "the connector follows: {:?}", seg.p);
+    }
+
+    #[test]
     fn frames_from_an_old_socket_are_ignored() {
         let (mut h, mut inp) = (Rec::default(), Input::default());
         let mut c = online(&mut h, &mut inp, true);

@@ -41,6 +41,8 @@ pub enum Tool {
     Shape(BoxKind),
     /// Drag a straight line; an end dropped on a shape attaches to it.
     Line,
+    /// Pick my items (click, shift-click, a marquee) to move, delete or group them.
+    Select,
 }
 
 /// One pointer event, or one of its coalesced samples. `x`, `y` are client px.
@@ -54,6 +56,8 @@ pub struct Ptr {
     pub x: f64,
     pub y: f64,
     pub primary: bool,
+    /// Shift held: a click adds to the selection.
+    pub shift: bool,
 }
 
 /// What the toolbar and `hello` have set.
@@ -130,6 +134,8 @@ pub trait Host {
     fn scene(&mut self) -> &Scene;
     /// Show `o` over the live canvas until the next call; `None` clears it.
     fn overlay(&mut self, o: Option<Overlay>);
+    /// The selection changed: whether Group and Ungroup would do anything now.
+    fn sel_changed(&mut self, can_group: bool, can_ungroup: bool);
 }
 
 /// What the page draws over the live canvas during a shape gesture: ghosts of the result, and
@@ -140,6 +146,10 @@ pub struct Overlay {
     pub ghosts: Vec<(String, Vec<Op>)>,
     /// Anchor dots, board units; `true` for the one a release would attach to.
     pub dots: Vec<(f64, f64, bool)>,
+    /// The selection's box, board units.
+    pub sel: Option<[f64; 4]>,
+    /// The marquee being dragged, board units.
+    pub marquee: Option<[f64; 4]>,
 }
 
 /// One end of a line being drawn: where it is, and the anchor it is on.
@@ -156,12 +166,20 @@ pub enum Gest {
     NewBox { pointer: i32, kind: BoxKind, x0: f64, y0: f64, x1: f64, y1: f64 },
     MoveBox { pointer: i32, old: Item, sx: f64, sy: f64, dx: f64, dy: f64 },
     Line { pointer: i32, a: End, b: End },
+    /// A marquee from empty board; `base` is what was selected before (kept with Shift).
+    Marquee { pointer: i32, base: Vec<String>, x0: f64, y0: f64, x1: f64, y1: f64 },
+    /// The selection being dragged.
+    MoveSel { pointer: i32, sx: f64, sy: f64, dx: f64, dy: f64 },
 }
 
 impl Gest {
     fn pointer(&self) -> i32 {
         match self {
-            Gest::NewBox { pointer, .. } | Gest::MoveBox { pointer, .. } | Gest::Line { pointer, .. } => *pointer,
+            Gest::NewBox { pointer, .. }
+            | Gest::MoveBox { pointer, .. }
+            | Gest::Line { pointer, .. }
+            | Gest::Marquee { pointer, .. }
+            | Gest::MoveSel { pointer, .. } => *pointer,
         }
     }
 }
@@ -232,6 +250,12 @@ pub struct Input {
     /// Edits that replace or remove items, by the id `mine` holds for them: what undo puts
     /// back. A plain new item has none; undo just takes it away.
     pub steps: HashMap<String, Step>,
+    /// My selected items (every member of a selected group).
+    pub sel: Vec<String>,
+    /// The groups entered by double-click, outermost first: clicks pick inside the last.
+    pub group_path: Vec<String>,
+    /// The last select click: when, and on which item (for a double-click).
+    last_click: Option<(f64, String)>,
 }
 
 /// One change of my items, undone as one: `gone` are the items it took away (put back with
@@ -261,6 +285,9 @@ impl Default for Input {
             hover: Hover::default(),
             steps: HashMap::new(),
             shown: false,
+            sel: vec![],
+            group_path: vec![],
+            last_click: None,
         }
     }
 }
@@ -421,6 +448,10 @@ impl Input {
             self.shape_down(h, e, &pen);
             return true;
         }
+        if pen.tool == Tool::Select {
+            self.select_down(h, e);
+            return true;
+        }
         // Button 5 / buttons bit 32 is the eraser end of a pen.
         let pen_eraser = t == Kind::Pen && (e.button == 5 || e.buttons & 32 != 0);
         let ping = pen.tool == Tool::Ping && !pen_eraser;
@@ -486,8 +517,12 @@ impl Input {
                 return;
             }
         }
-        if self.gest.as_ref().is_some_and(|g| g.pointer() == e.id) {
-            self.shape_move(h, e);
+        if let Some(g) = self.gest.as_ref().filter(|g| g.pointer() == e.id) {
+            if matches!(g, Gest::Marquee { .. } | Gest::MoveSel { .. }) {
+                self.select_move(h, e);
+            } else {
+                self.shape_move(h, e);
+            }
             return;
         }
         if self.cur.is_none() && self.gest.is_none() {
@@ -575,8 +610,12 @@ impl Input {
             }
             return;
         }
-        if self.gest.as_ref().is_some_and(|g| g.pointer() == e.id) {
-            self.shape_end(h, up);
+        if let Some(g) = self.gest.as_ref().filter(|g| g.pointer() == e.id) {
+            if matches!(g, Gest::Marquee { .. } | Gest::MoveSel { .. }) {
+                self.select_end(h, up);
+            } else {
+                self.shape_end(h, up);
+            }
             return;
         }
         self.end_stroke(h, e.id);
@@ -726,6 +765,10 @@ impl Input {
             self.close_editor(h, false); // undo while typing cancels the text box
             return;
         }
+        if !self.sel.is_empty() {
+            self.sel.clear();
+            self.show_sel(h, Overlay::default());
+        }
         while let Some(id) = h.mine().pop() {
             if let Some(step) = self.steps.remove(&id) {
                 if self.undo_step(h, step) {
@@ -753,6 +796,9 @@ impl Input {
         match k {
             Key::Undo => self.undo(h),
             Key::Space => self.space_down = true,
+            Key::Delete => self.delete_sel(h),
+            Key::Group => self.group_sel(h),
+            Key::Ungroup => self.ungroup_sel(h),
             _ => {}
         }
     }
@@ -820,7 +866,7 @@ impl Input {
         }
         let (x, y) = Self::board_at(h, e);
         let (_, dots) = self.end_at(h, x, y, None);
-        self.show(h, (!dots.is_empty()).then(|| Overlay { ghosts: vec![], dots }));
+        self.show(h, (!dots.is_empty()).then(|| Overlay { ghosts: vec![], dots, ..Overlay::default() }));
     }
 
     fn shape_down(&mut self, h: &mut impl Host, e: &Ptr, pen: &Pen) {
@@ -830,7 +876,7 @@ impl Input {
             Tool::Line => {
                 let (a, dots) = self.end_at(h, x, y, None);
                 self.gest = Some(Gest::Line { pointer, a: a.clone(), b: a });
-                self.show(h, Some(Overlay { ghosts: vec![], dots }));
+                self.show(h, Some(Overlay { ghosts: vec![], dots, ..Overlay::default() }));
             }
             Tool::Shape(kind) => {
                 let m = 4.0 * Self::per_px(h);
@@ -867,7 +913,7 @@ impl Input {
             Gest::NewBox { kind, x0, y0, x1, y1, .. } => {
                 (*x1, *y1) = (x, y);
                 let bb = [x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)];
-                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, w, bw))], dots: vec![] }
+                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, w, bw))], ..Overlay::default() }
             }
             Gest::MoveBox { old, sx, sy, dx, dy, .. } => {
                 (*dx, *dy) = (x - *sx, y - *sy);
@@ -878,8 +924,9 @@ impl Input {
                 let (end, dots) = self.end_at(h, x, y, except.as_deref());
                 *b = end;
                 let ops = shape::line_ops(&[a.x, a.y, b.x, b.y], w, pen.heads, &[], bw);
-                Overlay { ghosts: vec![(c, ops)], dots }
+                Overlay { ghosts: vec![(c, ops)], dots, ..Overlay::default() }
             }
+            Gest::Marquee { .. } | Gest::MoveSel { .. } => Overlay::default(),
         };
         self.gest = Some(g);
         self.show(h, Some(o));
@@ -907,7 +954,7 @@ impl Input {
                 ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], bw)));
             }
         }
-        Overlay { ghosts, dots: vec![] }
+        Overlay { ghosts, ..Overlay::default() }
     }
 
     fn shape_end(&mut self, h: &mut impl Host, up: bool) {
@@ -947,6 +994,7 @@ impl Input {
                 let bt = b.at.filter(|bt| a.at.as_ref().is_none_or(|at| at.n != bt.n));
                 self.commit(h, c, w, pts, Shape::Line { h: pen.heads, a: a.at, b: bt });
             }
+            Gest::Marquee { .. } | Gest::MoveSel { .. } => {}
         }
     }
 
@@ -1055,6 +1103,387 @@ impl Input {
     }
 }
 
+// ---- selection and groups (A-166 items 12, 17) ---------------------------------------------
+// The select tool picks my items. A click picks the unit under it: the item, or the outermost
+// group it is in below the groups entered by double-click. Moving, deleting, grouping and
+// ungrouping are each ONE edit: one `x` to the relay and one undo step.
+
+/// A click picks this much past an item's edge, screen px.
+const PICK_PX: f64 = 6.0;
+/// Two clicks on one item this close together (ms) are a double-click.
+const DOUBLE_MS: f64 = 400.0;
+
+/// Distance from `(x, y)` to the segment `a`-`b`.
+fn seg_dist(x: f64, y: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let l = dx * dx + dy * dy;
+    let t = if l == 0.0 { 0.0 } else { (((x - a.0) * dx + (y - a.1) * dy) / l).clamp(0.0, 1.0) };
+    (x - a.0 - t * dx).hypot(y - a.1 - t * dy)
+}
+
+/// `pts` (x, y, p triples) moved by `(dx, dy)`.
+fn shifted(pts: &[f64], dx: f64, dy: f64) -> Vec<f64> {
+    pts.chunks(3).flat_map(|c| [r5(c[0] + dx), r5(c.get(1).copied().unwrap_or(0.0) + dy), c.get(2).copied().unwrap_or(0.5)]).collect()
+}
+
+/// What a click picks: the group `g[depth]` when the item is deeper than `path`, else the item.
+/// `None` when the item is not inside `path` at all.
+fn unit_of(it: &Item, path: &[String]) -> Option<String> {
+    let g = &it.st.g;
+    if !g.starts_with(path) {
+        return None;
+    }
+    Some(g.get(path.len()).cloned().unwrap_or_else(|| it.id.clone()))
+}
+
+impl Input {
+    /// Whether the select tool may pick `s`: mine, visible, not an eraser stroke.
+    fn pickable(h: &impl Host, s: &Item, me: Option<Layer>) -> bool {
+        s.l == me && me.is_some() && s.c != ERASER_COLOR && !h.hidden(s.l)
+    }
+
+    /// My topmost item under board point `(x, y)`.
+    fn pick(h: &mut impl Host, x: f64, y: f64) -> Option<Item> {
+        let me = h.pen().me;
+        let m = PICK_PX * Self::per_px(h);
+        let n = h.board().strokes.len();
+        for i in (0..n).rev() {
+            let s = h.board().strokes[i].clone();
+            if !Self::pickable(h, &s, me) {
+                continue;
+            }
+            let hit = match &s.sh {
+                Some(Shape::Line { .. }) => {
+                    let p = h.scene().seg(&s.id).map(|sg| sg.p);
+                    p.is_some_and(|p| seg_dist(x, y, (p[0], p[1]), (p[2], p[3])) <= m + s.w / 2.0)
+                }
+                Some(Shape::Box { .. }) => {
+                    let b = h.bbox(&s);
+                    x >= b[0] - m && x <= b[2] + m && y >= b[1] - m && y <= b[3] + m
+                }
+                None if s.txt.is_some() => {
+                    let b = h.bbox(&s);
+                    x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]
+                }
+                None => {
+                    let xy: Vec<(f64, f64)> = s.pts.chunks(3).filter(|c| c.len() >= 2).map(|c| (c[0], c[1])).collect();
+                    let tol = m + s.w / 2.0;
+                    match xy.len() {
+                        0 => false,
+                        1 => (x - xy[0].0).hypot(y - xy[0].1) <= tol,
+                        _ => xy.windows(2).any(|w| seg_dist(x, y, w[0], w[1]) <= tol),
+                    }
+                }
+            };
+            if hit {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    /// Every one of my items in the unit `u` (a group id or an item id).
+    fn members(h: &mut impl Host, u: &str) -> Vec<String> {
+        let me = h.pen().me;
+        let all: Vec<Item> = h.board().strokes.iter().filter(|s| s.l == me).cloned().collect();
+        let mut ids: Vec<String> = all.iter().filter(|s| s.st.g.iter().any(|g| g == u)).map(|s| s.id.clone()).collect();
+        if ids.is_empty() && all.iter().any(|s| s.id == u) {
+            ids.push(u.to_string());
+        }
+        ids
+    }
+
+    /// The selected items still on the board, in board order.
+    fn sel_items(&self, h: &mut impl Host) -> Vec<Item> {
+        h.board().strokes.iter().filter(|s| self.sel.contains(&s.id)).cloned().collect()
+    }
+
+    /// Show the selection's box (and `extra`), and tell the toolbar what Group can do.
+    fn show_sel(&mut self, h: &mut impl Host, extra: Overlay) {
+        let items = self.sel_items(h);
+        self.sel.retain(|id| items.iter().any(|s| &s.id == id));
+        let mut bb: Option<[f64; 4]> = None;
+        for s in &items {
+            let b = match &s.sh {
+                Some(Shape::Line { .. }) => match h.scene().seg(&s.id).map(|sg| sg.p) {
+                    Some(p) => [p[0].min(p[2]), p[1].min(p[3]), p[0].max(p[2]), p[1].max(p[3])],
+                    None => h.bbox(s),
+                },
+                _ => h.bbox(s),
+            };
+            bb = Some(match bb {
+                None => b,
+                Some(a) => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+            });
+        }
+        let units = self.units(&items);
+        let can_group = units.len() >= 2;
+        let can_ungroup = items.iter().any(|s| s.st.g.len() > self.group_path.len());
+        h.sel_changed(can_group, can_ungroup);
+        let o = Overlay { sel: if extra.ghosts.is_empty() { bb } else { None }, ..extra };
+        let empty = o.ghosts.is_empty() && o.dots.is_empty() && o.sel.is_none() && o.marquee.is_none();
+        self.show(h, (!empty).then_some(o));
+    }
+
+    /// The distinct units (groups below the entered path, or loose items) in `items`.
+    fn units(&self, items: &[Item]) -> Vec<String> {
+        let mut u: Vec<String> = vec![];
+        for s in items {
+            let k = unit_of(s, &self.group_path).unwrap_or_else(|| s.id.clone());
+            if !u.contains(&k) {
+                u.push(k);
+            }
+        }
+        u
+    }
+
+    /// Clear the selection and leave any entered group (Escape, a tool change).
+    pub fn deselect(&mut self, h: &mut impl Host) {
+        let had = !self.sel.is_empty() || !self.group_path.is_empty();
+        self.sel.clear();
+        self.group_path.clear();
+        self.last_click = None;
+        if had {
+            self.show_sel(h, Overlay::default());
+        }
+    }
+
+    fn select_down(&mut self, h: &mut impl Host, e: &Ptr) {
+        let (x, y) = Self::board_at(h, e);
+        let pointer = e.id;
+        let now = h.now();
+        let Some(hit) = Self::pick(h, x, y) else {
+            let base = if e.shift { self.sel.clone() } else { vec![] };
+            if !e.shift {
+                self.sel.clear();
+                self.group_path.clear();
+            }
+            self.last_click = None;
+            self.gest = Some(Gest::Marquee { pointer, base, x0: x, y0: y, x1: x, y1: y });
+            return self.show_sel(h, Overlay::default());
+        };
+        // a click outside the entered group leaves it
+        if unit_of(&hit, &self.group_path).is_none() {
+            self.group_path.clear();
+        }
+        let double = self.last_click.as_ref().is_some_and(|(t, id)| now - t < DOUBLE_MS && *id == hit.id);
+        self.last_click = Some((now, hit.id.clone()));
+        let mut unit = unit_of(&hit, &self.group_path).unwrap_or_else(|| hit.id.clone());
+        if double && unit != hit.id {
+            // enter the group: the next click picks inside it
+            self.group_path.push(unit);
+            unit = unit_of(&hit, &self.group_path).unwrap_or_else(|| hit.id.clone());
+            self.sel = Self::members(h, &unit);
+            self.last_click = None;
+        } else if e.shift {
+            let ids = Self::members(h, &unit);
+            if ids.iter().all(|i| self.sel.contains(i)) {
+                self.sel.retain(|i| !ids.contains(i));
+            } else {
+                self.sel.extend(ids.into_iter().filter(|i| !self.sel.contains(i)).collect::<Vec<_>>());
+            }
+            return self.show_sel(h, Overlay::default());
+        } else if !self.sel.contains(&hit.id) {
+            self.sel = Self::members(h, &unit);
+        }
+        self.gest = Some(Gest::MoveSel { pointer, sx: x, sy: y, dx: 0.0, dy: 0.0 });
+        self.show_sel(h, Overlay::default());
+    }
+
+    fn select_move(&mut self, h: &mut impl Host, e: &Ptr) {
+        let (x, y) = Self::board_at(h, e);
+        let Some(mut g) = self.gest.take() else { return };
+        let extra = match &mut g {
+            Gest::Marquee { base, x0, y0, x1, y1, .. } => {
+                (*x1, *y1) = (x, y);
+                let r = [x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)];
+                self.sel = base.clone();
+                for id in self.in_marquee(h, r) {
+                    if !self.sel.contains(&id) {
+                        self.sel.push(id);
+                    }
+                }
+                Overlay { marquee: Some(r), ..Overlay::default() }
+            }
+            Gest::MoveSel { sx, sy, dx, dy, .. } => {
+                (*dx, *dy) = (x - *sx, y - *sy);
+                self.sel_ghost(h, *dx, *dy)
+            }
+            _ => Overlay::default(),
+        };
+        self.gest = Some(g);
+        self.show_sel(h, extra);
+    }
+
+    /// The members of every unit wholly inside `r`.
+    fn in_marquee(&self, h: &mut impl Host, r: [f64; 4]) -> Vec<String> {
+        let me = h.pen().me;
+        let all: Vec<Item> = h.board().strokes.clone();
+        let mut inside: HashMap<String, bool> = HashMap::new();
+        let mut order: Vec<String> = vec![];
+        for s in &all {
+            if !Self::pickable(h, s, me) {
+                continue;
+            }
+            let Some(u) = unit_of(s, &self.group_path) else { continue };
+            let b = match &s.sh {
+                Some(Shape::Line { .. }) => match h.scene().seg(&s.id).map(|sg| sg.p) {
+                    Some(p) => [p[0].min(p[2]), p[1].min(p[3]), p[0].max(p[2]), p[1].max(p[3])],
+                    None => continue,
+                },
+                _ => h.bbox(s),
+            };
+            let ok = b[0] >= r[0] && b[1] >= r[1] && b[2] <= r[2] && b[3] <= r[3];
+            let e = inside.entry(u.clone()).or_insert_with(|| {
+                order.push(u.clone());
+                true
+            });
+            *e &= ok;
+        }
+        let mut ids = vec![];
+        for u in order {
+            if inside[&u] {
+                ids.extend(Self::members(h, &u));
+            }
+        }
+        ids
+    }
+
+    /// The selection moved by `(dx, dy)`, with every line on a moved shape following.
+    fn sel_ghost(&self, h: &mut impl Host, dx: f64, dy: f64) -> Overlay {
+        let bw = h.view().bw;
+        let items = self.sel_items(h);
+        let mut moved: HashMap<String, Node> = HashMap::new();
+        let mut ghosts = vec![];
+        for s in &items {
+            match &s.sh {
+                Some(Shape::Box { kind, fill, n }) => {
+                    let Some([x0, y0, x1, y1]) = shape::norm_box(&s.pts) else { continue };
+                    let nd = Node { kind: *kind, bb: [x0 + dx, y0 + dy, x1 + dx, y1 + dy] };
+                    ghosts.push((s.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, s.w, bw)));
+                    moved.insert(n.clone(), nd);
+                }
+                Some(Shape::Line { .. }) => {}
+                None if s.txt.is_some() => {
+                    let b = h.bbox(s);
+                    ghosts.push((s.c.clone(), shape::box_ops(BoxKind::Rect, &[b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy], false, 0.001, bw)));
+                }
+                None => ghosts.push((s.c.clone(), geom::full(&shifted(&s.pts, dx, dy), s.w, bw))),
+            }
+        }
+        let lines: Vec<Item> = h
+            .board()
+            .strokes
+            .iter()
+            .filter(|s| s.sh.as_ref().is_some_and(|sh| sh.is_line() && (self.sel.contains(&s.id) || moved.keys().any(|n| sh.touches(n)))))
+            .cloned()
+            .collect();
+        for it in lines {
+            if h.hidden(it.l) {
+                continue;
+            }
+            let it = if self.sel.contains(&it.id) { Item { pts: shifted(&it.pts, dx, dy), ..it } } else { it };
+            if let Some(seg) = h.scene().resolve_in(&it, |n| moved.get(n).copied()) {
+                ghosts.push((it.c.clone(), shape::line_ops(&seg.p, seg.w, seg.h, &[], bw)));
+            }
+        }
+        Overlay { ghosts, ..Overlay::default() }
+    }
+
+    fn select_end(&mut self, h: &mut impl Host, up: bool) {
+        let g = self.gest.take();
+        if let (Some(Gest::MoveSel { dx, dy, .. }), true) = (g, up) {
+            if dx.abs().max(dy.abs()) >= 2.0 * Self::per_px(h) {
+                let old = self.sel_items(h);
+                let new: Vec<Item> = old.iter().map(|s| Item { id: h.new_id(), q: None, pts: shifted(&s.pts, dx, dy), ..s.clone() }).collect();
+                self.replace_sel(h, old, new);
+            }
+        }
+        self.show_sel(h, Overlay::default());
+    }
+
+    /// One edit from `old` to `new`; the selection becomes `new`.
+    fn replace_sel(&mut self, h: &mut impl Host, old: Vec<Item>, new: Vec<Item>) {
+        let keep: Vec<String> = self.sel.iter().filter(|id| !old.iter().any(|o| &o.id == *id)).cloned().collect();
+        let ids: Vec<String> = new.iter().map(|n| n.id.clone()).collect();
+        self.edit(h, old, new);
+        self.sel = keep.into_iter().chain(ids).collect();
+    }
+
+    /// Delete or Backspace: the selection goes, as one edit.
+    fn delete_sel(&mut self, h: &mut impl Host) {
+        let old = self.sel_items(h);
+        if old.is_empty() || self.gest.is_some() {
+            return;
+        }
+        self.replace_sel(h, old, vec![]);
+        self.sel.clear();
+        self.show_sel(h, Overlay::default());
+    }
+
+    /// Ctrl/Cmd+G: the selected units become one group, inside the entered one.
+    pub fn group_sel(&mut self, h: &mut impl Host) {
+        let old = self.sel_items(h);
+        if self.units(&old).len() < 2 || self.gest.is_some() {
+            return;
+        }
+        let at = self.group_path.len();
+        if old.iter().any(|s| s.st.g.len() >= shape::MAX_GROUP_DEPTH || !s.st.g.starts_with(&self.group_path)) {
+            return;
+        }
+        let gid = h.new_id();
+        let new: Vec<Item> = old
+            .iter()
+            .map(|s| {
+                let mut st = s.st.clone();
+                st.g.insert(at, gid.clone());
+                Item { id: h.new_id(), q: None, st, ..s.clone() }
+            })
+            .collect();
+        self.replace_sel(h, old, new);
+        self.show_sel(h, Overlay::default());
+    }
+
+    /// Shift+Ctrl/Cmd+G: the selected groups below the entered one come apart one level.
+    pub fn ungroup_sel(&mut self, h: &mut impl Host) {
+        let at = self.group_path.len();
+        let old: Vec<Item> = self.sel_items(h).into_iter().filter(|s| s.st.g.len() > at).collect();
+        if old.is_empty() || self.gest.is_some() {
+            return;
+        }
+        let new: Vec<Item> = old
+            .iter()
+            .map(|s| {
+                let mut st = s.st.clone();
+                st.g.remove(at);
+                Item { id: h.new_id(), q: None, st, ..s.clone() }
+            })
+            .collect();
+        self.replace_sel(h, old, new);
+        self.show_sel(h, Overlay::default());
+    }
+
+    /// Draw the selection's box again (after something cleared the overlay).
+    pub fn sel_redraw(&mut self, h: &mut impl Host) {
+        if !self.sel.is_empty() && self.gest.is_none() {
+            self.show_sel(h, Overlay::default());
+        }
+    }
+
+    /// The board changed under the selection (a refusal, a layer deleted): drop what is gone.
+    pub fn sel_check(&mut self, h: &mut impl Host) {
+        if self.sel.is_empty() || self.gest.is_some() {
+            return;
+        }
+        let n = self.sel.len();
+        let on: Vec<String> = self.sel.iter().filter(|id| h.board().has(id)).cloned().collect();
+        if on.len() != n {
+            self.sel = on;
+            self.show_sel(h, Overlay::default());
+        }
+    }
+}
+
 /// The `s` frame that sends item `f`.
 pub fn out_of(f: &Item) -> Out {
     Out::Stroke { id: f.id.clone(), c: f.c.clone(), w: f.w, pts: f.pts.clone(), txt: f.txt.clone(), sh: f.sh.clone(), st: f.st.clone() }
@@ -1085,12 +1514,18 @@ pub enum Key {
     ZoomHome,
     PageStep(f64, f64),
     Space,
+    /// Delete or Backspace: remove the selection.
+    Delete,
+    /// Ctrl/Cmd+G: group the selection.
+    Group,
+    /// Shift+Ctrl/Cmd+G: take the selection out of its group.
+    Ungroup,
 }
 
 impl Key {
     /// Whether the handler calls `preventDefault`.
     pub fn prevents(self) -> bool {
-        matches!(self, Key::Undo | Key::Space)
+        matches!(self, Key::Undo | Key::Space | Key::Group | Key::Ungroup)
     }
 }
 
@@ -1098,6 +1533,13 @@ impl Key {
 pub fn key(key: &str, ctrl: bool, meta: bool, shift: bool, alt: bool, in_input: bool) -> Key {
     if (ctrl || meta) && !shift && !alt && key.to_lowercase() == "z" {
         return if in_input { Key::None } else { Key::Undo };
+    }
+    if (ctrl || meta) && !alt && key.to_lowercase() == "g" {
+        return match (in_input, shift) {
+            (true, _) => Key::None,
+            (false, false) => Key::Group,
+            (false, true) => Key::Ungroup,
+        };
     }
     if key == "Escape" {
         return Key::ClosePanel;
@@ -1114,6 +1556,7 @@ pub fn key(key: &str, ctrl: bool, meta: bool, shift: bool, alt: bool, in_input: 
         "ArrowUp" => Key::PageStep(0.0, -1.0),
         "ArrowDown" => Key::PageStep(0.0, 1.0),
         " " => Key::Space,
+        "Delete" | "Backspace" if !shift => Key::Delete,
         _ => Key::None,
     }
 }
@@ -1307,10 +1750,13 @@ mod tests {
             self.log.push(format!("overlay {}", o.as_ref().map_or("off".into(), |o| format!("{} ghosts {} dots", o.ghosts.len(), o.dots.len()))));
             self.over = o;
         }
+        fn sel_changed(&mut self, g: bool, u: bool) {
+            self.log.push(format!("sel {g} {u}"));
+        }
     }
 
     fn ptr(kind: Kind, id: i32, x: f64, y: f64) -> Ptr {
-        Ptr { id, kind, button: 0, buttons: 1, pressure: 0.5, x, y, primary: true }
+        Ptr { id, kind, button: 0, buttons: 1, pressure: 0.5, x, y, primary: true, shift: false }
     }
     fn mouse(x: f64, y: f64) -> Ptr {
         ptr(Kind::Mouse, 1, x, y)
@@ -1614,6 +2060,13 @@ mod tests {
         assert_eq!(key("0", false, false, false, false, true), Key::None);
         assert_eq!(key(" ", false, false, false, false, false), Key::Space);
         assert!(Key::Space.prevents() && Key::Undo.prevents() && !Key::ZoomHome.prevents());
+        assert_eq!(key("g", true, false, false, false, false), Key::Group);
+        assert_eq!(key("G", false, true, true, false, false), Key::Ungroup);
+        assert_eq!(key("g", true, false, false, false, true), Key::None);
+        assert_eq!(key("Delete", false, false, false, false, false), Key::Delete);
+        assert_eq!(key("Backspace", false, false, false, false, false), Key::Delete);
+        assert_eq!(key("Backspace", false, false, false, false, true), Key::None);
+        assert!(Key::Group.prevents() && Key::Ungroup.prevents() && !Key::Delete.prevents());
         assert_eq!(editor_key("Enter", false, false), Some(true));
         assert_eq!(editor_key("Enter", true, false), None);
         assert_eq!(editor_key("Enter", false, true), None);
@@ -1705,6 +2158,175 @@ mod tests {
     fn mid(h: &Rec) -> (f64, f64) {
         let v = &h.view;
         (v.pan_x + v.vis_w(v.zoom) / 2.0, v.pan_y + v.vis_h(v.zoom) / 2.0)
+    }
+
+    /// Three of my rectangles in a row, and a line from the first to the second.
+    fn three_boxes_and_a_line(h: &mut Rec, i: &mut Input) -> (f64, f64) {
+        let (x, y) = mid(h);
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        for k in 0..3 {
+            let x0 = x + 0.2 * k as f64;
+            drag(h, i, (x0, y), (x0 + 0.1, y + 0.1));
+        }
+        h.pen.tool = Tool::Line;
+        drag(h, i, (x + 0.05, y + 0.05), (x + 0.25, y + 0.05));
+        assert_eq!(h.mine.len(), 4);
+        h.pen.tool = Tool::Select;
+        (x, y)
+    }
+
+    /// A select-tool click at board point `(x, y)`, later than any earlier one.
+    fn click(h: &mut Rec, i: &mut Input, x: f64, y: f64, shift: bool) {
+        h.now += 1000.0;
+        let p = Ptr { shift, ..at(h, x, y) };
+        i.down(h, &p);
+        i.end(h, &p, true);
+    }
+
+    fn batch(o: &Out) -> Vec<Out> {
+        match o {
+            Out::Batch(a) => a.clone(),
+            o => panic!("not one x: {}", o.frame()),
+        }
+    }
+
+    #[test]
+    fn a_marquee_moves_three_shapes_and_their_connector_as_one_x_and_one_undo() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = three_boxes_and_a_line(&mut h, &mut i);
+        let line = h.mine[3].clone();
+        let before: Vec<Item> = h.board.strokes.clone();
+        drag(&mut h, &mut i, (x - 0.05, y - 0.05), (x + 0.55, y + 0.2));
+        assert_eq!(i.sel.len(), 4, "the marquee holds all four");
+        assert!(h.over.as_ref().is_some_and(|o| o.sel.is_some()), "the selection shows its box");
+        let sent = h.sent.len();
+        // drag the first box down: everything selected goes with it, in ONE x
+        let p = at(&h, x + 0.02, y + 0.02);
+        i.down(&mut h, &p);
+        let p = at(&h, x + 0.02, y + 0.12);
+        i.moved(&mut h, &p, &[]);
+        assert_eq!(h.over.as_ref().map(|o| o.ghosts.len()), Some(4), "ghosts of three boxes and the line");
+        i.end(&mut h, &p, true);
+        assert_eq!(h.sent.len(), sent + 1);
+        let parts = batch(&h.sent[sent]);
+        assert_eq!(parts.len(), 8);
+        assert!(parts[..4].iter().all(|p| matches!(p, Out::Undo { .. })) && parts[4..].iter().all(|p| matches!(p, Out::Stroke { .. })));
+        for b in &before {
+            assert!(!h.board.has(&b.id));
+        }
+        let names: Vec<Option<String>> = h.board.strokes.iter().map(|s| s.sh.as_ref().and_then(|sh| sh.node().map(String::from))).collect();
+        let old_names: Vec<Option<String>> = before.iter().map(|s| s.sh.as_ref().and_then(|sh| sh.node().map(String::from))).collect();
+        assert_eq!(names, old_names, "boxes keep their names, so the connector follows");
+        let moved_line = h.board.strokes.iter().find(|s| s.sh.as_ref().is_some_and(Shape::is_line)).unwrap().id.clone();
+        let seg = h.scene().seg(&moved_line).unwrap().clone();
+        assert!((seg.p[1] - (y + 0.15)).abs() < 0.02, "the line moved down with the boxes: {:?}", seg.p);
+        assert_eq!(i.sel.len(), 4, "the moved items stay selected");
+        // ONE undo puts all four back where they were
+        i.undo(&mut h);
+        assert_eq!(h.sent.len(), sent + 2);
+        assert_eq!(batch(&h.sent[sent + 1]).len(), 8);
+        let pos: Vec<Vec<f64>> = h.board.strokes.iter().map(|s| s.pts.clone()).collect();
+        let was: Vec<Vec<f64>> = before.iter().map(|s| s.pts.clone()).collect();
+        assert_eq!(pos, was);
+        assert!(i.sel.is_empty());
+        // the next undo takes away the line, under the id it came back with
+        assert!(!h.mine.contains(&line));
+        i.undo(&mut h);
+        assert_eq!(h.board.strokes.len(), 3);
+        assert!(!h.board.strokes.iter().any(|s| s.sh.as_ref().is_some_and(Shape::is_line)));
+    }
+
+    #[test]
+    fn groups_select_together_nest_enter_by_double_click_and_come_apart() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = three_boxes_and_a_line(&mut h, &mut i);
+        // boxes by name: an edit gives them new ids and puts them on top
+        let names: Vec<String> = h.board.strokes.iter().filter_map(|s| s.sh.as_ref().and_then(|sh| sh.node().map(String::from))).collect();
+        let box_at = |h: &Rec, k: usize| h.board.strokes.iter().find(|s| s.sh.as_ref().and_then(Shape::node) == Some(names[k].as_str())).unwrap().clone();
+        let (a, b, c) = ((x + 0.02, y + 0.09), (x + 0.22, y + 0.09), (x + 0.42, y + 0.09));
+        click(&mut h, &mut i, a.0, a.1, false);
+        assert_eq!(i.sel.len(), 1);
+        click(&mut h, &mut i, b.0, b.1, true);
+        assert_eq!(i.sel.len(), 2, "shift-click adds");
+        assert_eq!(h.log.iter().rev().find(|l| l.starts_with("sel ")).map(String::as_str), Some("sel true false"));
+        let sent = h.sent.len();
+        i.key(&mut h, Key::Group);
+        let parts = batch(&h.sent[sent]);
+        assert_eq!(parts.len(), 4, "group = one x: two u, two s");
+        let g1 = box_at(&h, 0).st.g.clone();
+        assert_eq!(g1.len(), 1);
+        assert_eq!(box_at(&h, 1).st.g, g1);
+        assert!(box_at(&h, 2).st.g.is_empty());
+        // a click on one member picks the group
+        i.deselect(&mut h);
+        click(&mut h, &mut i, b.0, b.1, false);
+        assert_eq!(i.sel.len(), 2);
+        // and the group nests in a new one with C, outer first
+        click(&mut h, &mut i, c.0, c.1, true);
+        assert_eq!(i.sel.len(), 3);
+        i.key(&mut h, Key::Group);
+        let (ga, gc) = (box_at(&h, 0).st.g.clone(), box_at(&h, 2).st.g.clone());
+        assert_eq!(ga.len(), 2);
+        assert_eq!(ga[1], g1[0], "the old group is inside");
+        assert_eq!(gc, vec![ga[0].clone()]);
+        // double-click enters a group, one level per double-click
+        i.deselect(&mut h);
+        click(&mut h, &mut i, a.0, a.1, false);
+        assert_eq!(i.sel.len(), 3);
+        let p = at(&h, a.0, a.1);
+        h.now += 100.0;
+        i.down(&mut h, &p);
+        i.end(&mut h, &p, true);
+        assert_eq!(i.group_path, vec![ga[0].clone()]);
+        assert_eq!(i.sel.len(), 2, "inside the outer group, the inner one is the unit");
+        click(&mut h, &mut i, a.0, a.1, false);
+        assert_eq!(i.sel.len(), 2, "a single click stays at this level");
+        h.now += 100.0;
+        i.down(&mut h, &p);
+        i.end(&mut h, &p, true);
+        assert_eq!(i.group_path, ga);
+        assert_eq!(i.sel, vec![box_at(&h, 0).id], "inside both, one box");
+        // a click outside the entered group leaves it
+        click(&mut h, &mut i, x + 0.15, y + 0.5, false);
+        assert!(i.sel.is_empty() && i.group_path.is_empty());
+        // ungroup takes off the outer level only
+        click(&mut h, &mut i, a.0, a.1, false);
+        let sent = h.sent.len();
+        i.key(&mut h, Key::Ungroup);
+        assert_eq!(batch(&h.sent[sent]).len(), 6);
+        assert_eq!(box_at(&h, 0).st.g, g1);
+        assert!(box_at(&h, 2).st.g.is_empty());
+        // undo regroups
+        i.undo(&mut h);
+        assert_eq!(box_at(&h, 0).st.g, ga);
+        // delete the group: one x, and undo brings it back
+        click(&mut h, &mut i, a.0, a.1, false);
+        let sent = h.sent.len();
+        i.key(&mut h, Key::Delete);
+        let parts = batch(&h.sent[sent]);
+        assert!(parts.len() == 3 && parts.iter().all(|p| matches!(p, Out::Undo { .. })));
+        assert_eq!(h.board.strokes.len(), 1, "only the line is left");
+        i.undo(&mut h);
+        assert_eq!(h.board.strokes.len(), 4);
+        assert_eq!(box_at(&h, 0).st.g, ga);
+        // Escape (deselect) empties the selection
+        click(&mut h, &mut i, a.0, a.1, false);
+        i.deselect(&mut h);
+        assert!(i.sel.is_empty() && h.over.is_none());
+    }
+
+    #[test]
+    fn select_never_picks_someone_elses_item() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.board.insert(Item { id: "theirs".into(), l: Some(2), c: "#111111".into(), w: 0.004, pts: vec![x, y, 0.5, x + 0.1, y + 0.1, 0.5], sh: Some(Shape::Box { kind: BoxKind::Rect, fill: true, n: "n9".into() }), ..Item::default() });
+        h.pen.tool = Tool::Select;
+        click(&mut h, &mut i, x + 0.05, y + 0.05, false);
+        assert!(i.sel.is_empty());
+        drag(&mut h, &mut i, (x - 0.05, y - 0.05), (x + 0.2, y + 0.2));
+        assert!(i.sel.is_empty());
+        i.key(&mut h, Key::Delete);
+        assert!(h.sent.is_empty() && h.board.has("theirs"));
     }
 
     #[test]
