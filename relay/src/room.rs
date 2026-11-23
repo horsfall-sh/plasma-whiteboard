@@ -104,6 +104,10 @@ pub enum In {
     /// never stored.
     #[serde(rename = "pg")]
     Ping { pts: Vec<f32> },
+    /// Several `s` and `u` from one edit (a move of a selection, a group, an ungroup),
+    /// applied together or not at all, and undone in one step by the page.
+    #[serde(rename = "x")]
+    Batch { a: Vec<serde_json::Value> },
 }
 
 struct Stroke {
@@ -113,6 +117,8 @@ struct Stroke {
     id: String,
     /// The stroke as it goes on the wire: {"id":..,"l":..,"q":..,"c":..,"w":..,"pts":[..]}
     json: String,
+    /// A shape's node name: arrows attach to it, so only one layer may hold it (S1).
+    node: Option<String>,
 }
 
 /// A crumpled sheet on the shelf.
@@ -360,37 +366,69 @@ fn stroke_json(
     s
 }
 
-/// Check the `sh` of a shape or an arrow and write it back out in its one canonical form, or
-/// None to refuse it. A shape (`rect`, `ellipse`, `tri`) has its node name `n` and whether it is
-/// filled, `f`; an arrow has the node names of the shapes it joins, `a` to `b`. Both have
-/// exactly two points: a shape the corners of its box, an arrow where its ends were drawn. No
-/// other keys are allowed, so nothing unchecked is stored or sent on.
-pub(crate) fn clean_shape(v: &serde_json::Value, pts: &[f32]) -> Option<String> {
+/// Deepest nesting of groups an item can be in.
+pub const MAX_GROUP_DEPTH: usize = 8;
+/// Most changes one batch (`x`) may carry.
+pub const MAX_BATCH: usize = 256;
+
+/// Check the `sh` of an item and write it back out in its one canonical form, or None to
+/// refuse it. `txt` is whether the item is a text annotation.
+///
+/// - A shape (`rect`, `ellipse`, `tri`): its node name `n`, whether it is filled `f`, and
+///   optionally a fill colour `fc` (the paint bucket) and a dash style `d`.
+/// - An arrow (`line`): its heads `h`, the shapes it joins `a` and `b`, a dash style `d`.
+/// - A text annotation (`text`): bold `b` and italic `i`.
+/// - A freehand stroke (`ink`): only there to carry its groups.
+///
+/// Any of them may carry `g`, the groups it is in from the outermost in. Shapes and arrows
+/// have exactly two points (a shape the corners of its box, an arrow where its ends were
+/// drawn); text has its one anchor point. No other keys are allowed, so nothing unchecked is
+/// stored or sent on.
+pub(crate) fn clean_shape(v: &serde_json::Value, pts: &[f32], txt: bool) -> Option<String> {
     let m = v.as_object()?;
-    if pts.len() != 6 {
+    let k = m.get("k")?.as_str()?;
+    let allowed: &[&str] = match k {
+        "rect" | "ellipse" | "tri" => &["k", "n", "f", "fc", "d", "g"],
+        "line" => &["k", "h", "a", "b", "d", "g"],
+        "text" => &["k", "b", "i", "g"],
+        "ink" => &["k", "g"],
+        _ => return None,
+    };
+    if m.keys().any(|key| !allowed.contains(&key.as_str())) {
         return None;
     }
+    match k {
+        "text" if !txt || pts.len() != 3 => return None,
+        "text" => {}
+        _ if txt => return None,
+        "ink" if pts.is_empty() => return None,
+        "ink" => {}
+        _ if pts.len() != 6 => return None,
+        _ => {}
+    }
+    let flag = |key: &str| -> Option<bool> {
+        match m.get(key) {
+            None => Some(false),
+            Some(f) => f.as_bool(),
+        }
+    };
     let name = |k: &str| m.get(k).and_then(|x| x.as_str()).filter(|s| valid_id(s));
-    match m.get("k")?.as_str()? {
-        k @ ("rect" | "ellipse" | "tri") => {
-            if m.keys().any(|key| !matches!(key.as_str(), "k" | "n" | "f")) {
-                return None;
-            }
+    let mut out = format!(r#"{{"k":"{k}""#);
+    match k {
+        "rect" | "ellipse" | "tri" => {
             let n = name("n")?;
-            let f = match m.get("f") {
-                None => false,
-                Some(f) => f.as_bool()?,
-            };
-            Some(format!(r#"{{"k":"{k}","n":"{n}","f":{f}}}"#))
+            out += &format!(r#","n":"{n}","f":{}"#, flag("f")?);
+            if let Some(fc) = m.get("fc") {
+                let fc = fc.as_str().filter(|c| valid_color(c))?;
+                out += &format!(r#","fc":"{}""#, fc.to_ascii_lowercase());
+            }
         }
         "line" => {
-            if m.keys().any(|key| !matches!(key.as_str(), "k" | "h" | "a" | "b")) {
-                return None;
-            }
             let h = match m.get("h") {
                 None => "end",
                 Some(h) => h.as_str().filter(|h| matches!(*h, "none" | "end" | "start" | "both"))?,
             };
+            out += &format!(r#","h":"{h}""#);
             // An end is free (absent: the drawn point in pts) or attached to a node at an
             // anchor: side s (0..=3) and t (0..=1) along it, both relative to the shape.
             let end = |k: &str| -> Option<Option<(String, String)>> {
@@ -402,7 +440,8 @@ pub(crate) fn clean_shape(v: &serde_json::Value, pts: &[f32]) -> Option<String> 
                 let n = e.get("n")?.as_str().filter(|n| valid_id(n))?;
                 let side = e.get("s")?.as_u64().filter(|s| *s <= 3)?;
                 let t = e.get("t")?.as_f64().filter(|t| t.is_finite() && (0.0..=1.0).contains(t))?;
-                let t = (t * 10000.0).round() / 10000.0;
+                // + 0.0 turns -0 into 0, so it is never stored as "-0"
+                let t = (t * 10000.0).round() / 10000.0 + 0.0;
                 Some(Some((n.to_string(), format!(r#"{{"n":"{n}","s":{side},"t":{t}}}"#))))
             };
             let (a, b) = (end("a")?, end("b")?);
@@ -411,16 +450,83 @@ pub(crate) fn clean_shape(v: &serde_json::Value, pts: &[f32]) -> Option<String> 
                     return None;
                 }
             }
-            let mut out = format!(r#"{{"k":"line","h":"{h}""#);
             for (k, e) in [("a", a), ("b", b)] {
                 if let Some((_, j)) = e {
                     out += &format!(r#","{k}":{j}"#);
                 }
             }
-            Some(out + "}")
         }
-        _ => None,
+        "text" => {
+            for key in ["b", "i"] {
+                if flag(key)? {
+                    out += &format!(r#","{key}":true"#);
+                }
+            }
+        }
+        _ => {}
     }
+    if let Some(d) = m.get("d") {
+        let d = d.as_str().filter(|d| matches!(*d, "dash" | "dot"))?;
+        out += &format!(r#","d":"{d}""#);
+    }
+    if let Some(g) = m.get("g") {
+        let g = g.as_array()?;
+        if g.is_empty() || g.len() > MAX_GROUP_DEPTH {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for x in g {
+            let x = x.as_str().filter(|x| valid_id(x))?;
+            if !seen.insert(x) {
+                return None;
+            }
+            ids.push(format!(r#""{x}""#));
+        }
+        out += &format!(r#","g":[{}]"#, ids.join(","));
+    } else if k == "ink" {
+        return None; // a freehand stroke has an `sh` only for its groups
+    }
+    Some(out + "}")
+}
+
+/// The node name of a shape, read from its canonical `sh`. None for anything else.
+fn box_node(sh: &str) -> Option<&str> {
+    let rest = ["rect", "ellipse", "tri"].iter().find_map(|k| sh.strip_prefix(&format!(r#"{{"k":"{k}","n":""#)))?;
+    // canonical: the name is a valid id, so it holds no quote
+    rest.split('"').next()
+}
+
+/// Whether a live shape on another layer than `layer` holds node name `n` (S1): a peer must
+/// not take over the arrows attached to someone else's shape.
+fn node_taken(st: &State, n: &str, layer: u32) -> bool {
+    st.strokes.iter().any(|s| s.state == LIVE && s.layer != layer && s.node.as_deref() == Some(n))
+}
+
+/// A finished item's fields checked, or None to refuse it: a good colour and width, points,
+/// text with exactly one point, and an `sh` in its canonical form.
+#[allow(clippy::type_complexity)]
+fn clean_item(
+    c: String,
+    w: f32,
+    pts: Vec<f32>,
+    txt: Option<String>,
+    sh: Option<serde_json::Value>,
+) -> Option<(String, f32, Vec<f32>, Option<String>, Option<String>)> {
+    if !valid_color(&c) || !valid_width(w) {
+        return None;
+    }
+    let pts = clean_pts(pts).filter(|p| !p.is_empty())?;
+    let txt = match txt {
+        None => None,
+        Some(t) if pts.len() == 3 => Some(clean_text(&t)?),
+        Some(_) => return None,
+    };
+    let sh = match sh {
+        None => None,
+        Some(v) => Some(clean_shape(&v, &pts, txt.is_some())?),
+    };
+    Some((c, w, pts, txt, sh))
 }
 
 /// Check the text of an annotation. Returns it with line endings normalised
@@ -542,6 +648,7 @@ impl Room {
                     state: r.state,
                     json: stroke_json(&r.id, r.layer, r.seq, &r.color, &w, &r.pts, r.txt.as_deref(), r.sh.as_deref()),
                     id: r.id.clone(),
+                    node: r.sh.as_deref().and_then(box_node).map(str::to_string),
                 });
             }
             ids.insert(r.id);
@@ -919,26 +1026,11 @@ impl Room {
                     Some(_) => return,
                     None => false,
                 };
-                let pts = clean_pts(pts).filter(|p| !p.is_empty());
-                // A text annotation has exactly one point and good text.
-                let txt = match txt {
-                    None => Ok(None),
-                    Some(t) => match (clean_text(&t), &pts) {
-                        (Some(t), Some(p)) if p.len() == 3 => Ok(Some(t)),
-                        _ => Err(()),
-                    },
-                };
-                // A shape or an arrow: never text as well.
-                let sh = match (sh, &pts, &txt) {
-                    (None, _, _) => Ok(None),
-                    (Some(v), Some(p), Ok(None)) => clean_shape(&v, p).map(Some).ok_or(()),
-                    _ => Err(()),
-                };
-                match (pts, txt, sh) {
-                    (Some(pts), Ok(txt), Ok(sh)) if valid_color(&c) && valid_width(w) => {
+                match clean_item(c, w, pts, txt, sh) {
+                    Some((c, w, pts, txt, sh)) => {
                         self.commit(&mut st, peer, id, c, w, pts, txt, sh, was_live, db, &budget.store);
                     }
-                    _ => {
+                    None => {
                         if was_live {
                             self.others(conn, format!(r#"{{"t":"u","id":"{id}"}}"#));
                         }
@@ -946,6 +1038,7 @@ impl Room {
                     }
                 }
             }
+            In::Batch { a } => self.batch(&mut st, peer, a, db, &budget.store),
             In::Undo { id } => {
                 if !valid_id(&id) {
                     return;
@@ -1088,6 +1181,119 @@ impl Room {
         })
     }
 
+    /// `x`: several `s` and `u` of my own layer as one change. Every part is checked first;
+    /// if any is refused, none is applied. The sender then gets `no` for each new item and its
+    /// own copies of the items it meant to take away, so its board matches the relay's again.
+    /// Applied, the parts go to the others as one `x` and to storage in one transaction.
+    fn batch(&self, st: &mut State, peer: Peer, a: Vec<serde_json::Value>, db: &Db, store: &Mutex<Bucket>) {
+        let conn = peer.conn;
+        let mut gone: Vec<String> = Vec::new();
+        let mut new: Vec<(String, String, f32, Vec<f32>, Option<String>, Option<String>)> = Vec::new();
+        let mut why = None;
+        let mut new_ids = HashSet::new();
+        if a.is_empty() || a.len() > MAX_BATCH {
+            why = Some("the change was too big");
+        }
+        for v in a.into_iter().take(MAX_BATCH) {
+            match serde_json::from_value::<In>(v) {
+                Ok(In::Undo { id }) if valid_id(&id) && !gone.contains(&id) => {
+                    let mine = st.strokes.iter().any(|s| s.id == id && s.layer == peer.layer && s.state == LIVE);
+                    if !mine {
+                        why = why.or(Some("part of the change was gone"));
+                    }
+                    gone.push(id);
+                }
+                Ok(In::Stroke { id, c, w, pts, txt, sh }) if valid_id(&id) => {
+                    if st.ids.contains(&id) || st.live.contains_key(&id) || !new_ids.insert(id.clone()) {
+                        why = why.or(Some("the change was not valid"));
+                        continue;
+                    }
+                    match clean_item(c, w, pts, txt, sh) {
+                        Some((c, w, pts, txt, sh)) => new.push((id, c, w, pts, txt, sh)),
+                        None => {
+                            why = why.or(Some("the change was not valid"));
+                            new.push((id, String::new(), 0.0, Vec::new(), None, None));
+                        }
+                    }
+                }
+                _ => why = why.or(Some("the change was not valid")),
+            }
+        }
+        if new.iter().any(|n| n.5.as_deref().and_then(box_node).is_some_and(|n| node_taken(st, n, peer.layer))) {
+            why = why.or(Some("another contributor's shape already has that name"));
+        }
+        let sizes: Vec<(String, String)> = new.iter().map(|n| (width_json(n.2), pts_json(&n.3))).collect();
+        let size: usize = new
+            .iter()
+            .zip(&sizes)
+            .map(|(n, (_, pj))| pj.len() + n.4.as_ref().map_or(0, |t| t.len() * 2) + n.5.as_ref().map_or(0, String::len) + 96)
+            .sum();
+        if why.is_none() {
+            if db.is_full() {
+                why = Some("storage is full; try again later");
+            } else if st.strokes.len() + st.shelf.iter().map(|s| s.strokes.len()).sum::<usize>() + new.len() > MAX_STROKES
+                || st.bytes + size > MAX_BOARD_BYTES
+                || st.ids.len() + new.len() > MAX_IDS
+            {
+                why = Some("this board is full");
+            } else if !store.lock().unwrap().take_n(size as f64) {
+                why = Some("too much has been stored from your network lately; try again later");
+            }
+        }
+        // Memory: what the board holds once the parts are applied.
+        let freed: usize = st.strokes.iter().filter(|s| gone.contains(&s.id) && s.layer == peer.layer && s.state == LIVE).map(|s| s.json.len()).sum();
+        let seq0 = st.next_seq;
+        let jsons: Vec<String> = new
+            .iter()
+            .zip(&sizes)
+            .enumerate()
+            .map(|(i, (n, (wj, pj)))| stroke_json(&n.0, peer.layer, seq0 + i as u64, &n.1, wj, pj, n.4.as_deref(), n.5.as_deref()))
+            .collect();
+        if why.is_none() {
+            let more = (st.bytes + jsons.iter().map(String::len).sum::<usize>()).saturating_sub(freed);
+            if !self.resize(st, more) {
+                store.lock().unwrap().give(size as f64);
+                why = Some("the server is out of memory for strokes; try again later");
+            }
+        }
+        if let Some(why) = why {
+            for n in &new {
+                self.only(conn, refusal(&n.0, why));
+            }
+            for id in &gone {
+                if let Some(s) = st.strokes.iter().find(|s| &s.id == id && s.layer == peer.layer && s.state == LIVE) {
+                    self.only(conn, format!(r#"{{"t":"e",{}"#, &s.json[1..]));
+                }
+            }
+            return;
+        }
+        // Apply: the old items go, then the new ones come, in the order sent.
+        let mut out: Vec<String> = Vec::new();
+        let mut cmds = Vec::new();
+        for id in &gone {
+            if let Some(i) = st.strokes.iter().rposition(|s| &s.id == id && s.layer == peer.layer && s.state == LIVE) {
+                st.strokes.remove(i);
+            }
+            cmds.push(db.stroke_state_cmd(&self.link, id.clone(), UNDONE));
+            out.push(format!(r#"{{"t":"u","id":"{id}"}}"#));
+        }
+        let mut oks = Vec::new();
+        for ((n, (_, pj)), json) in new.into_iter().zip(sizes).zip(jsons) {
+            let seq = st.next_seq;
+            st.next_seq += 1;
+            let (id, c, w, _, txt, sh) = n;
+            out.push(format!(r#"{{"t":"e",{}"#, &json[1..]));
+            oks.push(self.ok_once_stored(conn, &id, seq));
+            cmds.push(db.add_stroke_cmd(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, sh.clone()));
+            st.ids.insert(id.clone());
+            let node = sh.as_deref().and_then(box_node).map(str::to_string);
+            st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json, node });
+        }
+        st.snap = None;
+        self.others(conn, format!(r#"{{"t":"x","a":[{}]}}"#, out.join(",")));
+        db.many(&self.link, cmds, Box::new(move || oks.into_iter().for_each(|ok| ok())));
+    }
+
     /// Store a finished stroke and tell everyone.
     #[allow(clippy::too_many_arguments)]
     fn commit(
@@ -1130,6 +1336,11 @@ impl Room {
             }
             return;
         }
+        if sh.as_deref().and_then(box_node).is_some_and(|n| node_taken(st, n, peer.layer)) {
+            drop_live(self);
+            self.only(conn, refusal(&id, "another contributor's shape already has that name"));
+            return;
+        }
         if db.is_full() {
             // Refused before it is sent on: a stroke the others see must be stored.
             drop_live(self);
@@ -1164,10 +1375,11 @@ impl Room {
         }
         self.others(conn, format!(r#"{{"t":"e",{}"#, &json[1..]));
         let ok = self.ok_once_stored(conn, &id, seq);
+        let node = sh.as_deref().and_then(box_node).map(str::to_string);
         db.add_stroke(&self.link, seq, id.clone(), peer.layer, c, f64::from(w), pj, txt, sh, ok);
         st.ids.insert(id.clone());
         st.snap = None;
-        st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json });
+        st.strokes.push(Stroke { seq, layer: peer.layer, state: LIVE, id, json, node });
     }
 }
 

@@ -145,7 +145,12 @@ enum Cmd {
     Flush {
         reply: oneshot::Sender<()>,
     },
+    /// Several writes of one change, in one transaction.
+    Many(Vec<Cmd>),
 }
+
+/// A write for [`Db::many`].
+pub struct Part(Cmd);
 
 /// The default storage quota, in bytes.
 pub const MAX_DB: u64 = 1024 * 1024 * 1024;
@@ -345,6 +350,33 @@ impl Db {
         self.write(link, Cmd::AddStroke { board, seq, id, layer, color, width, pts, txt, sh }, Some(ack));
     }
 
+    /// [`Db::add_stroke`] as a part of [`Db::many`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_stroke_cmd(
+        &self,
+        link: &Arc<Link>,
+        seq: u64,
+        id: String,
+        layer: u32,
+        color: String,
+        width: f64,
+        pts: String,
+        txt: Option<String>,
+        sh: Option<String>,
+    ) -> Part {
+        Part(Cmd::AddStroke { board: link.board, seq, id, layer, color, width, pts, txt, sh })
+    }
+
+    /// [`Db::stroke_state`] as a part of [`Db::many`].
+    pub fn stroke_state_cmd(&self, link: &Arc<Link>, id: String, state: u8) -> Part {
+        Part(Cmd::StrokeState { board: link.board, id, state })
+    }
+
+    /// Store all of `parts` in one transaction; `ack` runs once it is committed.
+    pub fn many(&self, link: &Arc<Link>, parts: Vec<Part>, ack: Ack) {
+        self.write(link, Cmd::Many(parts.into_iter().map(|p| p.0).collect()), Some(ack));
+    }
+
     pub fn stroke_state(&self, link: &Arc<Link>, id: String, state: u8) {
         self.write(link, Cmd::StrokeState { board: link.board, id, state }, None);
     }
@@ -478,6 +510,16 @@ fn apply(
 ) -> rusqlite::Result<()> {
     match cmd {
         Cmd::Nop => {}
+        Cmd::Many(cmds) => {
+            // All or none, even inside the shared transaction.
+            conn.execute_batch("SAVEPOINT many")?;
+            let r = cmds.into_iter().try_for_each(|c| apply(conn, c, after));
+            if r.is_err() {
+                let _ = conn.execute_batch("ROLLBACK TO many");
+            }
+            conn.execute_batch("RELEASE many")?;
+            r?;
+        }
         Cmd::CreateBoard { edit, view, reply } => {
             let t = now();
             let r = conn

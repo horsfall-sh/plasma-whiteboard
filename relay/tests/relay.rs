@@ -149,6 +149,17 @@ impl Client {
         m
     }
 
+    /// Like `expect`, passing over layer announcements (a first stroke can open a layer).
+    async fn want(&mut self, t: &str) -> Value {
+        loop {
+            let m = self.next().await;
+            if m["t"] != "l" || t == "l" {
+                assert_eq!(m["t"], t, "{m}");
+                return m;
+            }
+        }
+    }
+
     /// Nothing but presence counts arrives for a short while.
     async fn quiet(&mut self) {
         loop {
@@ -1421,5 +1432,163 @@ async fn shapes_and_arrows() {
         ]
     );
     assert_eq!(strokes[3]["pts"], moved);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn styles_groups_and_node_names() {
+    let s = start(&temp_db("styles")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (mut b, _, _) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+    let bx = json!([0.1, 0.1, 0.5, 0.2, 0.15, 0.5]);
+
+    // Fill colour, dash, groups, text style, a grouped freehand stroke: written back canonical.
+    for (id, pts, sh, txt, want) in [
+        ("s1", bx.clone(), json!({"g": ["G1", "G2"], "d": "dot", "fc": "#AABBCC", "f": true, "n": "nA", "k": "rect"}), None,
+         json!({"k": "rect", "n": "nA", "f": true, "fc": "#aabbcc", "d": "dot", "g": ["G1", "G2"]})),
+        ("s2", bx.clone(), json!({"k": "line", "d": "dash", "a": {"n": "nA", "s": 0, "t": -0.0}}), None,
+         json!({"k": "line", "h": "end", "a": {"n": "nA", "s": 0, "t": 0}, "d": "dash"})),
+        ("s3", json!([0.3, 0.3, 0.5]), json!({"k": "text", "b": true, "i": false, "g": ["G1"]}), Some("hi"),
+         json!({"k": "text", "b": true, "g": ["G1"]})),
+        ("s4", json!([0.3, 0.3, 0.5, 0.4, 0.4, 0.5, 0.5, 0.3, 0.5]), json!({"k": "ink", "g": ["G1"]}), None,
+         json!({"k": "ink", "g": ["G1"]})),
+    ] {
+        let mut m = json!({"t": "s", "id": id, "c": "#0a66d8", "w": 0.004, "pts": pts, "sh": sh});
+        if let Some(t) = txt {
+            m["txt"] = json!(t);
+        }
+        a.send(m).await;
+        a.want("ok").await;
+        let e = v.want("e").await;
+        assert_eq!(e["sh"], want, "{id}");
+        assert_eq!(e["sh"]["t"], json!(null));
+        b.want("e").await;
+    }
+    // -0 is stored as 0, not "-0"
+    a.send(json!({"t": "s", "id": "s5", "c": "#0a66d8", "w": 0.004, "pts": bx, "sh": {"k": "line", "a": {"n": "nA", "s": 0, "t": -0.0}}})).await;
+    a.want("ok").await;
+    let e = v.want("e").await;
+    b.want("e").await;
+    assert!(e.to_string().contains(r#""t":0}"#), "{e}");
+
+    // Refused: a text style without text, text without its kind, ink without groups, a
+    // dash on text, a bad fill colour, groups that repeat, are empty or nest too deep.
+    let deep: Vec<String> = (0..9).map(|i| format!("g{i}")).collect();
+    for (id, pts, sh, txt) in [
+        ("y1", json!([0.3, 0.3, 0.5]), json!({"k": "text", "b": true}), None),
+        ("y2", json!([0.3, 0.3, 0.5]), json!({"k": "rect", "n": "q"}), Some("hi")),
+        ("y3", bx.clone(), json!({"k": "ink"}), None),
+        ("y4", json!([0.3, 0.3, 0.5]), json!({"k": "text", "d": "dash"}), Some("hi")),
+        ("y5", bx.clone(), json!({"k": "rect", "n": "q", "fc": "red"}), None),
+        ("y6", bx.clone(), json!({"k": "rect", "n": "q", "g": ["G", "G"]}), None),
+        ("y7", bx.clone(), json!({"k": "rect", "n": "q", "g": []}), None),
+        ("y8", bx.clone(), json!({"k": "rect", "n": "q", "g": deep}), None),
+        ("y9", bx.clone(), json!({"k": "line", "d": "wavy"}), None),
+        ("y10", json!([0.3, 0.3, 0.5]), json!({"k": "text", "b": "yes"}), Some("hi")),
+    ] {
+        let mut m = json!({"t": "s", "id": id, "c": "#0a66d8", "w": 0.004, "pts": pts, "sh": sh});
+        if let Some(t) = txt {
+            m["txt"] = json!(t);
+        }
+        a.send(m).await;
+        assert_eq!(a.want("no").await["id"], id);
+    }
+
+    // S1: B cannot take A's node name, so it cannot take over A's arrows...
+    b.send(json!({"t": "s", "id": "b1", "c": "#d63031", "w": 0.004, "pts": bx, "sh": {"k": "tri", "n": "nA"}})).await;
+    assert_eq!(b.want("no").await["id"], "b1");
+    // ...nor in a batch.
+    b.send(json!({"t": "x", "a": [{"t": "s", "id": "b2", "c": "#d63031", "w": 0.004, "pts": bx, "sh": {"k": "tri", "n": "nA"}}]})).await;
+    assert_eq!(b.want("no").await["id"], "b2");
+    // A moving its own shape keeps the name.
+    a.send(json!({"t": "x", "a": [{"t": "u", "id": "s1"}, {"t": "s", "id": "s1b", "c": "#0a66d8", "w": 0.004, "pts": bx, "sh": {"k": "rect", "n": "nA", "f": true}}]})).await;
+    a.want("ok").await;
+    v.want("x").await;
+    b.want("x").await;
+    // Once A's shape is gone, the name is free.
+    a.send(json!({"t": "u", "id": "s1b"})).await;
+    v.want("u").await;
+    b.want("u").await;
+    b.send(json!({"t": "s", "id": "b3", "c": "#d63031", "w": 0.004, "pts": bx, "sh": {"k": "tri", "n": "nA"}})).await;
+    b.want("ok").await;
+    v.want("e").await;
+    v.quiet().await;
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn a_batch_is_applied_whole_or_not_at_all() {
+    let s = start(&temp_db("batch")).await;
+    let (edit, view) = new_board(&s.addr).await;
+    let (mut a, _, _) = Client::join(&s.addr, &edit, Some(WHO_A)).await;
+    let (mut b, _, _) = Client::join(&s.addr, &edit, Some(WHO_B)).await;
+    let (mut v, _, _) = Client::join(&s.addr, &view, None).await;
+    let rect = |id: &str, n: &str, x: f64| {
+        json!({"t": "s", "id": id, "c": "#0a66d8", "w": 0.004, "pts": [x, 0.1, 0.5, x + 0.1, 0.15, 0.5], "sh": {"k": "rect", "n": n, "f": false}})
+    };
+    for (id, n, x) in [("r1", "n1", 0.1), ("r2", "n2", 0.3), ("r3", "n3", 0.5)] {
+        a.send(rect(id, n, x)).await;
+        a.want("ok").await;
+        v.want("e").await;
+        b.want("e").await;
+    }
+    a.send(json!({"t": "s", "id": "ar", "c": "#111111", "w": 0.004, "pts": [0.2, 0.125, 0.5, 0.3, 0.125, 0.5], "sh": {"k": "line", "a": {"n": "n1", "s": 1, "t": 0.5}, "b": {"n": "n2", "s": 3, "t": 0.5}}})).await;
+    a.want("ok").await;
+    v.want("e").await;
+    b.want("e").await;
+    let bq = b.draw("bz").await;
+    assert!(bq > 0);
+    v.want("e").await;
+    a.want("e").await;
+    a.quiet().await;
+
+    // Refused whole: one part takes away B's stroke. Nothing changes; A gets `no` for each new
+    // item and its own items back.
+    a.send(json!({"t": "x", "a": [{"t": "u", "id": "r1"}, rect("r1b", "n1", 0.15), {"t": "u", "id": "bz"}]})).await;
+    assert_eq!(a.want("no").await["id"], "r1b");
+    assert_eq!(a.want("e").await["id"], "r1");
+    v.quiet().await;
+    // Refused whole: a part that is not `s` or `u`, a resent id (the live one is kept, so it
+    // gets no `no`), too many parts, none.
+    a.send(json!({"t": "x", "a": [rect("q1", "n9", 0.7), {"t": "cr"}]})).await;
+    assert_eq!(a.want("no").await["id"], "q1");
+    a.send(json!({"t": "x", "a": [rect("q2", "n8", 0.7), rect("r2", "n2", 0.7)]})).await;
+    assert_eq!(a.want("no").await["id"], "q2");
+    a.quiet().await;
+    a.send(json!({"t": "x", "a": (0..257).map(|i| rect(&format!("m{i}"), &format!("k{i}"), 0.7)).collect::<Vec<_>>()})).await;
+    for i in 0..256 {
+        assert_eq!(a.want("no").await["id"], format!("m{i}"));
+    }
+    a.send(json!({"t": "x", "a": []})).await;
+    a.quiet().await;
+    v.quiet().await;
+
+    // Applied: three shapes moved in one change; the arrow follows by name, unchanged.
+    a.send(json!({"t": "x", "a": [
+        {"t": "u", "id": "r1"}, {"t": "u", "id": "r2"}, {"t": "u", "id": "r3"},
+        rect("r1b", "n1", 0.12), rect("r2b", "n2", 0.32), rect("r3b", "n3", 0.52)
+    ]})).await;
+    let oks: Vec<String> = [a.want("ok").await, a.want("ok").await, a.want("ok").await]
+        .iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(oks, ["r1b", "r2b", "r3b"]);
+    for c in [&mut v, &mut b] {
+        let x = c.want("x").await;
+        let parts: Vec<(String, String)> = x["a"].as_array().unwrap().iter()
+            .map(|p| (p["t"].as_str().unwrap().to_string(), p["id"].as_str().unwrap().to_string())).collect();
+        assert_eq!(parts, [("u", "r1"), ("u", "r2"), ("u", "r3"), ("e", "r1b"), ("e", "r2b"), ("e", "r3b")]
+            .map(|(t, i)| (t.to_string(), i.to_string())));
+        c.quiet().await;
+    }
+
+    // Stored as one change: after a restart the board holds exactly the moved shapes.
+    drop((a, b, v));
+    let db = s.stop().await;
+    let s = start(&db).await;
+    let (_v, _, strokes) = Client::join(&s.addr, &view, None).await;
+    let ids: Vec<&str> = strokes.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["ar", "bz", "r1b", "r2b", "r3b"]);
+    assert_eq!(strokes[2]["pts"][0], json!(0.12));
     s.stop().await;
 }
