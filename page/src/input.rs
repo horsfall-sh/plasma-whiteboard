@@ -43,6 +43,8 @@ pub enum Tool {
     Line,
     /// Pick my items (click, shift-click, a marquee) to move, delete or group them.
     Select,
+    /// Fill one of my shapes with the current colour; the same colour again clears it.
+    Bucket,
 }
 
 /// One pointer event, or one of its coalesced samples. `x`, `y` are client px.
@@ -436,6 +438,10 @@ impl Input {
         }
         let Some(color) = pen.color.clone() else { return true };
         if viewer || self.cur.is_some() {
+            return true;
+        }
+        if pen.tool == Tool::Bucket {
+            self.bucket(h, e, &color);
             return true;
         }
         if t == Kind::Touch && self.pen_seen {
@@ -860,6 +866,27 @@ impl Input {
         h.overlay(o);
     }
 
+    /// The bucket: the top shape of mine under the point gets `color` as its fill, one change
+    /// and one undo; the same colour again takes the fill off. Empty board does nothing.
+    fn bucket(&mut self, h: &mut impl Host, e: &Ptr, color: &str) {
+        let (x, y) = Self::board_at(h, e);
+        let me = h.pen().me;
+        let hit = h.board().strokes.iter().rev().find(|s| {
+            s.l == me
+                && matches!(s.sh, Some(Shape::Box { .. }))
+                && shape::norm_box(&s.pts).is_some_and(|b| x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3])
+        }).cloned();
+        let Some(old) = hit.filter(|s| !h.hidden(s.l)) else { return };
+        let c = color.to_ascii_lowercase();
+        let fc = if old.st.fc.as_deref() == Some(c.as_str()) { None } else { shape::rgb(&c).map(|_| c) };
+        if fc == old.st.fc {
+            return;
+        }
+        let id = h.new_id();
+        let new = Item { id, q: None, st: Style { fc, ..old.st.clone() }, ..old.clone() };
+        self.edit(h, vec![old], vec![new]);
+    }
+
     /// (x, y) on the nearest grid point when snap to grid is on.
     fn snap(h: &mut impl Host, x: f64, y: f64) -> (f64, f64) {
         if !h.pen().snap {
@@ -944,7 +971,7 @@ impl Input {
             Gest::NewBox { kind, x0, y0, x1, y1, .. } => {
                 (*x1, *y1) = Self::snap(h, x, y);
                 let bb = [x0.min(*x1), y0.min(*y1), x0.max(*x1), y0.max(*y1)];
-                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, w, bw))], ..Overlay::default() }
+                Overlay { ghosts: vec![(c, shape::box_ops(*kind, &bb, pen.fill, None, w, bw))], ..Overlay::default() }
             }
             Gest::MoveBox { old, sx, sy, dx, dy, .. } => {
                 (*dx, *dy) = (x - *sx, y - *sy);
@@ -972,7 +999,7 @@ impl Input {
         let Some(Shape::Box { kind, fill, n }) = &old.sh else { return Overlay::default() };
         let Some([x0, y0, x1, y1]) = shape::norm_box(&old.pts) else { return Overlay::default() };
         let nd = Node { kind: *kind, bb: [x0 + dx, y0 + dy, x1 + dx, y1 + dy] };
-        let mut ghosts = vec![(old.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, old.w, bw))];
+        let mut ghosts = vec![(old.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, old.st.fc.as_deref(), old.w, bw))];
         let lines: Vec<Item> = h
             .board()
             .strokes
@@ -1418,13 +1445,13 @@ impl Input {
                 Some(Shape::Box { kind, fill, n }) => {
                     let Some([x0, y0, x1, y1]) = shape::norm_box(&s.pts) else { continue };
                     let nd = Node { kind: *kind, bb: [x0 + dx, y0 + dy, x1 + dx, y1 + dy] };
-                    ghosts.push((s.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, s.w, bw)));
+                    ghosts.push((s.c.clone(), shape::box_ops(*kind, &nd.bb, *fill, s.st.fc.as_deref(), s.w, bw)));
                     moved.insert(n.clone(), nd);
                 }
                 Some(Shape::Line { .. }) => {}
                 None if s.txt.is_some() => {
                     let b = h.bbox(s);
-                    ghosts.push((s.c.clone(), shape::box_ops(BoxKind::Rect, &[b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy], false, 0.001, bw)));
+                    ghosts.push((s.c.clone(), shape::box_ops(BoxKind::Rect, &[b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy], false, None, 0.001, bw)));
                 }
                 None => ghosts.push((s.c.clone(), geom::full(&shifted(&s.pts, dx, dy), s.w, bw))),
             }
@@ -2404,6 +2431,48 @@ mod tests {
         // a click without a drag makes nothing
         drag(&mut h, &mut i, (x + 0.3, y), (x + 0.3, y));
         assert_eq!(h.sent.len(), 1);
+    }
+
+    #[test]
+    fn the_bucket_fills_my_shape_round_trips_clears_with_the_same_colour_and_undoes() {
+        let (mut h, mut i) = (Rec::new(), Input::default());
+        let (x, y) = mid(&h);
+        h.pen.tool = Tool::Shape(BoxKind::Rect);
+        drag(&mut h, &mut i, (x, y), (x + 0.1, y + 0.1));
+        let first = h.board.strokes.last().unwrap().clone();
+        h.pen.tool = Tool::Bucket;
+        h.pen.color = Some("#E53935".into());
+        // empty board: nothing
+        let n = h.sent.len();
+        let p = at(&h, x + 0.3, y + 0.3);
+        i.down(&mut h, &p);
+        i.end(&mut h, &p, true);
+        assert_eq!(h.sent.len(), n);
+        // inside the shape: one x (u old + e new) with the fill on the wire
+        let p = at(&h, x + 0.05, y + 0.05);
+        i.down(&mut h, &p);
+        i.end(&mut h, &p, true);
+        let f = h.frames().last().unwrap().clone();
+        assert!(f.starts_with(r#"{"t":"x""#) && f.contains(r##""fc":"#e53935""##), "{f}");
+        // what the relay echoes back parses to the same fill, and draws with it
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        let back = Item::from_value(&v["a"][1]).unwrap();
+        assert_eq!(back.st.fc.as_deref(), Some("#e53935"));
+        let filled = h.board.strokes.last().unwrap().clone();
+        assert_eq!(filled.st.fc, back.st.fc);
+        let (ops, _) = shape::item_ops(&filled, &h.scene().clone(), 1000.0).unwrap();
+        assert!(ops.contains(&geom::Op::FillColor(0xe53935)), "{ops:?}");
+        assert_eq!(filled.sh, first.sh, "same shape, same node");
+        // the same colour again takes it off
+        i.down(&mut h, &p);
+        i.end(&mut h, &p, true);
+        assert_eq!(h.board.strokes.last().unwrap().st.fc, None);
+        // undo puts the fill back, undo again the plain shape where it was
+        i.undo(&mut h);
+        assert_eq!(h.board.strokes.last().unwrap().st.fc.as_deref(), Some("#e53935"));
+        i.undo(&mut h);
+        let b = h.board.strokes.last().unwrap();
+        assert_eq!((b.st.fc.clone(), b.pts.clone()), (None, first.pts.clone()));
     }
 
     #[test]

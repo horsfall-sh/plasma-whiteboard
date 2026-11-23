@@ -1495,6 +1495,7 @@ impl Page {
             ("pingBtn", Tool::Ping),
             ("moveBtn", Tool::Move),
             ("selectBtn", Tool::Select),
+            ("bucketBtn", Tool::Bucket),
         ] {
             if let Some(b) = html(id) {
                 pressed(&b, self.tool == t);
@@ -1540,6 +1541,7 @@ impl Page {
         toggle(&self.d.body, "text", self.tool == Tool::Text);
         toggle(&self.d.body, "move", self.tool == Tool::Move);
         toggle(&self.d.body, "select", self.tool == Tool::Select);
+        toggle(&self.d.body, "bucket", self.tool == Tool::Bucket);
         if let Some(b) = html("groupBtn") {
             attr(&b, "hidden", "");
             if self.tool == Tool::Select {
@@ -2288,7 +2290,7 @@ impl App {
         }
         if let Some(c) = b.get_attribute("data-c").filter(|c| !c.is_empty()) {
             self.page.color = Some(c);
-            if self.page.tool != Tool::Text {
+            if !matches!(self.page.tool, Tool::Text | Tool::Bucket) {
                 self.page.tool = Tool::Pen;
             }
             self.page.mark_tools();
@@ -2313,6 +2315,7 @@ impl App {
             "pingBtn" => flip(&mut self.page, Tool::Ping),
             "moveBtn" => flip(&mut self.page, Tool::Move),
             "selectBtn" => flip(&mut self.page, Tool::Select),
+            "bucketBtn" => flip(&mut self.page, Tool::Bucket),
             "crumpleBtn" => self.crumple(),
             "shelfBtn" => self.page.toggle_panel("shelfPanel"),
             "layersBtn" => self.page.toggle_panel("layersPanel"),

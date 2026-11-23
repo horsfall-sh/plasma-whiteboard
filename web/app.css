@@ -155,6 +155,7 @@ body.edit #bar #swatches { display: contents; }
 /* ---- moving around ---- */
 body.edit.move #live, body:not(.edit) #live { cursor: grab; }
 body.edit.select #live { cursor: default; }
+body.edit.bucket #live { cursor: cell; }
 #groupBtn[aria-disabled="true"] { opacity: .4; }
 #nav {
   position: fixed; left: 8px; bottom: 8px; z-index: 3; width: 144px; height: 81px;

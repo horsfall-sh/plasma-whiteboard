@@ -74,6 +74,8 @@ pub enum Op {
     Arc(f64, f64, f64, f64, f64, bool),
     /// `globalAlpha`, for ghosts on the live canvas.
     Alpha(f64),
+    /// Fill the path with this colour (0xrrggbb), not the item's: a bucket fill.
+    FillColor(u32),
 }
 
 /// `dot`: a one-point stroke.

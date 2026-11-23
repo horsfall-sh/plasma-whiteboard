@@ -546,7 +546,15 @@ pub fn head_len(w: f64, bw: f64) -> f64 {
 
 /// A shape's path, then fill (and stroke the edge, so a filled shape is the same size as an
 /// outlined one) or stroke.
-pub fn box_ops(kind: BoxKind, bb: &[f64; 4], fill: bool, w: f64, bw: f64) -> Vec<Op> {
+/// A `#rrggbb` colour as 0xrrggbb.
+pub fn rgb(c: &str) -> Option<u32> {
+    let h = c.strip_prefix('#').filter(|h| h.len() == 6)?;
+    u32::from_str_radix(h, 16).ok()
+}
+
+/// A shape: its outline, filled with its own colour when `fill`, or with `fc` (a bucket fill,
+/// which wins) under the outline.
+pub fn box_ops(kind: BoxKind, bb: &[f64; 4], fill: bool, fc: Option<&str>, w: f64, bw: f64) -> Vec<Op> {
     let [x0, y0, x1, y1] = bb.map(|v| v * bw);
     let mut o = vec![Op::LineWidth(line_w(w, bw, 0.5)), Op::Begin];
     match kind {
@@ -554,8 +562,10 @@ pub fn box_ops(kind: BoxKind, bb: &[f64; 4], fill: bool, w: f64, bw: f64) -> Vec
         BoxKind::Ellipse => o.push(Op::Ellipse((x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0, (y1 - y0) / 2.0)),
         BoxKind::Tri => o.extend([Op::MoveTo((x0 + x1) / 2.0, y0), Op::LineTo(x1, y1), Op::LineTo(x0, y1), Op::Close]),
     }
-    if fill {
-        o.push(Op::Fill);
+    match fc.and_then(rgb) {
+        Some(c) => o.push(Op::FillColor(c)),
+        None if fill => o.push(Op::Fill),
+        None => {}
     }
     o.push(Op::Stroke);
     o
@@ -616,7 +626,7 @@ pub fn line_ops(p: &[f64; 4], w: f64, h: Heads, hops: &[f64], bw: f64) -> Vec<Op
 /// the scene does not show (an end on a hidden shape). `bb` is where it is, board units.
 pub fn item_ops(it: &Item, scene: &Scene, bw: f64) -> Option<(Vec<Op>, Option<[f64; 4]>)> {
     match it.sh.as_ref()? {
-        Shape::Box { kind, fill, .. } => Some((box_ops(*kind, &norm_box(&it.pts)?, *fill, it.w, bw), None)),
+        Shape::Box { kind, fill, .. } => Some((box_ops(*kind, &norm_box(&it.pts)?, *fill, it.st.fc.as_deref(), it.w, bw), None)),
         Shape::Line { .. } => {
             let s = scene.seg(&it.id)?;
             Some((line_ops(&s.p, s.w, s.h, &scene.hops(&it.id, bw), bw), scene.bbox(&it.id, bw)))

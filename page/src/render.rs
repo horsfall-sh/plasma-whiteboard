@@ -309,6 +309,10 @@ impl Surface for CanvasRenderingContext2d {
                 let _ = self.arc_with_anticlockwise(x, y, r, a0, a1, ccw);
             }
             Op::Alpha(a) => self.set_global_alpha(a),
+            Op::FillColor(c) => {
+                self.set_fill_style_str(&format!("#{c:06x}"));
+                self.fill();
+            }
         }
     }
 
